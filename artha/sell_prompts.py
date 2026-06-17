@@ -10,6 +10,8 @@ Model assignments (same as buy council):
   - CIO Synthesis: GPT 5.5 — sell score computation + action mapping
 """
 
+from typing import Any
+
 # ---------------------------------------------------------------------------
 # Shared sell context header
 # ---------------------------------------------------------------------------
@@ -391,8 +393,6 @@ def build_sell_context(
     current_regime: str = "unknown",
 ) -> str:
     """Build the shared context header for all sell-side analysts."""
-    from typing import Any as _Any
-
     ticker = thesis.ticker if hasattr(thesis, "ticker") else str(thesis.get("ticker", "?"))
     position_type = thesis.position_type if hasattr(thesis, "position_type") else str(thesis.get("position_type", "BUY"))
     entry_price = float(thesis.entry_price or 0) if hasattr(thesis, "entry_price") else float(thesis.get("entry_price") or 0)
