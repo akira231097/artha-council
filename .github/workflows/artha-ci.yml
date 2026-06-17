@@ -1,0 +1,24 @@
+name: Artha CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Compile
+        run: python -m compileall artha run.py
+      - name: Enhancement tests
+        run: python -m artha.test_enhancements
+      - name: Production hardening tests
+        run: python -m artha.test_production_hardening

@@ -1,0 +1,32 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+.DS_Store
+
+# Runtime state. Public releases should contain code and docs, not private
+# portfolios, broker snapshots, reports, SQLite journals, logs, or agent traces.
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.lock
+*.log
+
+# Local automation/runtime handoffs.
+tmp/
+.codex/
+.openclaw/
