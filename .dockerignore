@@ -1,0 +1,39 @@
+# Version control
+.git
+.gitignore
+.github
+
+# Python caches / build artifacts
+__pycache__
+**/__pycache__
+*.py[cod]
+*.pyo
+*.egg-info
+build
+dist
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+.venv
+venv
+
+# Secrets and runtime state (must never enter the image)
+.env
+.env.*
+!.env.example
+data
+*.db
+*.sqlite
+*.sqlite3
+*.lock
+*.log
+tmp
+.codex
+.openclaw
+
+# Editor / OS noise
+.DS_Store
+.idea
+.vscode

@@ -9,6 +9,8 @@ _A staged, multi-model AI investment committee that turns a broad US-stock unive
 ![Claude Agent SDK](https://img.shields.io/badge/LLM-Claude%20Agent%20SDK-D97757)
 ![SQLite](https://img.shields.io/badge/store-SQLite-003B57?logo=sqlite&logoColor=white)
 
+> 📐 **[Architecture diagram & design deep-dive →](docs/DESIGN.md)**
+
 ## Overview
 
 Artha Council is an AI-assisted equity-research and broker-aware execution system. It scans a broad US-stock universe, promotes the most interesting candidates through a multi-stage funnel, asks specialist AI analysts to debate the best opportunities, and then applies deterministic broker-execution gates before any order can be queued.
