@@ -2,6 +2,7 @@
 
 _A staged, multi-model AI investment committee that turns a broad US-stock universe into auditable, fail-closed execution decisions._
 
+[![CI](https://github.com/akira231097/artha-council/actions/workflows/artha-ci.yml/badge.svg)](https://github.com/akira231097/artha-council/actions/workflows/artha-ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 ![GPT--5.5](https://img.shields.io/badge/LLM-GPT--5.5-412991?logo=openai&logoColor=white)
 ![Gemini](https://img.shields.io/badge/LLM-Gemini-4285F4?logo=google&logoColor=white)
@@ -144,3 +145,7 @@ python run.py supervisor-check              # production readiness / health
 - Live trading is **disabled by default** and should stay disabled until you have reviewed the full broker bridge, execution officer, account caps, and your broker's terms.
 - You must supply your own data/AI provider accounts; no keys are bundled.
 - This software is for personal research and automation. **It is not financial advice**, and you are responsible for verifying every gate and complying with applicable rules.
+
+## License
+
+Released under the [MIT License](LICENSE).
