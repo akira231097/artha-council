@@ -1,153 +1,184 @@
 # Artha Council
 
-_A staged, multi-model AI investment committee that turns a broad US-stock universe into auditable, fail-closed execution decisions._
+[![Artha CI](https://github.com/akira231097/artha-council/actions/workflows/artha-ci.yml/badge.svg)](https://github.com/akira231097/artha-council/actions/workflows/artha-ci.yml)
+[![CodeQL](https://github.com/akira231097/artha-council/actions/workflows/codeql.yml/badge.svg)](https://github.com/akira231097/artha-council/actions/workflows/codeql.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/akira231097/artha-council/badge)](https://securityscorecards.dev/viewer/?uri=github.com/akira231097/artha-council)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[![CI](https://github.com/akira231097/artha-council/actions/workflows/artha-ci.yml/badge.svg)](https://github.com/akira231097/artha-council/actions/workflows/artha-ci.yml)
-![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
-![GPT--5.5](https://img.shields.io/badge/LLM-GPT--5.5-412991?logo=openai&logoColor=white)
-![Gemini](https://img.shields.io/badge/LLM-Gemini-4285F4?logo=google&logoColor=white)
-![Claude Agent SDK](https://img.shields.io/badge/LLM-Claude%20Agent%20SDK-D97757)
-![SQLite](https://img.shields.io/badge/store-SQLite-003B57?logo=sqlite&logoColor=white)
+Artha is an AI-assisted equity research and portfolio automation system. It
+narrows a broad US-stock universe, ranks opportunities, asks independent analyst
+roles to debate the strongest candidates, monitors active investment theses, and
+uses deterministic broker gates before an order can proceed.
 
-> 📐 **[Architecture diagram & design deep-dive →](docs/DESIGN.md)**
+Created and maintained by **Sarath** ([@akira231097](https://github.com/akira231097)).
 
-## Overview
+See the [design notes and architecture diagram](docs/DESIGN.md) for a visual
+walkthrough of the research, Council, execution, and audit boundaries.
 
-Artha Council is an AI-assisted equity-research and broker-aware execution system. It scans a broad US-stock universe, promotes the most interesting candidates through a multi-stage funnel, asks specialist AI analysts to debate the best opportunities, and then applies deterministic broker-execution gates before any order can be queued.
+> Artha is research software, not financial advice. Public defaults cannot place
+> live trades. Anyone enabling broker integration is responsible for reviewing
+> the source, their configuration, broker terms, and applicable requirements.
 
-Its defining design choice is the hard separation of **investment quality** ("is this company worth investigating or owning?") from **execution feasibility** ("can this specific order be placed safely right now?"). That separation prevents a good idea with a bad quote, wide spread, stale snapshot, or broker alert from ever becoming an unsafe trade. The system is built **fail-closed**: public defaults are review-only, dry-run, agentic-disabled, kill-switch-on, and never place live trades.
+## Why Artha Exists
 
-> Artha is personal research and automation software. **It is not financial advice.**
+Most stock screeners stop after ranking tickers. Artha treats investing as a
+stateful operating system:
 
-## Key features
+1. Find candidates from a large universe.
+2. Verify data quality and execution feasibility.
+3. Give scarce Council attention to the strongest candidates.
+4. Separate investment judgment from order execution.
+5. Monitor every held thesis and send material changes to a sell Council.
+6. Reconcile intended actions against broker state.
+7. Preserve evidence and state transitions for audit.
 
-- **Promotion funnel** that narrows 1000+ active stocks into ~6-8 council-ready finalists using momentum, valuation, quality, liquidity, regime fit, and a soft repeat/cooldown freshness penalty.
-- **Broker-aware router** that lanes candidates into `execution_ready` / `research_watch` / `hard_reject` based on quote freshness, spread, tradability, and data-provider conflict — so non-executable ideas are preserved, not discarded.
-- **Agentic opportunity scout** that ranks which executable names deserve the scarce, expensive council slots (without ever making the final call).
-- **Multi-model analyst council**: Fundamental (GPT-5.5), Technical (Gemini), and Contrarian/Risk (GPT-5.5) run **independently**, then a synthesis/CIO layer audits scores, valuation anchors, data gaps, and invalidation rules.
-- **Execution officer** that converts a buy-side label into a live-quote verdict (`BUY_READY` / `WAIT_FOR_SAFE_EXECUTION` / `BLOCKED`) under hard, non-overridable caps.
-- **Replayable OpenClaw agentic broker bridge** over the Model Context Protocol (MCP): the engine emits exact read-only call sequences for the OpenClaw agentic runner and replays the responses into source-controlled clearance logic — keeping money-moving steps deterministic and auditable even though execution is agentic.
-- **Sell side** with thesis tracking, a 3-analyst sell council, trailing stops, regime comparison, and a portfolio circuit breaker.
-- **Auditable by design**: decision dossiers with evidence IDs, a SQLite decision journal, agentic traces, fill reconciliation, and supervisor health checks.
-- **Telegram reporting** for scan progress, council decisions, execution decisions, and supervisor checks.
-
-## Architecture
-
-Each stage has a narrow job and emits enough evidence for later audit. Research never becomes an order without passing an independent, deterministic execution gate.
-
-```text
-Market-data universe (FMP screener)
-  -> promotion funnel        (momentum / valuation / quality / liquidity / regime fit)
-  -> broker-aware router     (quote freshness, spread, tradability, data conflict)
-  -> opportunity scout       (agentic ranking of council slots)
-  -> council analysts        (Fundamental=GPT-5.5 | Technical=Gemini | Contrarian=GPT-5.5)
-  -> synthesis / CIO audit   (score, valuation anchors, invalidation, buy-score audit)
-  -> execution officer       (live-quote verdict under hard caps)
-  -> OpenClaw broker bridge  (read-only MCP snapshot -> review -> preview -> place)
-  -> journal, dossier, Telegram, supervisor
-```
-
-**Research layer vs. execution layer.** The council answers "is this worth owning?" and produces a label (`BUY`, `STARTER`, `TACTICAL_BUY`, `DEFER`, `WATCH`, `AVOID`). Only buy-side labels advance. The execution officer and broker bridge then answer "can this exact order be placed safely at the live quote?" — and the LLM may choose among deterministic candidates but **cannot expand caps or override the guardrail engine**.
-
-## Tech stack
-
-| Layer | Technology |
-| --- | --- |
-| Language / runtime | Python 3.12 |
-| Reasoning analysts | GPT-5.5 (ChatGPT/Codex backend), Google Gemini, Claude Agent SDK |
-| Market & fundamental data | Financial Modeling Prep, Finnhub, Benzinga, Alpha Vantage, FRED, SEC EDGAR, yfinance |
-| Numerics | pandas, numpy |
-| Persistence | SQLite (decision journal, dossiers) |
-| Config / parsing | python-dotenv, PyYAML |
-| Delivery | Telegram Bot API |
-| Broker integration | OpenClaw agentic runner over the Model Context Protocol (MCP) |
-| HTTP | requests |
-| CI | GitHub Actions (compile + hardening smoke tests) |
-
-## Project structure
+## System Pipeline
 
 ```text
-.
-├── run.py                     # CLI entry point (~30 subcommands)
-├── requirements.txt
-├── .env.example               # placeholder env template (no real keys)
-├── README.md
-├── SECURITY.md
-├── docs/
-│   ├── ARCHITECTURE.md        # full component map
-│   └── PUBLIC_RELEASE.md      # public-release boundary
-├── .github/workflows/         # CI smoke pipeline
-└── artha/
-    ├── funnel.py              # universe -> finalist candidates
-    ├── broker_router.py       # execution/data feasibility lanes
-    ├── opportunity_scout.py   # agentic pre-council ranking
-    ├── council.py             # multi-analyst decision + synthesis
-    ├── analysts.py            # independent per-model analysts
-    ├── execution_officer.py   # final buy-side execution verdict
-    ├── robinhood_bridge.py    # broker snapshot / review / place contracts
-    ├── sell_engine.py         # sell council, trailing stops, circuit breaker
-    ├── scheduler.py           # scan orchestration + Telegram reporting
-    ├── supervisor.py          # production readiness / health checks
-    ├── journal.py             # SQLite decision journal
-    ├── chatgpt_backend.py     # resilient GPT client (token refresh, fallback)
-    ├── gemini_client.py       # Gemini wrapper
-    ├── claude_sdk.py          # sync wrapper over the Claude Agent SDK
-    ├── collector.py           # multi-provider data collection
-    └── ...                    # regime, valuation, dossier, prompts, tests, etc.
+Market data providers
+  -> universe and promotion funnel
+  -> investment sanity checks
+  -> broker-aware candidate router
+  -> opportunity scout
+  -> fundamental / technical / risk analysts
+  -> CIO synthesis
+  -> execution officer
+  -> deterministic broker review and placement gates
+  -> reconciliation, thesis tracking, Telegram, supervisor
 ```
 
-## Getting started
+The sell side runs independently of new-buy capacity:
 
-**Requirements:** Python 3.12, and your own API keys for the data and AI providers you want to enable.
+```text
+Portfolio snapshot
+  -> position and thesis monitor
+  -> deterministic stop / invalidation triggers
+  -> sell Council for judgment decisions
+  -> execution officer
+  -> broker review and exact-order placement gate
+  -> post-fill reconciliation
+```
+
+## Important Design Rules
+
+### Research is not execution
+
+The Council answers: "Is this investment attractive?"
+
+The execution layer answers: "Can this exact order be placed safely now?"
+
+A good company can be temporarily unbuyable because the quote is stale, the
+spread is too wide, the price moved above the approved cap, or broker review is
+incomplete. Those conditions do not rewrite the investment thesis.
+
+### Missing broker proof blocks an order
+
+Money-moving paths fail closed. A model statement that a check passed is not
+enough; Artha requires the decisive structured broker output.
+
+### Portfolio monitoring continues when buys pause
+
+Position limits and invested-capacity limits pause new buys only. Monitoring,
+sell review, reconciliation, health checks, and alerts continue running.
+
+## Major Components
+
+- `artha/funnel.py` - broad-universe promotion and multi-sleeve ranking.
+- `artha/broker_router.py` - quote, liquidity, tradability, and data feasibility.
+- `artha/opportunity_scout.py` - agentic pre-Council evidence review and ranking.
+- `artha/council.py` - analyst roles, score audit, and CIO synthesis.
+- `artha/execution_officer.py` - Stage A and Stage B execution reasoning.
+- `artha/broker_capacity.py` - portfolio and daily buy-capacity calculations.
+- `artha/stand_down.py` - buy-only pause and next-session reset behavior.
+- `artha/sell_engine.py` - position triggers and sell-side orchestration.
+- `artha/sell_council.py` - hold, trim, and exit review.
+- `artha/robinhood_bridge.py` - broker handoff, review, clearance, and reconciliation.
+- `artha/scheduler.py` - scheduled scans and lifecycle orchestration.
+- `artha/supervisor.py` - production health and readiness checks.
+- `dashboard/` - local operator dashboard.
+
+See [Architecture](docs/ARCHITECTURE.md) for the complete component map.
+
+## Quick Start
+
+Requirements: Python 3.12 or newer and Node.js 20 or newer.
 
 ```bash
+git clone https://github.com/akira231097/artha-council.git
+cd artha-council
 python -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+npm ci
 cp .env.example .env
 ```
 
-Fill in `.env` with your own provider keys. The default broker settings are intentionally safe: **review-only, dry-run, agentic trading disabled, and kill-switch enabled.**
-
-Smoke checks:
+Add your own provider credentials to `.env`. Keep every Robinhood setting at its
+safe default while evaluating the system.
 
 ```bash
-python -m compileall artha run.py
+python run.py overview
+python run.py analyze AAPL MSFT V
+python run.py broker-router-preview --assume-market-open --no-persist
+python run.py supervise
+```
+
+## Verification
+
+```bash
+python -m compileall -q artha dashboard run.py
 python -m artha.test_enhancements
 python -m artha.test_production_hardening
 ```
 
-Example commands:
+Tests use synthetic fixtures and must not require real broker credentials.
+
+### Docker
+
+The included image supports the core Python research CLI:
 
 ```bash
-python run.py overview                      # market overview report
-python run.py analyze AAPL MSFT V           # analyze specific tickers
-python run.py scan 6                        # full funnel + council (6 finalists)
-python run.py broker-router-preview --assume-market-open --no-persist
-python run.py supervisor-check              # production readiness / health
+docker build -t artha-council .
+docker run --rm --env-file .env artha-council overview
 ```
 
-## How it works
+The broker snapshot helper is intentionally outside this minimal Python image;
+it requires a separately configured Node.js MCP runtime and broker access.
 
-**Promotion funnel.** A 5-stage pipeline builds an investable universe from a market-data screener, machine-ranks ~500-1000 names with momentum/quality/valuation/liquidity/regime-fit signals, enriches the top tier with ratios, analyst recommendations, and earnings context, applies a quick triage, and returns ~6-8 finalists. A soft penalty queried from recent scan sessions discourages lazily recycling the same basket.
+## Public Release Boundary
 
-**Broker-aware router.** A deliberately non-fundamental gate. It checks whether a candidate has sane, fresh-enough price/quote/liquidity data and is realistically executable today, and it lanes accordingly. Interesting-but-non-executable ideas are routed to research/watch rather than thrown away.
+This repository contains source, tests, documentation, and safe configuration
+templates. It intentionally excludes:
 
-**Multi-model council.** Three analysts run with no cross-contamination — each gets its own model, prompt, and data slice. A two-stage engine applies a binary hard risk gate, then opportunity scoring mapped to an action label. The synthesis/CIO layer reconciles the analysts and records valuation anchors, source conflicts, invalidation conditions, and a buy-score audit. Analyst output is parsed defensively: JSON block first, then markdown regex, then safe defaults.
+- API keys, OAuth tokens, and `.env` files
+- broker account identifiers and snapshots
+- portfolios, order history, and transaction records
+- SQLite journals and runtime state
+- generated dossiers, traces, reports, and logs
+- Telegram tokens, chat identifiers, and callback tokens
+- local OpenClaw, launchd, and workstation configuration
+- third-party market-data payloads
 
-**Resilient LLM clients.** The GPT backend client refreshes OAuth tokens on 401, falls back to an alternate model on 404, retries without `temperature` on 400, and backs off on 503. The Claude wrapper runs async SDK queries on a fresh event loop in a worker thread, so it works from both the synchronous CLI and the async daemon.
+Third-party data and services remain governed by their own licenses and terms.
+The Apache license covers Artha's source code, not provider data or broker access.
 
-**Execution officer + OpenClaw broker bridge.** The officer turns a buy-side label into a live-quote verdict under hard caps (no-chase, spread, buying power). Because the engine does not call broker MCP tools directly, it emits an exact, deterministic read-only MCP sequence for the **OpenClaw** agentic runner to execute, then replays the collected responses into source-controlled clearance logic: snapshot refresh → account identity check → positions/orders reconciliation → quote/tradability review → order preview → final clearance → place only with the exact approved arguments → post-fill reconciliation. This keeps the system agentic while remaining constrained by deterministic safety rules.
+## Project Documents
 
-**Safety model.** Broker-dependent actions require fresh snapshot state, live-quote sanity, tradability checks, review results, configured limits, and a kill-switch check. The auto-buy path is designed for a tightly capped pilot account: long US equities only, cash account only, per-order and per-day dollar caps, no options/margin/shorts/crypto, no stale snapshots, and no order if a broker review raises a blocking alert.
+- [Architecture](docs/ARCHITECTURE.md)
+- [Design notes and diagram](docs/DESIGN.md)
+- [Public release and data boundary](docs/PUBLIC_RELEASE.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Authors](AUTHORS.md)
+- [Changelog](CHANGELOG.md)
+- [Apache License 2.0](LICENSE)
 
-## Notes / limitations
+## License and Citation
 
-- This is a sanitized public release intended to show the architecture and implementation quality. It intentionally excludes all private runtime data: `.env` credentials, live portfolio state, broker snapshots, SQLite journals, generated reports/dossiers/traces, and any chat tokens.
-- Live trading is **disabled by default** and should stay disabled until you have reviewed the full broker bridge, execution officer, account caps, and your broker's terms.
-- You must supply your own data/AI provider accounts; no keys are bundled.
-- This software is for personal research and automation. **It is not financial advice**, and you are responsible for verifying every gate and complying with applicable rules.
+Artha Council is licensed under [Apache License 2.0](LICENSE). Distributed copies
+and modifications must retain the applicable license, copyright, and attribution
+notices described in [NOTICE](NOTICE).
 
-## License
-
-Released under the [MIT License](LICENSE).
+Use [CITATION.cff](CITATION.cff) to cite the project. GitHub exposes it through
+the repository's **Cite this repository** control.

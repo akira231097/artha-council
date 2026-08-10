@@ -3,6 +3,12 @@
 Each analyst gets a sell-specific role that mirrors the buy-side council but
 is tuned for the sell decision: hold vs. trim vs. exit.
 
+BLIND RE-EVALUATION (Odean disposition-effect mitigation): the three analysts
+never see cost basis, unrealized P&L, or holding period. They answer one
+question — "would you initiate this position today at the current price?" —
+so purchase-price anchoring cannot bias the verdict. Only the CIO synthesis
+sees the full position context (stops, holding period, lifecycle gates).
+
 Model assignments (same as buy council):
   - Sell Fundamental Analyst: GPT 5.5 — thesis integrity focus
   - Sell Technical Analyst: Gemini 3.1 Pro — deterioration / momentum focus
@@ -42,12 +48,39 @@ Entry: {entry_regime}
 Current: {current_regime}
 """
 
+# Blind context shown to the three analysts — deliberately excludes cost
+# basis, unrealized P&L, holding period, and stop levels (disposition-effect
+# mitigation; Odean 1998).
+SELL_BLIND_CONTEXT_HEADER = """## POSITION UNDER REVIEW — BLIND RE-EVALUATION
+Ticker: {ticker}
+Position Type: {position_type}
+Current Price: ${current_price:.2f}
+Position Size: {allocation_pct:.1f}% of NAV (${market_value:,.2f})
+
+(You are intentionally not shown the entry price, P&L, or holding period.)
+
+**Core question: would you INITIATE this position today at ${current_price:.2f}?**
+
+## ORIGINAL THESIS
+{thesis_summary}
+
+## INVALIDATION CONDITIONS (monitored since entry)
+{invalidation_conditions}
+
+## CURRENT REGIME
+{current_regime}
+"""
+
 SELL_SHARED_CONTEXT = """You are part of the Artha SELL Council — a three-analyst team
 debating whether to hold, trim, or exit a live position.
 
-The investor (Sarath) is a moderate-risk, long-horizon retail investor. He now
-self-manages $350/month into FXAIX, and the Artha satellite stock budget is
-re-enabled at $350/month for tactical stock research. He values:
+BLIND RE-EVALUATION: you are deliberately NOT told the entry price, unrealized
+P&L, or how long the position has been held. Anchoring on purchase price causes
+the disposition effect (riding losers, cutting winners early). Judge only what
+the asset is worth owning TODAY at the current price. The core question you must
+answer: **would you initiate this position today at the quoted price?**
+
+The supplied investor profile is the source of truth. The investor values:
 - Capital preservation over maximizing returns
 - Thesis-first decisions (price drops alone don't justify selling)
 - Clear, actionable recommendations with specific reasoning
@@ -58,7 +91,8 @@ simply to avoid being wrong. If the thesis is broken, say so clearly.
 This is a SELL decision framework — your outputs feed into a sell score (0-100).
 The higher your sell score component, the closer the system moves toward EXIT.
 
-Be specific. Reference exact numbers. State clearly: is the original thesis still valid?
+Be specific. Reference exact numbers. State clearly: is the original thesis still valid,
+and would you put fresh capital into this name today?
 """
 
 # ---------------------------------------------------------------------------
@@ -77,10 +111,10 @@ position, balance sheet health — and compare them to the original thesis assum
    Compare each invalidation condition to latest available data.
 2. **Earnings Quality Audit** — Is revenue/earnings growth accelerating or decelerating?
    Any surprises vs expectations? Any accounting concerns?
-3. **Valuation Re-Assessment** — Is the stock more or less attractive than at entry?
-   Is the upside/downside ratio still favorable?
-4. **Competitive Position Update** — Has the moat strengthened or narrowed since entry?
-   Any new competitive threats, regulatory risks, or market share changes?
+3. **Valuation Assessment at Today's Price** — Is the stock attractively priced RIGHT NOW?
+   Is the upside/downside ratio favorable enough that you would buy it fresh today?
+4. **Competitive Position Update** — Has the moat strengthened or narrowed since the thesis
+   was written? Any new competitive threats, regulatory risks, or market share changes?
 5. **Balance Sheet Check** — Any increase in leverage, cash burn, or liquidity concerns?
 
 ### Your Personality:
@@ -105,6 +139,7 @@ After your analysis, assign a FUNDAMENTAL SELL SCORE from 0-100:
 ### Output Format (follow EXACTLY):
 
 **SELL VERDICT:** [HOLD / TRIM / EXIT]
+**WOULD INITIATE TODAY:** [YES / NO]
 **FUNDAMENTAL SELL SCORE:** [0-100]
 **CONFIDENCE:** [1-10]
 
@@ -119,7 +154,7 @@ After your analysis, assign a FUNDAMENTAL SELL SCORE from 0-100:
 - [Finding 3]
 
 **VALUATION REASSESSMENT:**
-[2-3 sentences on current valuation vs entry assumptions]
+[2-3 sentences on whether today's price offers an attractive entry for fresh capital]
 
 **FUNDAMENTAL RECOMMENDATION:**
 [1-2 sentences: what should happen to this position and why]
@@ -145,7 +180,6 @@ deterioration patterns that often precede further price decline.
    Key moving averages (20/50/200 SMA), trend direction, slope.
 2. **Momentum** — RSI: is momentum building or fading? MACD crossovers, histogram.
 3. **Support/Resistance** — Where are key support levels? Is any critical support broken?
-   How close is current price to the hard stop level?
 4. **Volume Analysis** — Is the recent move on increasing or decreasing volume?
    Divergences between price and volume signal reversals.
 5. **Relative Strength** — How is this stock performing vs SPY and its sector ETF?
@@ -174,6 +208,7 @@ After your analysis, assign a TECHNICAL SELL SCORE from 0-100:
 ### Output Format (follow EXACTLY):
 
 **SELL VERDICT:** [HOLD / TRIM / EXIT]
+**WOULD INITIATE TODAY:** [YES / NO]
 **TECHNICAL SELL SCORE:** [0-100]
 **CONFIDENCE:** [1-10]
 
@@ -185,10 +220,8 @@ After your analysis, assign a TECHNICAL SELL SCORE from 0-100:
 - [Finding 3: support/resistance levels and status]
 - [Finding 4: relative strength vs market]
 
-**PROXIMITY TO STOP:** [% above hard stop level]
-
 **TECHNICAL RECOMMENDATION:**
-[1-2 sentences: what the technicals say about holding vs selling]
+[1-2 sentences: what the technicals say about buying at today's price vs stepping aside]
 """
 
 # ---------------------------------------------------------------------------
@@ -214,9 +247,9 @@ You play TWO roles simultaneously:
 4. **Risk Asymmetry** — What is the realistic upside vs downside from here?
    If downside >> upside, exit is rational even with intact thesis.
 5. **Market Context** — Does the current regime support holding this type of position?
-   Has the macro environment shifted against this thesis since entry?
-6. **Time Cost** — How long has this position been held without meaningful progress?
-   Time decay means the original thesis may no longer apply.
+   Has the macro environment shifted against this thesis since it was written?
+6. **Fresh-Capital Test** — Forget that the position exists: with the same cash today,
+   is THIS the trade you would put on? If not, owning it is a choice to buy it again.
 
 ### Your Personality:
 - You are the devil's advocate on every position
@@ -240,6 +273,7 @@ After your analysis, assign a RISK/CONTRARIAN SELL SCORE from 0-100:
 ### Output Format (follow EXACTLY):
 
 **SELL VERDICT:** [HOLD / TRIM / EXIT]
+**WOULD INITIATE TODAY:** [YES / NO]
 **CONTRARIAN SELL SCORE:** [0-100]
 **CONFIDENCE:** [1-10]
 
@@ -336,6 +370,19 @@ If two or more analysts identify the same specific risk, you MUST reflect this i
 Do NOT default to HOLD because "the thesis might still be intact." If analysts disagree on thesis
 status, weight the more specific, data-supported argument.
 
+### MANDATORY REBUTTAL RULE:
+Analysts vote blind (no cost basis / P&L / holding period). For EVERY analyst whose verdict is
+TRIM or EXIT with a sell score >= 60, you must either AGREE (reflect it in the score) or
+EXPLICITLY REBUT it in the `rebuttals` JSON field with concrete counter-evidence drawn from the
+reports or position context. A high sell vote may NOT be diluted away by weighted averaging:
+Artha code will floor the final score at any unrebutted TRIM/EXIT analyst's component score.
+
+### ANTI-DISPOSITION RULE (enforced in code):
+You may never argue to widen a stop, lower a stop, or defer a mechanically triggered exit
+(hard stop, trailing stop, time stop, thesis break). Your bounded adjustment may move the
+decision TOWARD earlier selling; for mechanically triggered reviews, negative (hold-direction)
+adjustments are rejected by code.
+
 ## OUTPUT FORMAT (follow EXACTLY):
 
 **CIO SELL ASSESSMENT: {ticker}**
@@ -378,6 +425,11 @@ status, weight the more specific, data-supported argument.
   "cio_adjustment_category": "[none|confirmed_thesis_break|material_news_or_filing|technical_break_not_captured|data_conflict_not_captured|opportunity_cost|false_positive_or_overreaction|other]",
   "cio_adjustment_evidence": ["specific evidence from the analyst reports or position context"],
   "cio_adjustment_reason": "short concrete reason for the adjustment, or 'none'",
+  "rebuttals": [
+    {{"analyst": "[fundamental|technical|contrarian]",
+      "rebuttal": "concrete counter-argument to that analyst's TRIM/EXIT vote",
+      "evidence": ["specific evidence from the reports or position context"]}}
+  ],
   "next_review_days": [7|14|21|30|45],
   "is_urgent": [true|false],
   "trim_pct": [0-100 or null],
@@ -460,6 +512,75 @@ def build_sell_context(
         hard_stop_pct=hard_stop_pct,
         trailing_stop_section=trailing_stop_section,
         entry_regime=entry_regime,
+        current_regime=current_regime,
+    )
+
+
+def build_blind_sell_context(
+    thesis: Any,
+    stock_data: dict,
+    current_regime: str = "unknown",
+) -> str:
+    """Build the BLIND context header for the three sell-side analysts.
+
+    Excludes cost basis, unrealized P&L, holding period, and stop levels so
+    the analysts answer "would you initiate this position today at $X?"
+    without purchase-price anchoring (disposition-effect mitigation).
+    """
+    ticker = thesis.ticker if hasattr(thesis, "ticker") else str(thesis.get("ticker", "?"))
+    position_type = thesis.position_type if hasattr(thesis, "position_type") else str(thesis.get("position_type", "BUY"))
+
+    quote = stock_data.get("quote") or {}
+    yf_quote = stock_data.get("yf_quote") or {}
+    current_price = float(quote.get("price") or yf_quote.get("price") or 0)
+    if current_price <= 0:
+        # Try the last completed daily close before giving up. A fabricated
+        # price (the old `or 1.0`) makes the blind analysts see a -99% crash
+        # and can trigger an unattended sell of a healthy position.
+        history = stock_data.get("price_history") or []
+        try:
+            last_close = float((history[-1] or {}).get("close") or 0) if history else 0.0
+        except (TypeError, ValueError):
+            last_close = 0.0
+        if last_close > 0:
+            current_price = last_close
+        else:
+            raise ValueError(
+                f"No usable quote or close for {ticker}; aborting blind sell review "
+                "rather than fabricating a price."
+            )
+
+    market_value = 0.0
+    allocation_pct = 0.0
+    try:
+        from .portfolio import Portfolio, PORTFOLIO_FILE
+        portfolio = Portfolio.load(PORTFOLIO_FILE)
+        pos = next((p for p in portfolio.positions if p.ticker.upper() == ticker), None)
+        if pos:
+            market_value = float(pos.market_value or 0)
+            nav = float(portfolio.total_nav() or 1)
+            allocation_pct = market_value / nav * 100 if nav > 0 else 0
+    except Exception:
+        pass
+
+    thesis_summary = getattr(thesis, "thesis_summary", "") or (thesis.get("thesis_summary", "") if not hasattr(thesis, "thesis_summary") else "")
+    invalidation_conds = getattr(thesis, "invalidation_conditions", []) or []
+    if not isinstance(invalidation_conds, list):
+        try:
+            import json as _j
+            invalidation_conds = _j.loads(str(invalidation_conds))
+        except Exception:
+            invalidation_conds = []
+    conditions_str = "\n".join(f"• {c}" for c in invalidation_conds) if invalidation_conds else "(none recorded)"
+
+    return SELL_BLIND_CONTEXT_HEADER.format(
+        ticker=ticker,
+        position_type=position_type,
+        current_price=current_price,
+        allocation_pct=allocation_pct,
+        market_value=market_value,
+        thesis_summary=thesis_summary or "(no thesis summary recorded)",
+        invalidation_conditions=conditions_str,
         current_regime=current_regime,
     )
 

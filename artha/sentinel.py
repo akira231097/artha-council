@@ -822,10 +822,28 @@ Be concrete and specific. Reference historical precedents if relevant."""
 
             # Convert CRITICAL/HIGH to Alert objects (no web research — speed)
             from hashlib import sha256 as _sha256
+            from .monitor import AlertManager
+            alert_history = AlertManager()
             severity_map = {"CRITICAL": "CRITICAL", "HIGH": "WARNING"}
             for ce in classified_events:
                 headline_hash = _sha256(ce.event.title.encode()).hexdigest()[:12]
                 normalized_sev = severity_map.get(ce.severity, "WARNING")
+                # The rich sentinel alert for this same headline may already be
+                # out; a second keyword-only ping is pure Telegram noise. Probe
+                # with INFO severity so the upgrade-bypass cannot misfire.
+                sentinel_probe = Alert(
+                    ticker=ce.event.ticker,
+                    alert_type=f"news_sentinel_{headline_hash}",
+                    severity="INFO",
+                    message="",
+                )
+                if not alert_history.should_send(sentinel_probe):
+                    logger.info(
+                        "[sentinel_fast] Skipping %s %s — sentinel alert for the same headline already sent",
+                        ce.event.ticker,
+                        headline_hash,
+                    )
+                    continue
                 msg = (
                     f"📰 [{ce.severity}] {ce.event.title}\n"
                     f"⚡ Trigger: {ce.trigger_detail or 'keyword match'}\n"

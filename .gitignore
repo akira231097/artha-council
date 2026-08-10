@@ -14,6 +14,10 @@ venv/
 dist/
 build/
 *.egg-info/
+node_modules/
+.coverage
+coverage.xml
+htmlcov/
 
 .DS_Store
 
@@ -30,3 +34,8 @@ data/
 tmp/
 .codex/
 .openclaw/
+.claude/
+
+# Local editor and operating-system files.
+.idea/
+.vscode/

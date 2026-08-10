@@ -105,7 +105,7 @@ def build_portfolio_factor_risk(
     current_sector_pct = (sector_value / total_nav * 100.0) if total_nav > 0 else 0.0
     after_sector_pct = current_sector_pct if is_existing_position else current_sector_pct + candidate_weight
     concentration_after_pct = max(_num(portfolio_state.get("concentration_pct"), 0.0), candidate_weight)
-    available_slots = max(0, int(_num(getattr(config, "MAX_CONCURRENT_POSITIONS", 6), 6)) - len(positions))
+    available_slots = max(0, int(_num(getattr(config, "MAX_CONCURRENT_POSITIONS", 20), 20)) - len(positions))
     max_sector_pct = _num(getattr(config, "MAX_SECTOR_PCT", 0.30), 0.30) * 100.0
     max_position_pct = _num(getattr(config, "MAX_POSITION_PCT", 0.20), 0.20) * 100.0
 

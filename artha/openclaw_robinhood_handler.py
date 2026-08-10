@@ -278,7 +278,7 @@ def handle_auto_buy_action(
                     {
                         "status": "review_blocked",
                         "result_json": {"execution_officer_final_clearance": final_clearance},
-                        "notes": "Execution Officer blocked auto-buy after final Robinhood review.",
+                        "notes": "Execution Officer blocked automated trade after final Robinhood review.",
                     },
                 )
                 return {
@@ -557,7 +557,7 @@ def run_agentic_auto_buy_clearance_from_responses(
         agentic = {
             **agentic,
             "status": "BLOCKED",
-            "reason": "Agentic Execution Officer is disabled; unattended auto-buy requires agentic clearance.",
+            "reason": "Agentic Execution Officer is disabled; unattended trading requires agentic clearance.",
         }
     if not allow_place:
         row = journal.get_trade_action(str(operation["action_id"])) or {}
@@ -577,7 +577,7 @@ def run_agentic_auto_buy_clearance_from_responses(
             {
                 "status": "review_blocked",
                 "result_json": result,
-                "notes": "Agentic Execution Officer blocked unattended auto-buy before placement.",
+                "notes": "Agentic Execution Officer blocked unattended trade before placement.",
             },
         )
     return {

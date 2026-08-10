@@ -29,6 +29,10 @@ class DataQualityReport:
     context_coverage_score: float = 0.0     # 0-100, non-blocking enrichment coverage
     passed_hard_checks: bool = True          # False = do not pass to council
     hard_check_failures: list[str] = field(default_factory=list)  # Reasons for hard failures
+    # Hard-check failures are DATA problems (missing/broken feeds), not
+    # investment judgments. retryable=True tells callers to re-collect and
+    # retry instead of recording a fake AVOID verdict for the ticker.
+    retryable: bool = False
     as_of: str = ""
 
 
@@ -45,6 +49,24 @@ _REQUIRED_FIELDS = {
     "technicals": 5,
     "news": 5,
 }
+
+
+def _first_number(*candidates: Any) -> Optional[float]:
+    """Return the first candidate that is present (not None) and numeric.
+
+    Explicit None checks only — 0 and negative values are PRESENT data and
+    must be returned as-is, never skipped. This replaces truthy `or` chains
+    that treated legitimate zeros as missing and let -1 sentinels short-circuit
+    fallback sources (the 2026-06-29 voided-scan bug).
+    """
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            return float(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 _ENRICHMENT_FIELDS = {
@@ -69,10 +91,15 @@ def validate_stock_data(data: dict) -> DataQualityReport:
     Runs both hard ingestion checks (disqualifying) and soft advisory checks.
 
     Hard checks (passed_hard_checks=False if any fail):
-      - price > 0
-      - volume >= 0
-      - market_cap >= 0
+      - price present in at least one source and > 0
+      - volume present in at least one source and >= 0
+      - market_cap >= 0 when reported (missing market cap alone is not fatal)
       - price_history has >= 20 data points
+
+    Source fallbacks use explicit None checks: a reported 0 or negative value
+    is validated as-is instead of being skipped by a truthy `or` chain.
+    Hard-check failures are data-layer failures, so `retryable` is set True —
+    callers should re-collect and retry rather than emit an AVOID verdict.
 
     Soft checks (warnings added to report, do not disqualify):
       - Gross margin in [-50%, 100%] range
@@ -156,20 +183,28 @@ def validate_stock_data(data: dict) -> DataQualityReport:
     yf_quote = data.get("yf_quote") or {}
     massive_quote = data.get("massive_quote") or {}
 
-    price = float(quote.get("price", 0) or yf_quote.get("price", 0) or massive_quote.get("price", 0) or 0)
-    if price <= 0:
+    # Explicit None-aware fallbacks: a missing field in one source must fall
+    # through to the next source, and 0 / -1 values from a source are treated
+    # as reported data, not as "missing".
+    price = _first_number(quote.get("price"), yf_quote.get("price"), massive_quote.get("price"))
+    if price is None:
+        report.hard_check_failures.append("price missing from all sources")
+    elif price <= 0:
         report.hard_check_failures.append(f"price={price} <= 0")
 
-    volume = float(quote.get("volume", -1) or massive_quote.get("volume", 0) or 0)
-    if volume < 0:
+    volume = _first_number(quote.get("volume"), massive_quote.get("volume"), yf_quote.get("volume"))
+    if volume is None:
+        report.hard_check_failures.append("volume missing from all sources")
+    elif volume < 0:
         report.hard_check_failures.append(f"volume={volume} < 0")
 
-    market_cap = float(
-        quote.get("marketCap", -1)
-        or yf_quote.get("market_cap", -1)
-        or 0
+    market_cap = _first_number(
+        quote.get("marketCap"),
+        yf_quote.get("market_cap"),
+        (data.get("profile") or {}).get("mktCap"),
+        (data.get("profile") or {}).get("marketCap"),
     )
-    if market_cap < 0:
+    if market_cap is not None and market_cap < 0:
         report.hard_check_failures.append(f"market_cap={market_cap} < 0")
 
     price_history = data.get("price_history")
@@ -180,6 +215,9 @@ def validate_stock_data(data: dict) -> DataQualityReport:
         )
 
     report.passed_hard_checks = len(report.hard_check_failures) == 0
+    # Every hard-check failure means the DATA layer failed, not the stock.
+    # Callers must treat this as retry-later, never as an AVOID verdict.
+    report.retryable = not report.passed_hard_checks
 
     # --- Soft Checks: Margin Sanity ---
     income = data.get("income_statement")

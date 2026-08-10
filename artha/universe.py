@@ -7,6 +7,7 @@ bonuses/penalties to score each candidate for downstream ranking.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -15,6 +16,16 @@ from .collector import FMPCollector
 from .config import Config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tunables (env-var overridable; Wave 2 consolidates into config.py)
+# ---------------------------------------------------------------------------
+
+# The FMP company-screener caps each response at 1000 rows, which used to
+# silently truncate ~45% of the $1B+ US universe (verified 2026-07-02: page 0
+# returns 1000 rows down to ~$5.15B, page 1 returns ~791 more down to $1B).
+# The screener supports a `page` param — we paginate until an empty/short page.
+UNIVERSE_MAX_PAGES: int = int(os.getenv("ARTHA_UNIVERSE_MAX_PAGES", "5"))
 
 # Sector mapping from FMP sector names to REGIME_TAXONOMY sector names
 FMP_SECTOR_ALIASES: dict[str, list[str]] = {
@@ -70,22 +81,18 @@ class UniverseBuilder:
             min_market_cap: Minimum market cap in USD (default $1B)
             min_volume: Minimum daily volume (default 100K shares)
             min_price: Minimum price (default $5)
-            limit: Max candidates from screener (default 1000)
+            limit: Max candidates per screener page (default 1000, FMP's cap)
 
         Returns:
             List of UniverseCandidate objects, sorted by market_cap descending.
         """
         logger.info(f"[universe] Building universe (regime={regime_type}, overlays={overlays})...")
 
-        raw = self.fmp.screener(
-            market_cap_more_than=int(min_market_cap),
-            volume_more_than=int(min_volume),
-            price_more_than=min_price,
-            country="US",
-            is_actively_trading=True,
-            is_etf=False,
-            is_fund=False,
-            limit=limit,
+        raw = self._fetch_screener_pages(
+            min_market_cap=min_market_cap,
+            min_volume=min_volume,
+            min_price=min_price,
+            page_limit=limit,
         )
 
         if not raw:
@@ -93,12 +100,14 @@ class UniverseBuilder:
             return []
 
         candidates = []
+        seen_symbols: set[str] = set()
         for item in raw:
             if not isinstance(item, dict):
                 continue
             symbol = item.get("symbol", "")
-            if not symbol:
+            if not symbol or symbol in seen_symbols:
                 continue
+            seen_symbols.add(symbol)
             try:
                 candidate = UniverseCandidate(
                     symbol=symbol,
@@ -124,6 +133,92 @@ class UniverseBuilder:
         # Sort by market cap (largest first for quality bias)
         candidates.sort(key=lambda c: c.market_cap, reverse=True)
         return candidates
+
+    def _fetch_screener_pages(
+        self,
+        *,
+        min_market_cap: float,
+        min_volume: int,
+        min_price: float,
+        page_limit: int,
+    ) -> list[dict]:
+        """Fetch the FULL screener universe by paginating the FMP screener.
+
+        FMP truncates each company-screener response at 1000 rows, which
+        previously dropped the bottom ~45% of the $1B+ universe (everything
+        below ~$5B). The endpoint supports a `page` param (probed and verified
+        against the stable API); we walk pages until an empty/short page or
+        UNIVERSE_MAX_PAGES.
+
+        Falls back to marketCap-band iteration if pagination is unavailable,
+        and finally to the single-shot legacy call.
+        """
+        pages: list[dict] = []
+        base_params = {
+            "marketCapMoreThan": str(int(min_market_cap)),
+            "volumeMoreThan": str(int(min_volume)),
+            "priceMoreThan": str(min_price),
+            "country": "US",
+            "isActivelyTrading": "true",
+            "isEtf": "false",
+            "isFund": "false",
+            "limit": str(int(page_limit)),
+        }
+
+        get = getattr(self.fmp, "_get", None)
+        if callable(get):
+            for page in range(max(1, UNIVERSE_MAX_PAGES)):
+                try:
+                    rows = get("company-screener", {**base_params, "page": str(page)})
+                except Exception as e:
+                    logger.warning(f"[universe] Screener page {page} failed: {e}")
+                    break
+                if not rows or not isinstance(rows, list):
+                    break
+                pages.extend(r for r in rows if isinstance(r, dict))
+                logger.info(f"[universe] Screener page {page}: {len(rows)} rows")
+                if len(rows) < page_limit:
+                    break
+            if pages:
+                return pages
+
+            # Pagination returned nothing — iterate marketCap bands instead.
+            bands = [
+                (int(min_market_cap), 3_000_000_000),
+                (3_000_000_000, 10_000_000_000),
+                (10_000_000_000, 50_000_000_000),
+                (50_000_000_000, None),
+            ]
+            for low, high in bands:
+                if low < int(min_market_cap):
+                    continue
+                band_params = dict(base_params)
+                band_params["marketCapMoreThan"] = str(low)
+                if high is not None:
+                    band_params["marketCapLowerThan"] = str(high)
+                try:
+                    rows = get("company-screener", band_params)
+                except Exception as e:
+                    logger.warning(f"[universe] Screener band {low}-{high} failed: {e}")
+                    continue
+                if rows and isinstance(rows, list):
+                    pages.extend(r for r in rows if isinstance(r, dict))
+                    logger.info(f"[universe] Screener band {low}-{high}: {len(rows)} rows")
+            if pages:
+                return pages
+
+        # Last resort: legacy single-shot call (truncates at page_limit rows).
+        rows = self.fmp.screener(
+            market_cap_more_than=int(min_market_cap),
+            volume_more_than=int(min_volume),
+            price_more_than=min_price,
+            country="US",
+            is_actively_trading=True,
+            is_etf=False,
+            is_fund=False,
+            limit=page_limit,
+        )
+        return [r for r in (rows or []) if isinstance(r, dict)]
 
     def apply_regime_filter(
         self,

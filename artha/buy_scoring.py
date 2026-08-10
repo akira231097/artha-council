@@ -9,11 +9,25 @@ Hard gates still live in council.py and cannot be bypassed by this module.
 """
 from __future__ import annotations
 
+import json
+import logging
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
 
 _CIO_CATEGORIES = {"none", "evidence_backed", "logic_backed", "risk_override", "data_dispute"}
+
+_SCAN_SIGNALS_DIR = Path(__file__).resolve().parent.parent / "data" / "scan_signals"
+
+# Mechanical technical-setup thresholds (mirror the funnel's rank_candidates
+# constants; see load_scan_signal_row/_score_technicals_mechanical below).
+_52WH_PASS = 0.85     # George-Hwang (2004) 52-week-high proximity pass tier
+_52WH_STRONG = 0.95   # strong tier
+_MOMENTUM_Z_MIN = 1.0  # Jegadeesh-Titman (1993) 12-1 momentum, cross-sectional z
+_ID_SMOOTH = -0.02    # Da-Gurun-Warachka (2014) information discreteness
 
 
 def _num(value: Any, default: float | None = None) -> float | None:
@@ -63,6 +77,128 @@ def _analyst_vote_counts(analysts: list[Any] | tuple[Any, ...] | None) -> dict[s
         if verdict in counts:
             counts[verdict] += 1
     return counts
+
+
+def load_scan_signal_row(ticker: str, scan_date: str | None = None, max_age_days: int = 5) -> dict[str, Any] | None:
+    """Load the funnel's mechanical signal row for a ticker.
+
+    Reads data/scan_signals/<date>.json (schema v1, written by
+    rank_candidates.persist_scan_signals). Falls back to the most recent
+    file within ``max_age_days`` so weekend/holiday council runs still see
+    the last scan. Returns None when no row is available.
+    """
+    symbol = str(ticker or "").strip().upper()
+    if not symbol:
+        return None
+    try:
+        today = datetime.now(timezone.utc).date()
+        dates: list[str] = []
+        if scan_date:
+            dates.append(str(scan_date))
+        else:
+            dates.extend(
+                (today - timedelta(days=offset)).isoformat()
+                for offset in range(max_age_days + 1)
+            )
+        for date_str in dates:
+            path = _SCAN_SIGNALS_DIR / f"{date_str}.json"
+            if not path.exists():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            row = ((payload or {}).get("signals") or {}).get(symbol)
+            if isinstance(row, dict):
+                return {**row, "scan_date": str(payload.get("date") or date_str)}
+            return None  # File exists but ticker was not in the scan universe.
+    except Exception as exc:
+        logger.warning("[buy_scoring] Could not load scan signals for %s: %s", symbol, exc)
+    return None
+
+
+def _llm_technical_adjustment(analysts: list[Any] | tuple[Any, ...] | None) -> tuple[int, str]:
+    """Bounded +/-5 adjustment from the LLM technical analyst's opinion.
+
+    The mechanical funnel signals own the technical_setup score; the LLM
+    view can only nudge it, never define it.
+    """
+    from .config import Config
+
+    cap = max(0, int(getattr(Config, "BUY_TECH_LLM_ADJUST_MAX", 5)))
+    for analyst in analysts or []:
+        name = str(getattr(analyst, "analyst_name", "") or "").lower()
+        if "technical" not in name:
+            continue
+        verdict = str(getattr(analyst, "verdict", "") or "").upper()
+        confidence = int(getattr(analyst, "confidence", 5) or 5)
+        if verdict == "BUY":
+            points = cap if confidence >= 7 else max(1, cap - 2)
+            return points, f"LLM technical analyst BUY({confidence}) adds {points:+d}"
+        if verdict == "SELL":
+            points = -cap if confidence >= 7 else -max(1, cap - 2)
+            return points, f"LLM technical analyst SELL({confidence}) adds {points:+d}"
+        return 0, ""
+    return 0, ""
+
+
+def _score_technicals_mechanical(
+    signal_row: dict[str, Any],
+    analysts: list[Any] | tuple[Any, ...] | None = None,
+) -> tuple[int, list[str]]:
+    """Technical setup (0-25) from the funnel's mechanical scan signals.
+
+    Weights (documented so the audit trail is reproducible):
+      - trend template pass  = 10  (Minervini stage-2 template; Zarattini-
+                                    Antonacci 2024 showed the filter roughly
+                                    doubles momentum risk-adjusted returns)
+      - 52wH proximity >=0.85 = +5, >=0.95 = +8
+                                   (George-Hwang 2004: nearness to the
+                                    52-week high predicts forward returns —
+                                    it is a POSITIVE signal, not a warning)
+      - momentum z >= 1      = +5  (Jegadeesh-Titman 1993: 12-1 formation
+                                    momentum, cross-sectional z-score)
+      - ID <= -0.02          = +2  (Da-Gurun-Warachka 2014: smooth "frog in
+                                    the pan" advances outperform jumpy ones)
+    LLM technical analyst opinion adjusts +/-5 max on top. Total clamps 0-25.
+    """
+    from .config import Config
+
+    score = 0
+    notes: list[str] = []
+
+    if bool(signal_row.get("trend_template")):
+        pts = int(getattr(Config, "BUY_TECH_TREND_TEMPLATE_POINTS", 10))
+        score += pts
+        notes.append(f"trend template PASS (+{pts}, Minervini/Zarattini)")
+    prox = _num(signal_row.get("high_52w_prox"))
+    if prox is not None:
+        if prox >= _52WH_STRONG:
+            pts = int(getattr(Config, "BUY_TECH_52WH_STRONG_POINTS", 8))
+            score += pts
+            notes.append(f"52wH proximity {prox:.2f} >= {_52WH_STRONG} (+{pts}, George-Hwang)")
+        elif prox >= _52WH_PASS:
+            pts = int(getattr(Config, "BUY_TECH_52WH_PASS_POINTS", 5))
+            score += pts
+            notes.append(f"52wH proximity {prox:.2f} >= {_52WH_PASS} (+{pts}, George-Hwang)")
+    momentum_z = _num(signal_row.get("momentum_z"))
+    if momentum_z is not None and momentum_z >= _MOMENTUM_Z_MIN:
+        pts = int(getattr(Config, "BUY_TECH_MOMENTUM_Z_POINTS", 5))
+        score += pts
+        notes.append(f"12-1 momentum z {momentum_z:+.2f} >= {_MOMENTUM_Z_MIN} (+{pts}, Jegadeesh-Titman)")
+    info_discreteness = _num(signal_row.get("information_discreteness"))
+    if info_discreteness is not None and info_discreteness <= _ID_SMOOTH:
+        pts = int(getattr(Config, "BUY_TECH_ID_SMOOTH_POINTS", 2))
+        score += pts
+        notes.append(f"ID {info_discreteness:+.3f} <= {_ID_SMOOTH} smooth path (+{pts}, Da-Gurun-Warachka)")
+    if signal_row.get("volume_confirmed") is True:
+        notes.append("volume confirmation present (breakout-grade participation)")
+    elif signal_row.get("volume_confirmed") is False:
+        notes.append("no volume confirmation on latest bar")
+
+    llm_adj, llm_note = _llm_technical_adjustment(analysts)
+    if llm_adj:
+        score += llm_adj
+        notes.append(llm_note)
+    notes.insert(0, f"mechanical scan signals ({signal_row.get('scan_date', '?')}, track={signal_row.get('track', '?')})")
+    return _clamp(score, 0, 25), notes[:6]
 
 
 def _score_technicals(stock_data: dict[str, Any]) -> tuple[int, list[str]]:
@@ -206,6 +342,52 @@ def _score_fundamentals(stock_data: dict[str, Any]) -> tuple[int, list[str]]:
 
 
 def _score_sentiment(stock_data: dict[str, Any], valuation: dict[str, Any]) -> tuple[int, list[str]]:
+    """contrarian_sentiment (0-15): measured news sentiment first, legacy proxies second.
+
+    When collector.py attached a measured per-headline news sentiment row
+    (Finnhub company-news classified GOOD/BAD/UNKNOWN by Gemini flash;
+    Lopez-Lira & Tang, SSRN 4412788), map its -1..1 score around a NEUTRAL
+    baseline of 7.5/15: points = 7.5 + 6*score, with a bounded +/-1.5 blend
+    from the legacy analyst/short-interest signals when those exist.
+    Unavailable or thin data (n scored < 3) must NOT depress the component —
+    it falls back to the legacy path unchanged (that starvation bias is the
+    bug this fixes).
+    """
+    news = stock_data.get("news_sentiment")
+    legacy_points, legacy_notes, legacy_has_signals = _score_sentiment_legacy(stock_data, valuation)
+    if isinstance(news, dict) and news.get("available"):
+        raw = _num(news.get("score"))
+        n_good = int(_num(news.get("n_good"), 0) or 0)
+        n_bad = int(_num(news.get("n_bad"), 0) or 0)
+        n_scored = n_good + n_bad
+        if raw is not None and n_scored >= 3:
+            score = max(-1.0, min(1.0, raw))
+            points = 7.5 + 6.0 * score
+            notes = [
+                f"news sentiment (finnhub+llm) {score:+.2f} "
+                f"({n_good} good/{n_bad} bad/{int(_num(news.get('n_unknown'), 0) or 0)} unknown)"
+            ]
+            if legacy_has_signals:
+                # Bounded +/-1.5 blend from the legacy proxies (analyst targets,
+                # upgrades, short interest). Centered at 4 — the legacy scorer
+                # accumulates from 0 and typically lands 0-8, so centering at
+                # 7.5 would push nearly every candidate negative.
+                blend = max(-1.5, min(1.5, (float(legacy_points) - 4.0) * (1.5 / 7.5)))
+                points += blend
+                notes.append(f"legacy analyst/short-interest blend {blend:+.1f}")
+            notes.extend(legacy_notes)
+            return _clamp(points, 0, 15), notes[:5]
+    return legacy_points, legacy_notes
+
+
+def _score_sentiment_legacy(
+    stock_data: dict[str, Any], valuation: dict[str, Any]
+) -> tuple[int, list[str], bool]:
+    """Legacy analyst/short-interest proxy scoring (pre news-sentiment path).
+
+    Returns (points, notes, has_signals). has_signals reports whether ANY
+    legacy input was present, so the news path knows if a blend is meaningful.
+    """
     targets = valuation.get("analyst_targets") or {}
     rec_trends = stock_data.get("recommendation_trends") or {}
     short_interest = stock_data.get("short_interest") or {}
@@ -247,7 +429,15 @@ def _score_sentiment(stock_data: dict[str, Any], valuation: dict[str, Any]) -> t
         score += 1
         notes.append("possible squeeze asymmetry")
 
-    return _clamp(score, 0, 15), notes[:5]
+    has_signals = bool(
+        consensus_upside is not None
+        or net_upgrades
+        or net_downgrades
+        or short_pct is not None
+        or squeeze
+        or val_signal in ("positive", "neutral", "negative")
+    )
+    return _clamp(score, 0, 15), notes[:5], has_signals
 
 
 def _score_regime(stock_data: dict[str, Any], valuation: dict[str, Any], portfolio_risk: dict[str, Any], fear_greed: int | None) -> tuple[int, list[str]]:
@@ -382,12 +572,26 @@ def build_buy_score_audit(
     research_insufficient: bool = False,
     fear_greed: int | None = 50,
 ) -> dict[str, Any]:
-    """Build a deterministic buy score before CIO adjustment."""
+    """Build a deterministic buy score before CIO adjustment.
+
+    technical_setup consumes the funnel's mechanical scan signals
+    (data/scan_signals/<date>.json) when available — the LLM technical
+    opinion only nudges it by +/-5. Falls back to locally computed
+    RSI/SMA/MACD heuristics when no scan row exists for the ticker.
+    """
     components: dict[str, int] = {}
     component_notes: dict[str, list[str]] = {}
 
+    signal_row = stock_data.get("scan_signals")
+    if not isinstance(signal_row, dict) or not signal_row:
+        signal_row = load_scan_signal_row(str(stock_data.get("ticker") or ""))
+    if isinstance(signal_row, dict) and signal_row:
+        technical_scored = _score_technicals_mechanical(signal_row, analysts)
+    else:
+        technical_scored = _score_technicals(stock_data)
+
     scorers = {
-        "technical_setup": _score_technicals(stock_data),
+        "technical_setup": technical_scored,
         "fundamental_quality": _score_fundamentals(stock_data),
         "contrarian_sentiment": _score_sentiment(stock_data, valuation_expectations or {}),
         "regime_alignment": _score_regime(stock_data, valuation_expectations or {}, portfolio_factor_risk or {}, fear_greed),
@@ -406,19 +610,45 @@ def build_buy_score_audit(
         if points:
             adjustments.append({"points": int(points), "reason": reason, "category": category})
 
+    # Track-qualified momentum/breakout candidates must not be re-penalized
+    # for the very properties that qualified them (price above 50DMA, high
+    # RSI near a 52-week high, price above anchored analyst targets). That
+    # anchoring is what produced 17 straight SNDK defers during a 3x run.
+    # George-Hwang 2004: 52wH proximity is a positive signal; the mechanical
+    # technical component already prices setup quality.
+    momentum_qualified = bool(
+        isinstance(signal_row, dict)
+        and signal_row
+        and str(signal_row.get("track") or "").lower() in ("momentum", "breakout")
+        and signal_row.get("trend_template")
+    )
+
     valuation = valuation_expectations or {}
     val_signal = str(valuation.get("valuation_signal") or "").lower()
     expectation_risk = str(valuation.get("expectation_risk_level") or "").lower()
     if val_signal == "positive":
         add(4, "deterministic valuation signal is positive", "valuation")
     elif val_signal == "negative":
-        add(-8, "deterministic valuation signal is negative", "valuation")
+        # valuation_signal flips negative when EITHER valuation_score <= 42
+        # OR expectation_risk == "high" (valuation.py). The latter case is
+        # already penalized below — don't double-count the same condition.
+        genuinely_weak = (_num(valuation.get("valuation_score"), 50) or 50) <= 42
+        if genuinely_weak:
+            add(-8, "deterministic valuation signal is negative", "valuation")
+        else:
+            add(
+                -2 if momentum_qualified else -4,
+                "valuation signal negative on expectation risk only (double-count reduced)",
+                "valuation",
+            )
     if expectation_risk == "low":
         add(2, "expectation risk is low", "valuation")
-    elif expectation_risk == "moderate":
+    elif expectation_risk == "moderate" and not momentum_qualified:
         add(-2, "expectation risk is moderate", "valuation")
     elif expectation_risk == "high":
-        add(-5, "expectation risk is high", "valuation")
+        # Analyst-target anchoring: halved for qualified momentum tracks
+        # (targets lag price in strong trends; scout already de-anchored).
+        add(-2 if momentum_qualified else -5, "expectation risk is high", "valuation")
 
     dq = data_quality_report or {}
     if research_insufficient:
@@ -456,9 +686,11 @@ def build_buy_score_audit(
 
     risk_flags = valuation.get("risk_flags") or []
     joined_flags = " | ".join(str(flag).lower() for flag in risk_flags)
-    if "rsi is overbought" in joined_flags:
+    if "rsi is overbought" in joined_flags and not momentum_qualified:
         add(-4, "valuation engine flagged overbought RSI", "timing")
-    if "above 50-day sma" in joined_flags:
+    if "above 50-day sma" in joined_flags and not momentum_qualified:
+        # Being above the 50DMA is a trend-template REQUIREMENT for
+        # momentum tracks — never a deduction there.
         add(-4, "valuation engine flagged price extension above 50-day trend", "timing")
     if "low free-cash-flow yield" in joined_flags:
         add(-3, "valuation engine flagged low free-cash-flow yield", "quality")

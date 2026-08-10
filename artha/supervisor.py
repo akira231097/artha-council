@@ -41,11 +41,22 @@ LOG_ERROR_RE = re.compile(
 )
 LOG_WARNING_RE = re.compile(r"(?:^|[\s\[])(?:WARNING)(?:[\s\]:-]|$)", re.IGNORECASE)
 EXPECTED_TRANSIENT_LOG_PATTERNS = (
+    # Expected operational events (guardrails and known data-plan gaps doing
+    # their job) — reported through their own channels, not log-health WARNs.
+    "Hard Risk Gate FAILED",
+    "Missing data: analyst_estimates",
+    "ChatGPT backend rejected temperature",
     "Failed to fetch article",
     "403 Client Error",
     "404 Client Error",
     "Skipping non-HTML content",
     "Read timed out",
+    "ConnectTimeoutError",
+    "No route to host",
+    "EHOSTUNREACH",
+    "ENETUNREACH",
+    "ranking budget exhausted",
+    "Short interest unavailable",
 )
 QUALITY_DEGRADING_LOG_PATTERNS = (
     "Scoring JSON failed schema validation",
@@ -54,6 +65,11 @@ QUALITY_DEGRADING_LOG_PATTERNS = (
     "Telegram connection error",
     "Telegram API error",
     "Failed to send Telegram",
+)
+BENIGN_DASHBOARD_DISCONNECT_ERRORS = (
+    "ConnectionResetError",
+    "BrokenPipeError",
+    "ConnectionAbortedError",
 )
 
 
@@ -221,8 +237,17 @@ def _check_latest_report_artifact(journal: DecisionJournal) -> dict[str, Any]:
 
     latest = dict(row)
     raw_paths = str(latest.get("report_path") or "").strip()
-    paths = [Path(p.strip()) for p in raw_paths.split(",") if p.strip()]
+    raw_items = [p.strip() for p in raw_paths.split(",") if p.strip()]
+    virtual_items = [p for p in raw_items if p.lower() == "telegram"]
+    paths = [Path(p) for p in raw_items if p.lower() != "telegram"]
     if not paths:
+        if virtual_items:
+            return {
+                "name": "latest_report",
+                "status": "PASS",
+                "message": "Latest report was delivered through Telegram; no local file was expected.",
+                "virtual_paths": virtual_items,
+            }
         return {
             "name": "latest_report",
             "status": "WARN",
@@ -378,6 +403,10 @@ def _check_defer_watches(journal: DecisionJournal) -> dict[str, Any]:
         requeued = journal.requeue_stale_defer_auto_reviews(
             Config.DEFER_AUTO_REVIEW_STALE_REVIEW_MINUTES,
         )
+        failed_requeued = journal.requeue_failed_defer_auto_reviews(
+            Config.DEFER_AUTO_REVIEW_FAILED_RETRY_MINUTES,
+            Config.DEFER_AUTO_REVIEW_MAX_FAILURES,
+        )
         watches = journal.get_active_defer_watches()
         recent = journal.get_defer_watches(limit=50)
         status_counts: dict[str, int] = {}
@@ -397,7 +426,8 @@ def _check_defer_watches(journal: DecisionJournal) -> dict[str, Any]:
         status = "PASS"
         message = (
             f"{len(watches)} active DEFER/WATCH entry watch(es); expired {expired} stale watch(es); "
-            f"invalidated {invalidated} implausible watch(es); requeued {requeued} stale review(s). "
+            f"invalidated {invalidated} implausible watch(es); requeued {requeued} stale review(s) "
+            f"and {failed_requeued} bounded failed review(s). "
             f"Auto-review enabled={Config.DEFER_AUTO_REVIEW_ENABLED}, "
             f"cycle cap={Config.DEFER_AUTO_REVIEW_MAX_PER_CYCLE}, "
             f"Robinhood review prep={Config.DEFER_AUTO_REVIEW_PREPARE_ROBINHOOD_REVIEW}."
@@ -419,6 +449,7 @@ def _check_defer_watches(journal: DecisionJournal) -> dict[str, Any]:
             "expired_count": expired,
             "invalidated_count": invalidated,
             "requeued_count": requeued,
+            "failed_requeued_count": failed_requeued,
             "recent_status_counts": status_counts,
             "auto_review": {
                 "enabled": Config.DEFER_AUTO_REVIEW_ENABLED,
@@ -435,7 +466,7 @@ def _check_defer_watches(journal: DecisionJournal) -> dict[str, Any]:
 
 
 def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
-    """Verify held positions are actually protected by active sell theses."""
+    """Verify held positions are actually protected by sell-monitored theses."""
     try:
         portfolio = Portfolio.load(PORTFOLIO_FILE)
         position_tickers = {
@@ -444,11 +475,27 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
             if str(getattr(pos, "ticker", "") or "").strip()
         }
         active_rows = journal.get_all_active_theses()
+        monitoring_rows = (
+            journal.get_all_sell_monitored_theses()
+            if hasattr(journal, "get_all_sell_monitored_theses")
+            else active_rows
+        )
         active_tickers = {
             str(row.get("ticker") or "").upper()
             for row in active_rows
             if str(row.get("ticker") or "").strip()
         }
+        monitored_tickers = {
+            str(row.get("ticker") or "").upper()
+            for row in monitoring_rows
+            if str(row.get("ticker") or "").strip()
+        }
+        pending_exit_tickers = sorted({
+            str(row.get("ticker") or "").upper()
+            for row in monitoring_rows
+            if str(row.get("status") or "").lower() == "pending_exit"
+            and str(row.get("ticker") or "").strip()
+        })
         pending_rows = journal.get_pending_theses()
         pending_tickers = sorted({
             str(row.get("ticker") or "").upper()
@@ -456,22 +503,87 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
             if str(row.get("ticker") or "").strip()
         })
 
-        unmonitored_positions = sorted(position_tickers - active_tickers)
-        orphan_active_theses = sorted(active_tickers - position_tickers)
+        unmonitored_positions = sorted(position_tickers - monitored_tickers)
+        orphan_active_theses = sorted(monitored_tickers - position_tickers)
+        live_sell_statuses = {
+            "review_ready", "review_clear", "review_requested",
+            "auto_review_requested", "reviewed", "place_requested",
+            "submitted", "partially_filled",
+        }
+        now = _utcnow()
+        sell_actions = []
+        for row in journal.get_trade_actions(limit=500):
+            if str(row.get("action_type") or "").lower() != "auto_sell":
+                continue
+            if str(row.get("status") or "").lower() not in live_sell_statuses:
+                continue
+            expires_at = _parse_dt(row.get("expires_at"))
+            status = str(row.get("status") or "").lower()
+            if expires_at and expires_at < now and status not in {"submitted", "partially_filled"}:
+                continue
+            sell_actions.append(row)
+        live_by_thesis: dict[str, list[dict[str, Any]]] = {}
+        live_by_ticker: dict[str, list[dict[str, Any]]] = {}
+        for row in sell_actions:
+            live_by_thesis.setdefault(str(row.get("thesis_id") or ""), []).append(row)
+            live_by_ticker.setdefault(str(row.get("ticker") or "").upper(), []).append(row)
+        pending_rows_by_id = {
+            str(row.get("thesis_id") or ""): row
+            for row in monitoring_rows
+            if str(row.get("status") or "").lower() == "pending_exit"
+        }
+        pending_without_auto_sell = sorted(
+            str(row.get("ticker") or "").upper()
+            for thesis_id, row in pending_rows_by_id.items()
+            if not live_by_thesis.get(thesis_id)
+        )
+        duplicate_live_sells = sorted(
+            ticker for ticker, rows in live_by_ticker.items() if ticker and len(rows) > 1
+        )
 
         if unmonitored_positions:
             return {
                 "name": "position_monitoring",
                 "status": "FAIL",
                 "message": (
-                    "Held portfolio position(s) are missing active sell theses: "
+                    "Held portfolio position(s) are missing sell-monitored theses: "
                     f"{', '.join(unmonitored_positions[:8])}. Sell monitoring is not safe until reconciled."
                 ),
                 "portfolio_positions": sorted(position_tickers),
                 "active_theses": sorted(active_tickers),
+                "pending_exit_theses": pending_exit_tickers,
                 "pending_theses": pending_tickers,
                 "unmonitored_positions": unmonitored_positions,
                 "orphan_active_theses": orphan_active_theses,
+            }
+
+        if pending_without_auto_sell:
+            return {
+                "name": "position_monitoring",
+                "status": "FAIL",
+                "message": (
+                    "Pending-exit position(s) have no drainable Council-approved auto-sell: "
+                    f"{', '.join(pending_without_auto_sell[:8])}."
+                ),
+                "portfolio_positions": sorted(position_tickers),
+                "active_theses": sorted(active_tickers),
+                "pending_exit_theses": pending_exit_tickers,
+                "pending_exit_without_auto_sell": pending_without_auto_sell,
+                "duplicate_live_sells": duplicate_live_sells,
+            }
+
+        if duplicate_live_sells:
+            return {
+                "name": "position_monitoring",
+                "status": "FAIL",
+                "message": (
+                    "Multiple live auto-sell actions exist for the same ticker: "
+                    f"{', '.join(duplicate_live_sells[:8])}."
+                ),
+                "portfolio_positions": sorted(position_tickers),
+                "pending_exit_theses": pending_exit_tickers,
+                "pending_exit_without_auto_sell": [],
+                "duplicate_live_sells": duplicate_live_sells,
             }
 
         if orphan_active_theses:
@@ -479,11 +591,12 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
                 "name": "position_monitoring",
                 "status": "WARN",
                 "message": (
-                    "Active sell theses exist without matching portfolio positions: "
+                    "Sell-monitored theses exist without matching portfolio positions: "
                     f"{', '.join(orphan_active_theses[:8])}. Artha may be watching stale holdings."
                 ),
                 "portfolio_positions": sorted(position_tickers),
                 "active_theses": sorted(active_tickers),
+                "pending_exit_theses": pending_exit_tickers,
                 "pending_theses": pending_tickers,
                 "unmonitored_positions": unmonitored_positions,
                 "orphan_active_theses": orphan_active_theses,
@@ -500,6 +613,7 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
                 ),
                 "portfolio_positions": [],
                 "active_theses": [],
+                "pending_exit_theses": pending_exit_tickers,
                 "pending_theses": pending_tickers,
                 "unmonitored_positions": [],
                 "orphan_active_theses": [],
@@ -508,16 +622,19 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
         if not position_tickers:
             message = "No active holdings; sell engine is idle by design."
         else:
-            message = f"{len(position_tickers)} held position(s) have matching active sell theses."
+            message = f"{len(position_tickers)} held position(s) have matching sell-monitored theses."
         return {
             "name": "position_monitoring",
             "status": "PASS",
             "message": message,
             "portfolio_positions": sorted(position_tickers),
             "active_theses": sorted(active_tickers),
+            "pending_exit_theses": pending_exit_tickers,
             "pending_theses": pending_tickers,
             "unmonitored_positions": [],
             "orphan_active_theses": [],
+            "pending_exit_without_auto_sell": [],
+            "duplicate_live_sells": [],
         }
     except Exception as exc:
         return {"name": "position_monitoring", "status": "FAIL", "message": f"Position monitoring check failed: {exc}"}
@@ -631,8 +748,19 @@ def _check_shadow_rules(journal: DecisionJournal) -> dict[str, Any]:
             message = "No shadow-rule practice rows yet; future decisions will create them when rules trigger."
         else:
             status = "PASS"
+            rule_count = 0
+            try:
+                with journal._connect() as conn:
+                    rule_count = int(
+                        conn.execute("SELECT COUNT(DISTINCT rule_id) FROM shadow_rule_evaluations").fetchone()[0]
+                    )
+            except Exception:
+                pass
             message = (
-                f"{total} shadow-rule practice row(s): "
+                f"{rule_count} candidate rule(s) under paper trials — {total} evaluation row(s): "
+                f"{summary.get('tracking', 0)} tracking, {summary.get('completed', 0)} completed."
+                if rule_count
+                else f"{total} shadow-rule evaluation row(s): "
                 f"{summary.get('tracking', 0)} tracking, {summary.get('completed', 0)} completed."
             )
         return {
@@ -704,14 +832,51 @@ def _check_recent_logs(
             return
         bucket.append({"file": path.name, "line": line.strip()[:300]})
 
+    def suppress_benign_disconnect_tracebacks(path: Path, lines: list[str]) -> list[str]:
+        if path.name != "dashboard.err.log":
+            return lines
+        filtered: list[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if "Exception occurred during processing of request from" not in line:
+                filtered.append(line)
+                i += 1
+                continue
+
+            block = [line]
+            j = i + 1
+            while j < len(lines):
+                block.append(lines[j])
+                if (
+                    lines[j].strip() == "----------------------------------------"
+                    and any(error in "\n".join(block) for error in BENIGN_DASHBOARD_DISCONNECT_ERRORS)
+                ):
+                    break
+                j += 1
+            block_text = "\n".join(block)
+            if "Traceback (most recent call last):" in block_text and any(
+                error in block_text for error in BENIGN_DASHBOARD_DISCONNECT_ERRORS
+            ):
+                add(transient_lines, path, "Dashboard client disconnected during request; suppressed benign traceback.")
+                i = j + 1
+                continue
+
+            filtered.extend(block)
+            i = j + 1
+        return filtered
+
     for path in candidates:
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_tail_lines:]
         except Exception:
             add(error_lines, path, "Could not read log file")
             continue
+        lines = suppress_benign_disconnect_tracebacks(path, lines)
         for line in lines:
             if not line.strip():
+                continue
+            if re.search(r"\]\s+INFO:", line):
                 continue
             if "Traceback" in line or "CRITICAL" in line:
                 add(fatal_lines, path, line)
@@ -744,8 +909,8 @@ def _check_recent_logs(
     else:
         status = "PASS"
         message = (
-            f"Recent log tails look clean. Ignored {len(transient_lines)} expected web-fetch warning(s) "
-            "that had fallback behavior."
+            f"Recent log tails look clean. Ignored {len(transient_lines)} expected transient log event(s) "
+            "whose bounded fallback behavior completed normally."
         )
 
     return {
@@ -904,6 +1069,15 @@ def run_supervisor_check(
     op = _timed_operation("decision_feature_backfill", lambda: backfill_decision_features(journal))
     operations.append(op)
     decision_backfilled = op.get("result") if op.get("status") == "PASS" else 0
+
+    op = _timed_operation(
+        "trade_action_reconciliation",
+        lambda: {
+            "reconciled": journal.reconcile_trade_actions_from_execution_orders(),
+            "expired": journal.expire_stale_trade_actions(),
+        },
+    )
+    operations.append(op)
 
     if run_diagnosis or diagnosis is None:
         op = _timed_operation(

@@ -3,10 +3,13 @@
 Each analyst gets their own model, their own prompt, and produces
 an independent assessment. No cross-contamination between analysts.
 
-Model assignments:
-  - Fundamental Analyst: GPT 5.5 via ChatGPT backend (deep reasoning, conservative)
+Model assignments (Wave 2 diversity: three distinct model lineages when the
+optional Claude analyst is enabled; two otherwise):
+  - Fundamental Analyst: GPT 5.5 via ChatGPT backend (deep reasoning)
   - Technical Analyst: Gemini (pattern recognition, speed)
-  - Contrarian Analyst: GPT 5.5 via ChatGPT backend API (independent risk perspective)
+  - Contrarian Analyst: Claude (optional, ARTHA_CLAUDE_ANALYST_ENABLED) with
+    Gemini fallback — an independent lineage from the fundamental analyst so
+    the council is no longer two copies of the same model agreeing with itself
 """
 import json
 import logging
@@ -23,19 +26,27 @@ logger = logging.getLogger(__name__)
 # Data Serialization
 # ---------------------------------------------------------------------------
 
+# Keys whose list values must NOT be truncated to 10 items (e.g. the explicit
+# 90-bar recent price window the technical analyst reasons over).
+_KEEP_FULL_LIST_KEYS = {"recent_daily_bars"}
+
+
 def _serialize_data(data: dict) -> str:
     """Convert collected data dict to a readable string for the LLM.
-    
+
     Truncates very large fields to keep within context limits.
     """
-    def _truncate(obj, max_items: int = 10, max_str_len: int = 500):
+    def _truncate(obj, max_items: int = 10, max_str_len: int = 500, keep_full: bool = False):
         if isinstance(obj, list):
-            truncated = obj[:max_items]
-            if len(obj) > max_items:
-                truncated.append(f"... ({len(obj) - max_items} more items)")
+            truncated = obj if keep_full else obj[:max_items]
+            if not keep_full and len(obj) > max_items:
+                truncated = truncated + [f"... ({len(obj) - max_items} more items)"]
             return [_truncate(item, max_items, max_str_len) for item in truncated]
         elif isinstance(obj, dict):
-            return {k: _truncate(v, max_items, max_str_len) for k, v in obj.items()}
+            return {
+                k: _truncate(v, max_items, max_str_len, keep_full=(k in _KEEP_FULL_LIST_KEYS))
+                for k, v in obj.items()
+            }
         elif isinstance(obj, str) and len(obj) > max_str_len:
             return obj[:max_str_len] + "..."
         return obj
@@ -44,13 +55,75 @@ def _serialize_data(data: dict) -> str:
     return json.dumps(cleaned, indent=2, default=str)
 
 
+def _recent_daily_bars(data: dict, n: int = 90) -> list[dict]:
+    """Last ``n`` daily bars, oldest-first (the FINAL row is the most recent
+    session), each with an explicit ISO date so the LLM cannot misread order.
+
+    Prefers the already-collected price_history; falls back to
+    collector.get_recent_bars when history is missing or too short.
+    """
+    history = data.get("price_history")
+    bars: list[dict] = []
+    if isinstance(history, list):
+        for row in history:
+            if not isinstance(row, dict) or not row.get("date"):
+                continue
+            bars.append({
+                "date": str(row.get("date")),
+                "open": row.get("open"),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "close": row.get("close"),
+                "volume": row.get("volume"),
+            })
+        bars.sort(key=lambda item: item["date"])
+    if len(bars) < min(n, 30):
+        try:
+            from .collector import get_recent_bars
+            fetched = get_recent_bars(str(data.get("ticker") or ""), n)
+            if fetched:
+                bars = fetched
+        except Exception as exc:
+            logger.warning("[analysts] recent-bars fallback fetch failed: %s", exc)
+    return bars[-n:]
+
+
+def _attach_price_action(relevant: dict, data: dict, n: int = 90) -> dict:
+    """Attach the explicit recent-bars window + funnel scan signals."""
+    bars = _recent_daily_bars(data, n)
+    if bars:
+        relevant["recent_daily_bars"] = bars
+        relevant["recent_daily_bars_note"] = (
+            f"LAST {len(bars)} daily bars, ordered oldest->newest. The FINAL row "
+            f"({bars[-1].get('date')}) is the most recent session."
+        )
+    scan_signals = data.get("scan_signals")
+    if not (isinstance(scan_signals, dict) and scan_signals):
+        # Council injects this row; fall back to disk when analysts are
+        # invoked standalone so they still see the mechanical evidence.
+        try:
+            from .buy_scoring import load_scan_signal_row
+            scan_signals = load_scan_signal_row(str(data.get("ticker") or ""))
+        except Exception as exc:
+            logger.warning("[analysts] scan-signal fallback load failed: %s", exc)
+            scan_signals = None
+    if isinstance(scan_signals, dict) and scan_signals:
+        relevant["scan_signals"] = scan_signals
+        relevant["scan_signals_note"] = (
+            "Mechanically computed funnel signals (12-1 momentum z-score, 52-week-high "
+            "proximity, Minervini trend template, information discreteness, volume "
+            "confirmation). Treat these as ground truth over your own re-derivations."
+        )
+    return relevant
+
+
 def _extract_relevant_fundamental_data(data: dict) -> dict:
     """Extract fundamental-relevant fields for the fundamental analyst.
 
     Includes: financials, valuation, analyst consensus, earnings calendar,
     price targets, news, and price history for full context.
     """
-    return {
+    relevant = {
         "quote": data.get("quote"),
         "profile": data.get("profile"),
         "income_statement": data.get("income_statement"),
@@ -82,20 +155,21 @@ def _extract_relevant_fundamental_data(data: dict) -> dict:
         "yf_price_history_available": bool(data.get("yf_price_history")),
         "massive_price_history_available": bool(data.get("massive_price_history")),
     }
+    return _attach_price_action(relevant, data)
 
 
 def _extract_relevant_technical_data(data: dict) -> dict:
     """Extract technical/sentiment-relevant fields.
 
-    Includes: price history, computed technicals, news, sentiment,
-    earnings calendar (affects volatility patterns), and analyst price
-    targets (act as psychological support/resistance levels).
+    Includes: the explicit last-90-bars window (newest-last with dates),
+    the funnel's mechanical scan signals, computed technicals, news,
+    sentiment, earnings calendar (affects volatility patterns), and analyst
+    price targets (act as psychological support/resistance levels).
     """
-    return {
+    relevant = {
         "quote": data.get("quote"),
         "yf_quote": data.get("yf_quote"),
         "massive_quote": data.get("massive_quote"),
-        "price_history": data.get("price_history"),
         "price_history_source": data.get("price_history_source"),
         "history_provider_checks": data.get("history_provider_checks"),
         "fmp_price_history_available": bool(data.get("fmp_price_history")),
@@ -115,6 +189,7 @@ def _extract_relevant_technical_data(data: dict) -> dict:
         "short_interest": data.get("short_interest"),
         "data_quality_report": data.get("data_quality_report") or data.get("data_quality"),
     }
+    return _attach_price_action(relevant, data)
 
 
 def _extract_relevant_risk_data(data: dict) -> dict:
@@ -125,7 +200,7 @@ def _extract_relevant_risk_data(data: dict) -> dict:
     risk), technicals (overbought/death cross signals), and price
     history (drawdown/extension risk).
     """
-    return {
+    relevant = {
         "quote": data.get("quote"),
         "profile": data.get("profile"),
         "income_statement": data.get("income_statement"),
@@ -150,7 +225,6 @@ def _extract_relevant_risk_data(data: dict) -> dict:
         "yf_quote": data.get("yf_quote"),
         "massive_quote": data.get("massive_quote"),
         "technicals": data.get("technicals"),
-        "price_history": data.get("price_history"),
         "price_history_source": data.get("price_history_source"),
         "history_provider_checks": data.get("history_provider_checks"),
         "fmp_price_history_available": bool(data.get("fmp_price_history")),
@@ -158,6 +232,7 @@ def _extract_relevant_risk_data(data: dict) -> dict:
         "massive_price_history_available": bool(data.get("massive_price_history")),
         "data_quality_report": data.get("data_quality_report") or data.get("data_quality"),
     }
+    return _attach_price_action(relevant, data)
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +324,13 @@ def run_technical_analyst(
         return None
 
 
+def get_contrarian_model_label() -> str:
+    """Model label recorded for the contrarian analyst in council decisions."""
+    if Config.CLAUDE_ANALYST_ENABLED:
+        return Config.CLAUDE_ANALYST_MODEL
+    return Config.GEMINI_TECHNICAL_MODEL
+
+
 def run_contrarian_analyst(
     stock_data: dict,
     macro_data: dict | None = None,
@@ -257,11 +339,13 @@ def run_contrarian_analyst(
     pre_brief: str = "",
     momentum_context: str = "",
 ) -> Optional[str]:
-    """Run the Contrarian / Risk Analyst (GPT 5.5 via ChatGPT backend).
+    """Run the Contrarian / Risk Analyst (Claude optional, Gemini default).
 
-    Devil's advocate, stress-tests every thesis. Uses GPT 5.5 via the
-    ChatGPT backend OAuth flow for an independent model perspective from
-    the rest of the council.
+    Devil's advocate, stress-tests every thesis. Wave 2 moved this analyst
+    OFF the fundamental analyst's GPT model: two copies of the same model
+    at the same temperature are not independent perspectives. Uses Claude
+    (via the Agent SDK) when ARTHA_CLAUDE_ANALYST_ENABLED is set, falling
+    back to Gemini on any failure; otherwise Gemini directly.
     """
     relevant_data = _extract_relevant_risk_data(stock_data)
     if macro_data:
@@ -276,9 +360,28 @@ def run_contrarian_analyst(
         momentum_context=momentum_context or "No momentum history available.",
     )
 
+    if Config.CLAUDE_ANALYST_ENABLED:
+        try:
+            from .claude_sdk import call_claude
+
+            text, _usage = call_claude(
+                prompt,
+                model=Config.CLAUDE_ANALYST_MODEL,
+                timeout_sec=float(Config.CLAUDE_ANALYST_TIMEOUT_SECONDS),
+            )
+            if text:
+                return text
+            logger.warning("Claude contrarian returned empty output — falling back to Gemini")
+        except Exception as e:
+            logger.warning(f"Claude contrarian failed ({e}) — falling back to Gemini")
+
+    if not Config.GOOGLE_API_KEY and not Config.GEMINI_API_KEY:
+        logger.error("GEMINI/GOOGLE API key not set — cannot run contrarian analyst")
+        return None
+
     try:
-        client = ChatGPTBackendClient()
-        return client.chat(prompt)
+        text, _ = gemini_generate(prompt, model=Config.GEMINI_TECHNICAL_MODEL, timeout=90)
+        return text
     except Exception as e:
         logger.error(f"Contrarian analyst failed: {e}")
         return None

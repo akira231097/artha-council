@@ -2,11 +2,17 @@
 
 Every position enters the system as a pending thesis (created when council issues a
 buy recommendation) and transitions through:
-  pending → active (Sarath buys) → archived (position exited or expired)
+  pending → active (operator buys) → archived (position exited or expired)
 
 Thesis objects store the investment thesis, invalidation conditions, stop levels,
 review schedule, and health score. They are the primary vehicle the sell engine
 uses to decide whether to hold, trim, or exit.
+
+Invalidation conditions (rule 4.7) come in two forms:
+  - Legacy free text (str): not machine-checkable; flagged for council review.
+  - Structured (dict): ``{"metric": "price", "op": "<", "value": 205.0,
+    "description": "..."}`` — machine-checkable against collector data via
+    :func:`evaluate_invalidation_conditions`.
 """
 from __future__ import annotations
 
@@ -62,6 +68,103 @@ _MIN_HOLD: dict[str, int] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Structured invalidation conditions (rule 4.7)
+# ---------------------------------------------------------------------------
+
+# Supported comparison operators for machine-checkable conditions.
+# Includes the word-form aliases the CIO structured decision block emits
+# (council._DECISION_OPS / prompts.SYNTHESIS_PROMPT — keep in sync), so
+# council-stored conditions are actually evaluable by the sell engine.
+_CONDITION_OPS = {
+    "<": lambda observed, threshold: observed < threshold,
+    "<=": lambda observed, threshold: observed <= threshold,
+    ">": lambda observed, threshold: observed > threshold,
+    ">=": lambda observed, threshold: observed >= threshold,
+    "==": lambda observed, threshold: observed == threshold,
+    "lt": lambda observed, threshold: observed < threshold,
+    "lte": lambda observed, threshold: observed <= threshold,
+    "gt": lambda observed, threshold: observed > threshold,
+    "gte": lambda observed, threshold: observed >= threshold,
+    "eq": lambda observed, threshold: observed == threshold,
+}
+
+
+def is_structured_condition(condition: Any) -> bool:
+    """Return True when a condition is a machine-checkable structured dict."""
+    return (
+        isinstance(condition, dict)
+        and bool(str(condition.get("metric") or "").strip())
+        and str(condition.get("op") or "").strip() in _CONDITION_OPS
+        and condition.get("value") is not None
+    )
+
+
+def evaluate_invalidation_conditions(
+    conditions: list[Any],
+    metrics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Evaluate a thesis's invalidation conditions against observed metrics.
+
+    Args:
+        conditions: Mixed list of legacy free-text (str) and structured (dict)
+            conditions, e.g. ``{"metric": "price", "op": "<", "value": 205.0}``.
+        metrics: Observed values keyed by metric name (e.g. ``{"price": 261.0,
+            "pnl_pct": 11.7, "days_held": 12}`` — pnl_pct is in percent).
+            Missing or None metrics yield status ``"unknown"``.
+
+    Returns:
+        One result dict per condition:
+        ``{"condition", "status": "triggered"|"intact"|"unknown"|"legacy_text",
+           "metric", "observed", "threshold"}``
+    """
+    results: list[dict[str, Any]] = []
+    for condition in conditions or []:
+        if not is_structured_condition(condition):
+            results.append({
+                "condition": condition,
+                "status": "legacy_text" if isinstance(condition, str) else "unknown",
+                "metric": None,
+                "observed": None,
+                "threshold": None,
+            })
+            continue
+
+        metric = str(condition["metric"]).strip()
+        op = str(condition["op"]).strip()
+        try:
+            threshold = float(condition["value"])
+        except (TypeError, ValueError):
+            results.append({
+                "condition": condition,
+                "status": "unknown",
+                "metric": metric,
+                "observed": None,
+                "threshold": condition.get("value"),
+            })
+            continue
+
+        observed_raw = metrics.get(metric)
+        try:
+            observed = float(observed_raw) if observed_raw is not None else None
+        except (TypeError, ValueError):
+            observed = None
+
+        if observed is None:
+            status = "unknown"
+        else:
+            status = "triggered" if _CONDITION_OPS[op](observed, threshold) else "intact"
+
+        results.append({
+            "condition": condition,
+            "status": status,
+            "metric": metric,
+            "observed": observed,
+            "threshold": threshold,
+        })
+    return results
+
+
 @dataclass
 class PositionThesis:
     """Full thesis for a single position."""
@@ -72,13 +175,14 @@ class PositionThesis:
     position_type: str              # BUY | STARTER | TACTICAL_BUY | ACCUMULATE | ADD
 
     thesis_summary: str = ""
-    invalidation_conditions: list[str] = field(default_factory=list)
+    # Mixed list: legacy free-text strings and/or structured condition dicts
+    invalidation_conditions: list[Any] = field(default_factory=list)
     price_target: Optional[float] = None
     stop_loss_pct: float = -0.20    # fraction (e.g. -0.25)
     stop_loss_price: Optional[float] = None
     recommended_allocation_pct: float = 0.0
 
-    # Filled when Sarath executes the buy
+    # Filled when the operator executes the buy
     entry_price: Optional[float] = None
     entry_date: Optional[str] = None
     entry_regime: Optional[str] = None
@@ -140,6 +244,16 @@ class PositionThesis:
         return self.days_held < self.min_hold_days
 
     @property
+    def structured_conditions(self) -> list[dict[str, Any]]:
+        """Machine-checkable invalidation conditions (rule 4.7)."""
+        return [c for c in (self.invalidation_conditions or []) if is_structured_condition(c)]
+
+    @property
+    def legacy_text_conditions(self) -> list[str]:
+        """Free-text conditions — not machine-checkable; council-review only."""
+        return [c for c in (self.invalidation_conditions or []) if isinstance(c, str)]
+
+    @property
     def in_cooldown(self) -> bool:
         if not self.sell_cooldown_until:
             return False
@@ -189,7 +303,7 @@ class ThesisTracker:
         ticker: str,
         position_type: str,
         thesis_summary: str = "",
-        invalidation_conditions: Optional[list[str]] = None,
+        invalidation_conditions: Optional[list[Any]] = None,
         price_target: Optional[float] = None,
         stop_loss_pct: Optional[float] = None,
         recommended_allocation_pct: float = 0.0,
@@ -242,16 +356,31 @@ class ThesisTracker:
         entry_price: float,
         entry_date: Optional[str] = None,
         shares: Optional[float] = None,
+        atr: Optional[float] = None,
+        price_history: Optional[list[dict]] = None,
     ) -> Optional[PositionThesis]:
-        """Activate a pending thesis when Sarath executes the buy."""
+        """Activate a pending thesis when the operator executes the buy.
+
+        The initial hard stop follows rule 4.1: entry -8% or entry - 2.5×ATR14,
+        whichever is tighter, capped at 10% below entry. Callers may pass a
+        precomputed ``atr`` or recent OHLCV ``price_history`` (for ATR-14);
+        without either, the fixed-percent stop applies.
+        """
         thesis = self.get(thesis_id)
         if thesis is None:
             logger.warning("[thesis] Cannot activate — thesis %s not found", thesis_id)
             return None
 
+        from .trailing_stop import compute_atr, compute_initial_stop
+
         position_type = thesis.position_type
-        stop_pct = thesis.stop_loss_pct or _HARD_STOP.get(position_type, Config.SELL_HARD_STOP_LEGACY)
-        hard_stop = round(entry_price * (1 + stop_pct), 4) if entry_price else None
+        if atr is None and price_history:
+            try:
+                atr = compute_atr(price_history, period=14)
+            except Exception as atr_e:
+                logger.warning("[thesis] ATR computation failed for %s: %s", thesis.ticker, atr_e)
+                atr = None
+        hard_stop = compute_initial_stop(entry_price, atr=atr) if entry_price else None
 
         # Compute first review date
         review_days = _REVIEW_DAYS.get(position_type, 30)
@@ -264,13 +393,17 @@ class ThesisTracker:
         thesis.thesis_health_score = 100
         thesis.last_review_date = _utcnow_iso()
         thesis.next_review_date = next_review
-        thesis.sell_cooldown_until = _add_days(Config.SELL_COOLDOWN_AFTER_BUY)
+        cooldown_days = min(
+            int(Config.SELL_COOLDOWN_AFTER_BUY),
+            int(_MIN_HOLD.get(position_type, Config.SELL_COOLDOWN_AFTER_BUY)),
+        )
+        thesis.sell_cooldown_until = _add_days(cooldown_days)
 
-        # For TACTICAL_BUY, set initial trailing stop
-        if position_type == "TACTICAL_BUY":
-            # Initial trailing stop is same as hard stop; updated by TrailingStop module
-            thesis.trailing_stop_price = hard_stop
-            thesis.trailing_stop_high = entry_price
+        # Initialize trailing stop state for all buy-type positions.
+        # The trail itself stays parked at the hard stop until the position
+        # earns its cushion (+2R or +20%; see trailing_stop.cushion_reached).
+        thesis.trailing_stop_price = hard_stop
+        thesis.trailing_stop_high = entry_price
 
         if shares and thesis.notes:
             thesis.notes += f" | {shares} shares @ ${entry_price:.2f}"
@@ -320,6 +453,21 @@ class ThesisTracker:
                 theses.append(PositionThesis.from_db_dict(row))
             except Exception as e:
                 logger.warning("[thesis] Skip malformed thesis row: %s", e)
+        return theses
+
+    def get_all_monitored(self) -> list[PositionThesis]:
+        """Get all theses protecting held positions (active + pending_exit).
+
+        A ``pending_exit`` position is still held until the sell executes —
+        it must keep its stop/trail monitoring or it free-falls unwatched.
+        """
+        rows = self.journal.get_all_sell_monitored_theses()
+        theses = []
+        for row in rows:
+            try:
+                theses.append(PositionThesis.from_db_dict(row))
+            except Exception as e:
+                logger.warning("[thesis] Skip malformed monitored thesis row: %s", e)
         return theses
 
     def get_pending_for_ticker(self, ticker: str) -> Optional[PositionThesis]:
@@ -378,13 +526,27 @@ class ThesisTracker:
     def update_trailing_stop(
         self, thesis_id: str, new_stop: float, new_high: Optional[float] = None
     ) -> None:
-        """Update trailing stop price and high-water mark."""
+        """Update trailing stop price and high-water mark.
+
+        Rule 4.8 enforcement: a stop is NEVER widened. Attempts to lower the
+        trailing stop are ignored (the existing stop is kept) and logged.
+        """
         thesis = self.get(thesis_id)
         if not thesis:
             return
-        thesis.trailing_stop_price = new_stop
+        existing_stop = float(thesis.trailing_stop_price or 0)
+        if new_stop and existing_stop > 0 and new_stop < existing_stop:
+            logger.warning(
+                "[thesis] Refusing to lower trailing stop for %s: %.4f → %.4f "
+                "(stops only ratchet up)",
+                thesis.ticker,
+                existing_stop,
+                new_stop,
+            )
+        else:
+            thesis.trailing_stop_price = new_stop
         if new_high is not None:
-            thesis.trailing_stop_high = new_high
+            thesis.trailing_stop_high = max(new_high, float(thesis.trailing_stop_high or 0))
         self._save(thesis)
 
     def set_cooldown(self, thesis_id: str, days: int) -> None:
@@ -405,14 +567,52 @@ class ThesisTracker:
             self._save(thesis)
 
     def update_thesis_fields(self, thesis_id: str, **kwargs: Any) -> None:
-        """Generic field updater for any thesis fields."""
+        """Generic field updater for any thesis fields.
+
+        Rule 4.8 enforcement: stop fields (``hard_stop_price``,
+        ``trailing_stop_price``) may only ratchet up through this path —
+        attempts to lower them are dropped with a warning.
+        """
         thesis = self.get(thesis_id)
         if not thesis:
             return
         for key, value in kwargs.items():
-            if hasattr(thesis, key):
-                setattr(thesis, key, value)
+            if not hasattr(thesis, key):
+                continue
+            if key in ("hard_stop_price", "trailing_stop_price") and value is not None:
+                try:
+                    existing = float(getattr(thesis, key) or 0)
+                    if existing > 0 and float(value) < existing:
+                        logger.warning(
+                            "[thesis] Refusing to lower %s for %s: %.4f → %.4f "
+                            "(stops only ratchet up)",
+                            key,
+                            thesis.ticker,
+                            existing,
+                            float(value),
+                        )
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            setattr(thesis, key, value)
         self._save(thesis)
+
+    def refresh_pending_expiry(self, thesis_id: str, days: int | None = None) -> bool:
+        """Renew a pending thesis after a fresh buy-side Council decision."""
+        thesis = self.get(thesis_id)
+        if not thesis or thesis.status != "pending":
+            return False
+        thesis.pending_expiry = _add_days(
+            Config.SELL_THESIS_PENDING_EXPIRY_DAYS if days is None else max(1, int(days))
+        )
+        self._save(thesis)
+        logger.info(
+            "[thesis] Refreshed pending thesis %s ticker=%s expiry=%s",
+            thesis_id[:8],
+            thesis.ticker,
+            thesis.pending_expiry,
+        )
+        return True
 
     def mark_waiting_for_sell(self, thesis_id: str, reason: str = "", notes: str = "") -> None:
         """Move an active thesis into waiting-for-sell state after ARTHA issues an exit call."""
@@ -436,6 +636,34 @@ class ThesisTracker:
             thesis.ticker,
             reason,
         )
+
+    def reactivate_for_retry(self, thesis_id: str, notes: str = "") -> bool:
+        """Inverse of mark_waiting_for_sell: revive a pending_exit thesis.
+
+        A ``pending_exit`` thesis is excluded from get_due_reviews, so if its
+        queued sell action dies (blocked/review_blocked/expired/skipped)
+        nothing would ever retry the exit. Reverting to ``active`` with an
+        immediately-due review lets the next periodic-review slot re-confirm
+        and re-queue a fresh sell. Returns True when the thesis was revived.
+        """
+        thesis = self.get(thesis_id)
+        if not thesis:
+            logger.warning("[thesis] Cannot reactivate — thesis %s not found", thesis_id)
+            return False
+        if thesis.status != "pending_exit":
+            return False
+        thesis.status = "active"
+        thesis.next_review_date = _utcnow_iso()
+        if notes:
+            stamp = _utcnow_iso()
+            thesis.notes = (thesis.notes or "") + f"\n[EXIT_RETRY {stamp}] {notes}"
+        self._save(thesis)
+        logger.info(
+            "[thesis] Reactivated pending_exit thesis %s ticker=%s for exit retry",
+            thesis_id[:8],
+            thesis.ticker,
+        )
+        return True
 
     # ---------------------------------------------------------------- archive
 

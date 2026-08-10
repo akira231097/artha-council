@@ -29,6 +29,26 @@ except ImportError:
 
 CENTS = Decimal("0.01")
 ACCURACY_FILE = Path(__file__).resolve().parent.parent / "data" / "accuracy.json"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# Benchmark-relative grading tunables (Wave 2 consolidates into Config).
+ACCURACY_BENCHMARK_TICKER = os.getenv("ARTHA_ACCURACY_BENCHMARK_TICKER", "SPY")
+ACCURACY_REVIEW_DAYS = int(_env_float("ARTHA_ACCURACY_REVIEW_DAYS", 30))
+# No-buy verdicts grade INCORRECT when the name beats the benchmark by more
+# than this many percentage points over the review window; PARTIALLY_CORRECT
+# between the partial and incorrect gates. Buy verdicts mirror on the downside.
+ACCURACY_EXCESS_INCORRECT_PCT = _env_float("ARTHA_ACCURACY_EXCESS_INCORRECT_PCT", 10.0)
+ACCURACY_EXCESS_PARTIAL_PCT = _env_float("ARTHA_ACCURACY_EXCESS_PARTIAL_PCT", 5.0)
 CURRENT_ANALYST_LABELS = {
     "fundamental": "Fundamental (GPT agentic)",
     "technical": "Technical (Gemini agentic)",
@@ -39,6 +59,15 @@ LEGACY_ANALYST_LABELS = {
     "technical": "Technical (Gemini)",
     "contrarian": "Contrarian (GPT 5.4)",
 }
+BUY_SIDE_VERDICTS = {"STRONG BUY", "BUY", "STARTER", "TACTICAL BUY", "ACCUMULATE", "ADD"}
+AVOID_SIDE_VERDICTS = {"AVOID", "STRONG SELL", "SELL"}
+WAIT_SIDE_VERDICTS = {"WATCH", "DEFER", "HOLD"}
+TRIM_SIDE_VERDICTS = {"TRIM", "REDUCE"}
+# Benchmark-relative grading groups verdicts by whether they keep exposure:
+# HOLD keeps the position, so it wins with the name; WATCH/DEFER/AVOID/SELL
+# all mean "no exposure", so they are wrong when the name beats the benchmark.
+EXPOSURE_VERDICTS = BUY_SIDE_VERDICTS | {"HOLD"}
+NO_EXPOSURE_VERDICTS = {"WATCH", "DEFER", "AVOID", "SELL", "STRONG SELL"} | TRIM_SIDE_VERDICTS
 
 
 def _utcnow() -> datetime:
@@ -80,6 +109,184 @@ def _analyst_labels_for_record(rec: dict) -> dict[str, str]:
     if isinstance(labels, dict) and all(k in labels for k in CURRENT_ANALYST_LABELS):
         return {k: str(labels[k]) for k in CURRENT_ANALYST_LABELS}
     return CURRENT_ANALYST_LABELS if _is_current_era(rec) else LEGACY_ANALYST_LABELS
+
+
+def _normalize_verdict(verdict: str) -> str:
+    return str(verdict or "").upper().replace("_", " ").strip()
+
+
+def _grade_verdict(verdict: str, change_pct: Decimal) -> str:
+    """Grade modern Artha verdict families against subsequent price movement."""
+    normalized = _normalize_verdict(verdict)
+    if normalized in BUY_SIDE_VERDICTS:
+        if change_pct >= 5:
+            return "CORRECT"
+        if change_pct >= 0:
+            return "PARTIALLY_CORRECT"
+        return "INCORRECT"
+    if normalized in AVOID_SIDE_VERDICTS:
+        if change_pct <= 0:
+            return "CORRECT"
+        if change_pct <= 5:
+            return "PARTIALLY_CORRECT"
+        return "INCORRECT"
+    if normalized in WAIT_SIDE_VERDICTS:
+        if abs(change_pct) <= 10:
+            return "CORRECT"
+        if change_pct > 10:
+            return "PARTIALLY_CORRECT"
+        return "CORRECT"
+    if normalized in TRIM_SIDE_VERDICTS:
+        if change_pct <= -2:
+            return "CORRECT"
+        if change_pct <= 3:
+            return "PARTIALLY_CORRECT"
+        return "INCORRECT"
+    return "UNGRADED"
+
+
+def _grade_analyst_verdict(verdict: str, change_pct: Decimal) -> str:
+    normalized = _normalize_verdict(verdict)
+    if normalized in BUY_SIDE_VERDICTS:
+        if change_pct >= 5:
+            return "CORRECT"
+        if change_pct >= 0:
+            return "PARTIALLY_CORRECT"
+        return "INCORRECT"
+    if normalized in AVOID_SIDE_VERDICTS:
+        if change_pct <= 0:
+            return "CORRECT"
+        if change_pct <= 5:
+            return "PARTIALLY_CORRECT"
+        return "INCORRECT"
+    if normalized in WAIT_SIDE_VERDICTS:
+        if abs(change_pct) <= 10:
+            return "CORRECT"
+        return "PARTIALLY_CORRECT"
+    if normalized in TRIM_SIDE_VERDICTS:
+        if change_pct <= -2:
+            return "CORRECT"
+        if change_pct <= 3:
+            return "PARTIALLY_CORRECT"
+        return "INCORRECT"
+    return "UNGRADED"
+
+
+def _grade_verdict_excess(verdict: str, excess_pct: Decimal) -> str:
+    """Grade a verdict on benchmark-relative excess return (percentage points).
+
+    No-exposure verdicts (DEFER/WATCH/AVOID/SELL/TRIM) are INCORRECT when the
+    name beat the benchmark by more than ACCURACY_EXCESS_INCORRECT_PCT,
+    PARTIALLY_CORRECT between the partial and incorrect gates, and CORRECT
+    when the name matched or lagged the benchmark. Exposure verdicts
+    (BUY/STARTER/TACTICAL_BUY/ACCUMULATE/HOLD) are graded symmetrically.
+    Timid calls can now be wrong: a +30% missed winner grades INCORRECT.
+    """
+    normalized = _normalize_verdict(verdict)
+    incorrect_gate = Decimal(str(ACCURACY_EXCESS_INCORRECT_PCT))
+    partial_gate = Decimal(str(ACCURACY_EXCESS_PARTIAL_PCT))
+    if normalized in EXPOSURE_VERDICTS:
+        if excess_pct <= -incorrect_gate:
+            return "INCORRECT"
+        if excess_pct <= -partial_gate:
+            return "PARTIALLY_CORRECT"
+        return "CORRECT"
+    if normalized in NO_EXPOSURE_VERDICTS:
+        if excess_pct >= incorrect_gate:
+            return "INCORRECT"
+        if excess_pct >= partial_gate:
+            return "PARTIALLY_CORRECT"
+        return "CORRECT"
+    return "UNGRADED"
+
+
+def _directional_outcome(verdict: str, excess_pct: Decimal) -> Optional[int]:
+    """1 when the verdict was directionally right vs the benchmark, else 0."""
+    normalized = _normalize_verdict(verdict)
+    if normalized in EXPOSURE_VERDICTS:
+        return 1 if excess_pct > 0 else 0
+    if normalized in NO_EXPOSURE_VERDICTS:
+        return 1 if excess_pct <= 0 else 0
+    return None
+
+
+def _confidence_to_probability(confidence: object) -> Optional[float]:
+    """Map analyst confidence 1-9 to an implied probability 0.5-0.95."""
+    try:
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        return None
+    if conf <= 0:
+        return None
+    conf = max(1.0, min(9.0, conf))
+    return 0.5 + (conf - 1.0) / 8.0 * 0.45
+
+
+def _brier_score(verdict: str, confidence: object, excess_pct: Decimal) -> Optional[float]:
+    """Brier score of the analyst's implied probability of being right."""
+    probability = _confidence_to_probability(confidence)
+    outcome = _directional_outcome(verdict, excess_pct)
+    if probability is None or outcome is None:
+        return None
+    return round((probability - float(outcome)) ** 2, 4)
+
+
+# --- Benchmark price helpers (FMP EOD, cached per process) -----------------
+_history_cache: dict[str, Optional[list[dict]]] = {}
+
+
+def _fmp_history(symbol: str, period: str = "1y") -> Optional[list[dict]]:
+    """Fetch (and cache) FMP EOD history rows sorted ascending by date."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return None
+    cache_key = f"{symbol}:{period}"
+    if cache_key not in _history_cache:
+        try:
+            from .collector import FMPCollector
+            _history_cache[cache_key] = FMPCollector().history(symbol, period=period)
+        except Exception as exc:
+            logger.warning("[accuracy] FMP history failed for %s: %s", symbol, exc)
+            _history_cache[cache_key] = None
+    return _history_cache[cache_key]
+
+
+def _close_on_or_after(rows: Optional[list[dict]], target_date: str) -> Optional[float]:
+    """First close on/after an ISO date from ascending FMP history rows."""
+    if not rows:
+        return None
+    for row in rows:
+        if str(row.get("date") or "") >= target_date[:10]:
+            close = row.get("close")
+            if close:
+                return float(close)
+    return None
+
+
+def _benchmark_return_pct(
+    start: datetime,
+    end: datetime,
+    symbol: Optional[str] = None,
+    period: str = "1y",
+) -> Optional[Decimal]:
+    """Benchmark close-to-close return over [start, end] in percent."""
+    symbol = symbol or ACCURACY_BENCHMARK_TICKER
+    rows = _fmp_history(symbol, period=period)
+    start_close = _close_on_or_after(rows, start.date().isoformat())
+    end_close = _close_on_or_after(rows, end.date().isoformat())
+    if not start_close or not end_close:
+        return None
+    return ((Decimal(str(end_close)) - Decimal(str(start_close)))
+            / Decimal(str(start_close)) * 100).quantize(CENTS)
+
+
+def _num_or_none(v: object) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def _to_decimal(v: object) -> Decimal:
@@ -178,7 +385,7 @@ class AccuracyTracker:
         """Record a new council recommendation for future grading."""
         now = _utcnow()
         rec.timestamp = now.isoformat()
-        rec.review_after = (now + timedelta(days=30)).isoformat()
+        rec.review_after = (now + timedelta(days=ACCURACY_REVIEW_DAYS)).isoformat()
         rec.status = "PENDING"
         rec.council_version = rec.council_version or Config.ACCURACY_CURRENT_COUNCIL_VERSION
         rec.accuracy_era = rec.accuracy_era or "current"
@@ -222,20 +429,88 @@ class AccuracyTracker:
                 continue
         return due
 
+    @staticmethod
+    def _apply_grade_fields(
+        target: dict,
+        current: Decimal,
+        change_pct: Decimal,
+        benchmark_return: Optional[Decimal],
+    ) -> dict:
+        """Apply benchmark-relative grade + analyst attribution to a record in place."""
+        verdict = target.get("verdict", "").upper()
+
+        if benchmark_return is not None:
+            excess_pct = (change_pct - benchmark_return).quantize(CENTS)
+            grade = _grade_verdict_excess(verdict, excess_pct)
+            grade_basis = f"excess_vs_{ACCURACY_BENCHMARK_TICKER}"
+            if grade == "UNGRADED":
+                # Verdict outside known families — fall back to legacy grading.
+                grade = _grade_verdict(verdict, change_pct)
+        else:
+            # Benchmark unavailable: legacy absolute grading so records still close.
+            excess_pct = None
+            grade = _grade_verdict(verdict, change_pct)
+            grade_basis = "absolute_legacy_fallback"
+
+        # Grade individual analysts against their OWN verdict, plus a Brier
+        # score on their stated confidence (1-9 → implied p of 0.5-0.95).
+        analyst_grades: dict[str, str] = {}
+        analyst_brier: dict[str, Optional[float]] = {}
+        for analyst_key, analyst_name in _analyst_labels_for_record(target).items():
+            a_verdict = target.get(f"{analyst_key}_verdict", "").upper()
+            a_confidence = target.get(f"{analyst_key}_confidence", 0)
+            if excess_pct is not None:
+                a_grade = _grade_verdict_excess(a_verdict, excess_pct)
+                if a_grade == "UNGRADED":
+                    a_grade = _grade_analyst_verdict(a_verdict, change_pct)
+                analyst_brier[analyst_name] = _brier_score(a_verdict, a_confidence, excess_pct)
+            else:
+                a_grade = _grade_analyst_verdict(a_verdict, change_pct)
+                analyst_brier[analyst_name] = None
+            analyst_grades[analyst_name] = a_grade
+
+        entry = _to_decimal(target.get("entry_price", "0"))
+        target["status"] = "GRADED"
+        target["price_at_review"] = str(current)
+        target["price_change_pct"] = str(change_pct)
+        target["benchmark_ticker"] = ACCURACY_BENCHMARK_TICKER
+        target["benchmark_return_pct"] = str(benchmark_return) if benchmark_return is not None else ""
+        target["excess_return_pct"] = str(excess_pct) if excess_pct is not None else ""
+        target["grade_basis"] = grade_basis
+        target["grade"] = grade
+        target["analyst_grades"] = analyst_grades
+        target["analyst_brier"] = analyst_brier
+        excess_note = (
+            f" vs {ACCURACY_BENCHMARK_TICKER} {benchmark_return:+}% (excess {excess_pct:+}%)"
+            if excess_pct is not None else ""
+        )
+        target["notes"] = (
+            f"Entry ${entry} → Review ${current} ({change_pct:+}%){excess_note}. "
+            f"Verdict was {verdict}. Grade: {grade}."
+        )
+        return target
+
     def grade_recommendation(
         self,
         ticker: str,
         timestamp: str,
         current_price: float,
+        benchmark_return_pct: Optional[float] = None,
     ) -> Optional[dict]:
-        """Grade a recommendation by comparing entry price to current price.
+        """Grade a recommendation on benchmark-relative excess return.
 
-        Grading logic:
-        - BUY/STRONG BUY → price went up ≥5% = CORRECT, 0-5% = PARTIALLY_CORRECT, down = INCORRECT
-        - AVOID/STRONG SELL → price went down or flat = CORRECT, up ≤5% = PARTIALLY_CORRECT, up >5% = INCORRECT
-        - WATCH → any outcome within ±10% = CORRECT (it was genuinely uncertain)
+        Grading logic (excess = ticker return minus benchmark return over the
+        same window, in percentage points):
+        - Exposure verdicts (BUY/STARTER/TACTICAL_BUY/ACCUMULATE/HOLD):
+          INCORRECT when lagging the benchmark by >10pp, PARTIALLY_CORRECT for
+          a 5-10pp lag, CORRECT when matching or beating it.
+        - No-exposure verdicts (DEFER/WATCH/AVOID/SELL/TRIM): symmetric —
+          INCORRECT when the name beats the benchmark by >10pp,
+          PARTIALLY_CORRECT for 5-10pp, CORRECT when it matches or lags.
 
-        Each analyst also gets graded individually.
+        Each analyst is graded against their OWN verdict, with a Brier score
+        on their confidence. When the benchmark fetch fails, grading falls
+        back to the legacy absolute rules so records still close.
         """
         lf = self._lock(exclusive=True)
         try:
@@ -257,83 +532,177 @@ class AccuracyTracker:
 
             entry = _to_decimal(target.get("entry_price", "0"))
             current = _to_decimal(current_price)
+            rec_dt = _record_timestamp(target) or _utcnow()
+
             if entry == 0:
-                return None
+                # Recorded without a usable quote — backfill the entry from EOD
+                # history instead of leaving the record PENDING forever.
+                backfilled = _close_on_or_after(
+                    _fmp_history(ticker), rec_dt.date().isoformat()
+                )
+                if backfilled:
+                    entry = _to_decimal(backfilled)
+                    target["entry_price"] = str(entry)
+                    target["notes"] = "Entry price backfilled from EOD history. "
+                else:
+                    target["status"] = "GRADED"
+                    target["grade"] = "UNGRADED"
+                    target["notes"] = "No entry price recorded and EOD backfill failed."
+                    records[target_idx] = target
+                    self._save(records)
+                    return target
 
             change_pct = ((current - entry) / entry * 100).quantize(CENTS)
-            verdict = target.get("verdict", "").upper()
 
-            # Grade overall verdict
-            if verdict in ("STRONG BUY", "BUY"):
-                if change_pct >= 5:
-                    grade = "CORRECT"
-                elif change_pct >= 0:
-                    grade = "PARTIALLY_CORRECT"
-                else:
-                    grade = "INCORRECT"
-            elif verdict in ("AVOID", "STRONG SELL"):
-                if change_pct <= 0:
-                    grade = "CORRECT"
-                elif change_pct <= 5:
-                    grade = "PARTIALLY_CORRECT"
-                else:
-                    grade = "INCORRECT"
-            elif verdict == "WATCH":
-                if abs(change_pct) <= 10:
-                    grade = "CORRECT"
-                elif change_pct > 10:
-                    grade = "PARTIALLY_CORRECT"  # Missed opportunity
-                else:
-                    grade = "CORRECT"  # Avoided a drop
+            if benchmark_return_pct is not None:
+                benchmark_return: Optional[Decimal] = _to_decimal(benchmark_return_pct).quantize(CENTS)
             else:
-                grade = "UNGRADED"
+                benchmark_return = _benchmark_return_pct(rec_dt, _utcnow())
 
-            # Grade individual analysts
-            analyst_grades = {}
-            for analyst_key, analyst_name in _analyst_labels_for_record(target).items():
-                a_verdict = target.get(f"{analyst_key}_verdict", "").upper()
-                if a_verdict in ("BUY",):
-                    if change_pct >= 5:
-                        analyst_grades[analyst_name] = "CORRECT"
-                    elif change_pct >= 0:
-                        analyst_grades[analyst_name] = "PARTIALLY_CORRECT"
-                    else:
-                        analyst_grades[analyst_name] = "INCORRECT"
-                elif a_verdict in ("SELL",):
-                    if change_pct <= 0:
-                        analyst_grades[analyst_name] = "CORRECT"
-                    elif change_pct <= 5:
-                        analyst_grades[analyst_name] = "PARTIALLY_CORRECT"
-                    else:
-                        analyst_grades[analyst_name] = "INCORRECT"
-                elif a_verdict in ("HOLD",):
-                    if abs(change_pct) <= 10:
-                        analyst_grades[analyst_name] = "CORRECT"
-                    else:
-                        analyst_grades[analyst_name] = "PARTIALLY_CORRECT"
-                else:
-                    analyst_grades[analyst_name] = "UNGRADED"
-
-            # Update record
-            target["status"] = "GRADED"
-            target["price_at_review"] = str(current)
-            target["price_change_pct"] = str(change_pct)
-            target["grade"] = grade
-            target["analyst_grades"] = analyst_grades
-            target["notes"] = (
-                f"Entry ${entry} → Review ${current} ({change_pct:+}%). "
-                f"Verdict was {verdict}. Grade: {grade}."
-            )
+            target = self._apply_grade_fields(target, current, change_pct, benchmark_return)
             records[target_idx] = target
             self._save(records)
 
             logger.info(
-                f"[accuracy] Graded {ticker}: {verdict} → {grade} "
-                f"({change_pct:+}% over 30 days)"
+                f"[accuracy] Graded {ticker}: {target.get('verdict', '').upper()} → {target['grade']} "
+                f"({change_pct:+}% raw, excess {target.get('excess_return_pct') or 'n/a'}% "
+                f"over {ACCURACY_REVIEW_DAYS} days)"
             )
             return target
         finally:
             self._unlock(lf)
+
+    def backfill_regrade(self, now: Optional[datetime] = None) -> dict:
+        """Regrade every matured record with benchmark-relative excess grading.
+
+        Recomputes the ticker return over the exact [timestamp, timestamp +
+        ACCURACY_REVIEW_DAYS] window from FMP EOD closes (entry price stays the
+        recorded live price), fetches the benchmark over the same window, and
+        re-applies grades + analyst attribution + Brier scores. Previously
+        GRADED records keep their old grade in ``previous_grade``.
+
+        Returns a summary dict with before/after grade distributions.
+        """
+        now = now or _utcnow()
+        lf = self._lock(exclusive=True)
+        try:
+            records = self._load()
+            before = {}
+            for rec in records:
+                key = rec.get("grade") or rec.get("status", "?")
+                before[key] = before.get(key, 0) + 1
+
+            regraded = 0
+            skipped: list[str] = []
+            for idx, rec in enumerate(records):
+                rec_dt = _record_timestamp(rec)
+                ticker = str(rec.get("ticker") or "").upper()
+                if not rec_dt or not ticker:
+                    continue
+                review_dt = rec_dt + timedelta(days=ACCURACY_REVIEW_DAYS)
+                if review_dt > now:
+                    continue  # Not matured yet — leave PENDING for the nightly loop.
+
+                entry = _to_decimal(rec.get("entry_price", "0"))
+                rows = _fmp_history(ticker)
+                if entry == 0:
+                    backfilled = _close_on_or_after(rows, rec_dt.date().isoformat())
+                    if backfilled:
+                        entry = _to_decimal(backfilled)
+                        rec["entry_price"] = str(entry)
+                review_close = _close_on_or_after(rows, review_dt.date().isoformat())
+                if entry == 0 or not review_close:
+                    skipped.append(ticker)
+                    continue
+
+                current = _to_decimal(review_close)
+                change_pct = ((current - entry) / entry * 100).quantize(CENTS)
+                benchmark_return = _benchmark_return_pct(rec_dt, review_dt)
+
+                previous_grade = rec.get("grade") or "PENDING"
+                rec = self._apply_grade_fields(rec, current, change_pct, benchmark_return)
+                rec["previous_grade"] = previous_grade
+                rec["regraded_at"] = now.isoformat()
+                records[idx] = rec
+                regraded += 1
+
+            after = {}
+            for rec in records:
+                key = rec.get("grade") or rec.get("status", "?")
+                after[key] = after.get(key, 0) + 1
+
+            self._save(records)
+            logger.info(
+                "[accuracy] Backfill regrade complete: %d regraded, %d skipped",
+                regraded, len(skipped),
+            )
+            return {
+                "regraded": regraded,
+                "skipped": skipped,
+                "before": before,
+                "after": after,
+            }
+        finally:
+            self._unlock(lf)
+
+    def backfill_recommendation_outcomes(self, journal: Any = None) -> int:
+        """Grade matured artha.db recommendation rows the same excess-vs-benchmark way.
+
+        Fills ``outcome``/``outcome_notes`` on rows older than the review
+        window that are still 'unknown'. Never touches ``status`` (owned by
+        live execution flows). Returns count of rows updated.
+        """
+        if journal is None:
+            from .journal import DecisionJournal
+            journal = DecisionJournal()
+        now = _utcnow()
+        updated = 0
+        with journal._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, ticker, action, timestamp, price_at_recommendation
+                FROM recommendations
+                WHERE (outcome IS NULL OR outcome = 'unknown' OR outcome = '')
+                """
+            ).fetchall()
+            for row in rows:
+                rec_dt = _parse_dt(row["timestamp"])
+                ticker = str(row["ticker"] or "").upper()
+                if not rec_dt or not ticker:
+                    continue
+                review_dt = rec_dt + timedelta(days=ACCURACY_REVIEW_DAYS)
+                if review_dt > now:
+                    continue
+                hist = _fmp_history(ticker)
+                entry = _num_or_none(row["price_at_recommendation"]) or _close_on_or_after(
+                    hist, rec_dt.date().isoformat()
+                )
+                review_close = _close_on_or_after(hist, review_dt.date().isoformat())
+                if not entry or not review_close:
+                    continue
+                change_pct = ((Decimal(str(review_close)) - Decimal(str(entry)))
+                              / Decimal(str(entry)) * 100).quantize(CENTS)
+                benchmark_return = _benchmark_return_pct(rec_dt, review_dt)
+                if benchmark_return is None:
+                    continue
+                excess_pct = (change_pct - benchmark_return).quantize(CENTS)
+                grade = _grade_verdict_excess(str(row["action"] or ""), excess_pct)
+                if grade == "UNGRADED":
+                    continue
+                conn.execute(
+                    "UPDATE recommendations SET outcome = ?, outcome_notes = ? WHERE id = ?",
+                    (
+                        grade.lower(),
+                        f"{ACCURACY_REVIEW_DAYS}d return {change_pct:+}% vs "
+                        f"{ACCURACY_BENCHMARK_TICKER} {benchmark_return:+}% "
+                        f"(excess {excess_pct:+}%)",
+                        row["id"],
+                    ),
+                )
+                updated += 1
+            conn.commit()
+        logger.info("[accuracy] Backfilled outcomes for %d recommendation row(s)", updated)
+        return updated
 
     def get_summary_stats(self, since: object = None) -> dict:
         """Return aggregate accuracy statistics."""
@@ -356,8 +725,12 @@ class AccuracyTracker:
         if not graded:
             return {
                 "total_graded": 0,
+                "usable_graded": 0,
+                "ungraded": 0,
                 "total_pending": len(pending),
                 "overall_accuracy": None,
+                "weighted_accuracy": None,
+                "strict_accuracy": None,
                 "analyst_accuracy": {},
                 "scope_start": since_dt.isoformat() if since_dt else None,
             }
@@ -365,14 +738,23 @@ class AccuracyTracker:
         correct = sum(1 for r in graded if r.get("grade") == "CORRECT")
         partial = sum(1 for r in graded if r.get("grade") == "PARTIALLY_CORRECT")
         incorrect = sum(1 for r in graded if r.get("grade") == "INCORRECT")
+        ungraded = sum(1 for r in graded if r.get("grade") == "UNGRADED")
         total = correct + partial + incorrect
+        excess_values = [
+            v for v in (_num_or_none(r.get("excess_return_pct")) for r in graded)
+            if v is not None
+        ]
 
-        # Analyst-level stats
-        analyst_stats: dict[str, dict[str, int]] = {}
+        # Analyst-level stats (graded vs their OWN verdict, plus Brier score)
+        analyst_stats: dict[str, dict[str, Any]] = {}
         for rec in graded:
+            briers = rec.get("analyst_brier") or {}
             for analyst, ag in rec.get("analyst_grades", {}).items():
                 if analyst not in analyst_stats:
-                    analyst_stats[analyst] = {"correct": 0, "partial": 0, "incorrect": 0, "total": 0}
+                    analyst_stats[analyst] = {
+                        "correct": 0, "partial": 0, "incorrect": 0, "total": 0,
+                        "brier_sum": 0.0, "brier_n": 0,
+                    }
                 analyst_stats[analyst]["total"] += 1
                 if ag == "CORRECT":
                     analyst_stats[analyst]["correct"] += 1
@@ -380,6 +762,10 @@ class AccuracyTracker:
                     analyst_stats[analyst]["partial"] += 1
                 elif ag == "INCORRECT":
                     analyst_stats[analyst]["incorrect"] += 1
+                brier = _num_or_none(briers.get(analyst)) if isinstance(briers, dict) else None
+                if brier is not None:
+                    analyst_stats[analyst]["brier_sum"] += brier
+                    analyst_stats[analyst]["brier_n"] += 1
 
         analyst_accuracy = {}
         for analyst, stats in analyst_stats.items():
@@ -391,20 +777,32 @@ class AccuracyTracker:
                     "partial": stats["partial"],
                     "incorrect": stats["incorrect"],
                     "total": t,
+                    "avg_brier": (
+                        round(stats["brier_sum"] / stats["brier_n"], 4)
+                        if stats["brier_n"] else None
+                    ),
+                    "brier_n": stats["brier_n"],
                 }
 
         return {
             "total_graded": len(graded),
+            "usable_graded": total,
+            "ungraded": ungraded,
             "total_pending": len(pending),
             "overall_accuracy": round((correct + 0.5 * partial) / total * 100, 1) if total else None,
+            "weighted_accuracy": round((correct + 0.5 * partial) / total * 100, 1) if total else None,
+            "strict_accuracy": round(correct / total * 100, 1) if total else None,
             "correct": correct,
             "partially_correct": partial,
             "incorrect": incorrect,
             "analyst_accuracy": analyst_accuracy,
             "scope_start": since_dt.isoformat() if since_dt else None,
             "avg_price_change": round(
-                sum(float(r.get("price_change_pct", 0)) for r in graded) / len(graded), 2
-            ) if graded else 0,
+                sum(float(r.get("price_change_pct", 0)) for r in graded if r.get("grade") != "UNGRADED") / total, 2
+            ) if total else 0,
+            "avg_excess_return": (
+                round(sum(excess_values) / len(excess_values), 2) if excess_values else None
+            ),
         }
 
     def update_shadow_forward_returns(self, journal) -> dict:
@@ -670,12 +1068,15 @@ class AccuracyTracker:
         lines.append("🧭 Current Council Era")
         lines.append(f"   Version: {Config.ACCURACY_CURRENT_COUNCIL_VERSION}")
         lines.append(f"   Since: {Config.ACCURACY_CURRENT_ERA_START[:10]}")
-        if current_stats["total_graded"] > 0:
-            lines.append(f"   Accuracy: {current_stats['overall_accuracy']}%")
+        if current_stats["usable_graded"] > 0:
+            lines.append(f"   Weighted score: {current_stats['weighted_accuracy']}%")
+            lines.append(f"   Strict correct-only: {current_stats['strict_accuracy']}%")
             lines.append(
                 f"   Correct: {current_stats['correct']} | Partial: {current_stats['partially_correct']} "
                 f"| Wrong: {current_stats['incorrect']}"
             )
+            if current_stats.get("ungraded"):
+                lines.append(f"   Ungraded legacy-label rows: {current_stats['ungraded']}")
             lines.append(f"   Avg Price Change: {current_stats['avg_price_change']:+.1f}%")
             lines.append("")
 
@@ -687,18 +1088,22 @@ class AccuracyTracker:
                 )
         else:
             lines.append(
-                f"   No graded recommendations yet; "
+                f"   No final usable grades yet; "
                 f"{current_stats['total_pending']} pending current-era review(s)."
             )
+            lines.append("   Treat current-era quality as still in live tracking, not proven by legacy rows.")
         lines.append("")
 
-        if stats["total_graded"] > 0:
+        if stats["usable_graded"] > 0:
             lines.append("📜 Legacy / All-Time Context")
-            lines.append(f"   Overall Accuracy: {stats['overall_accuracy']}%")
+            lines.append(f"   Weighted historical score: {stats['weighted_accuracy']}%")
+            lines.append(f"   Strict correct-only score: {stats['strict_accuracy']}%")
             lines.append(
                 f"   Correct: {stats['correct']} | Partial: {stats['partially_correct']} "
                 f"| Wrong: {stats['incorrect']}"
             )
+            if stats.get("ungraded"):
+                lines.append(f"   Ungraded legacy-label rows: {stats['ungraded']}")
             lines.append(
                 "   Legacy rows include older model/prompt eras and are not prompt-tune triggers by themselves."
             )

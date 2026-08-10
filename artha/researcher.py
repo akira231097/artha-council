@@ -9,6 +9,7 @@ real-time market context and sourced bull/bear cases.
 import re
 import json
 import logging
+import time
 import requests
 
 # Shared HTTP session for connection pooling
@@ -294,7 +295,9 @@ Return ONLY a JSON array of search query strings, no other text:
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
 
-            response = requests.get(url, headers=headers, timeout=timeout, stream=True)
+            connect_timeout = min(5, max(1, timeout))
+            read_timeout = min(5, max(1, timeout))
+            response = requests.get(url, headers=headers, timeout=(connect_timeout, read_timeout), stream=True)
             response.raise_for_status()
 
             # Skip non-HTML content (PDFs, images, etc.)
@@ -304,11 +307,22 @@ Return ONLY a JSON array of search query strings, no other text:
                 response.close()
                 return ""
 
-            # Read up to 500KB to prevent memory issues
+            # Read up to 500KB with a hard wall-clock cap. Some finance/news
+            # endpoints keep streaming bodies open, so a single raw.read() can
+            # hold a review far longer than the request timeout.
             max_bytes = 512_000
-            response.raw.decode_content = True
-            raw = response.raw.read(max_bytes)
+            deadline = time.monotonic() + max(1, timeout)
+            chunks: list[bytes] = []
+            total_bytes = 0
+            for chunk in response.iter_content(chunk_size=16_384):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total_bytes += len(chunk)
+                if total_bytes >= max_bytes or time.monotonic() >= deadline:
+                    break
             response.close()
+            raw = b"".join(chunks)[:max_bytes]
 
             # Decode with fallback
             try:

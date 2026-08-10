@@ -21,10 +21,30 @@ from typing import Any, Optional
 
 from .config import Config
 from .journal import DecisionJournal
-from .thesis_tracker import ThesisTracker, PositionThesis
-from .trailing_stop import TrailingStopManager
+from .thesis_tracker import (
+    ThesisTracker,
+    PositionThesis,
+    evaluate_invalidation_conditions,
+)
+from .trailing_stop import TrailingStopManager, TRAIL_MANAGED_POSITION_TYPES
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Sell signal types (exit engine v2)
+# ---------------------------------------------------------------------------
+SIGNAL_HARD_STOP = "hard_stop"
+SIGNAL_TRAILING_STOP = "trailing_stop"
+SIGNAL_DEAD_MONEY_TIME_STOP = "dead_money_time_stop"   # rule 4.5
+SIGNAL_PROFIT_TAKE = "profit_take"                     # rule 4.3
+SIGNAL_EARNINGS_RISK = "earnings_risk"                 # rule 4.6
+SIGNAL_THESIS_BREAK = "thesis_break"                   # rule 4.7
+SIGNAL_REGIME_EXIT = "regime_exit"                     # rule 4.7/regime
+SIGNAL_REVIEW_EXIT = "review_exit"                     # rule 4.7 material news
+
+# Scale-out markers used to make one-shot rules idempotent
+_MARKER_FAST_MOVE_HOLD = "8WK_HOLD"
+_MARKER_PROFIT_TAKE = "PT_+20%"
 
 
 def _utcnow() -> datetime:
@@ -33,6 +53,32 @@ def _utcnow() -> datetime:
 
 def _utcnow_iso() -> str:
     return _utcnow().isoformat()
+
+
+def _trading_days_between(start: datetime, end: datetime) -> int:
+    """Approximate trading days (weekdays) between two datetimes."""
+    if end <= start:
+        return 0
+    count = 0
+    cursor = start.date()
+    end_date = end.date()
+    while cursor < end_date:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            count += 1
+    return count
+
+
+def _trading_days_held(thesis: PositionThesis) -> int:
+    if not thesis.entry_date:
+        return 0
+    try:
+        entry = datetime.fromisoformat(thesis.entry_date)
+        if entry.tzinfo is None:
+            entry = entry.replace(tzinfo=timezone.utc)
+        return _trading_days_between(entry, _utcnow())
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -46,12 +92,15 @@ class SellSignal:
     ticker: str = ""
     thesis_id: Optional[str] = None
     signal_type: str = ""   # hard_stop | trailing_stop | thesis_triggered | news_critical |
-                             # regime_change | scale_out | periodic_review | opportunity_cost
+                             # regime_change | scale_out | periodic_review | opportunity_cost |
+                             # dead_money_time_stop | profit_take | earnings_risk |
+                             # thesis_break | regime_exit | review_exit
     severity: str = "MEDIUM"  # URGENT | HIGH | MEDIUM | LOW
     source: str = ""
     message: str = ""
     sell_score: Optional[float] = None
     action_recommended: Optional[str] = None
+    trim_pct: Optional[float] = None
     created_at: str = field(default_factory=_utcnow_iso)
 
 
@@ -76,6 +125,7 @@ class SellSignalAggregator:
                 "message": signal.message,
                 "sell_score": signal.sell_score,
                 "action_recommended": signal.action_recommended,
+                "trim_pct": signal.trim_pct,
             })
         except Exception as e:
             logger.warning("[signal_agg] Failed to persist signal: %s", e)
@@ -95,6 +145,7 @@ class SellSignalAggregator:
                 message=row.get("message", ""),
                 sell_score=row.get("sell_score"),
                 action_recommended=row.get("action_recommended"),
+                trim_pct=row.get("trim_pct"),
                 created_at=row.get("created_at", _utcnow_iso()),
             ))
         # Sort by priority
@@ -138,21 +189,34 @@ class PortfolioCircuitBreaker:
         self.journal = journal or DecisionJournal()
         self._exit_count_today: int = 0
         self._exit_count_date: date = _utcnow().date()
+        self._exit_tickers_today: set[str] = set()
 
     def _refresh_count(self) -> None:
         today = _utcnow().date()
         if today != self._exit_count_date:
             self._exit_count_today = 0
             self._exit_count_date = today
+            self._exit_tickers_today = set()
 
-    def can_exit(self) -> bool:
-        """Return True if another exit is allowed today."""
+    def can_exit(self, ticker: Optional[str] = None) -> bool:
+        """Return True if another exit is allowed today.
+
+        Re-signals for a ticker already counted today are always allowed —
+        the cap limits distinct positions exited per day, not repeat alerts.
+        """
         self._refresh_count()
+        if ticker and ticker.upper() in self._exit_tickers_today:
+            return True
         return self._exit_count_today < Config.SELL_MAX_EXITS_PER_DAY
 
-    def record_exit(self) -> None:
-        """Record that an exit occurred today."""
+    def record_exit(self, ticker: Optional[str] = None) -> None:
+        """Record that an exit occurred today (deduped per ticker)."""
         self._refresh_count()
+        if ticker:
+            key = ticker.upper()
+            if key in self._exit_tickers_today:
+                return
+            self._exit_tickers_today.add(key)
         self._exit_count_today += 1
 
     def is_portfolio_in_drawdown(self) -> bool:
@@ -208,8 +272,9 @@ class SellEngine:
         self.tracker = ThesisTracker(journal=self.journal)
         self.aggregator = SellSignalAggregator(journal=self.journal)
         self.circuit_breaker = PortfolioCircuitBreaker(journal=self.journal)
-        self.trailing_stop_mgr = TrailingStopManager()
+        self.trailing_stop_mgr = TrailingStopManager(tracker=self.tracker)
         self._collector = collector  # Lazy: set by scheduler
+        self._earnings_cache: dict[tuple[str, str], Any] = {}  # (ticker, date) → ctx
 
     @property
     def collector(self) -> Any:
@@ -227,12 +292,17 @@ class SellEngine:
     ) -> list[SellSignal]:
         """Run sell-side tasks during every 30-min price check.
 
-        Tasks:
-        1. Enforce hard stops for every active thesis
-        2. Update trailing stops for TACTICAL_BUY positions
-        3. Check trailing stop breaches
-        4. Check for scale-out milestones
-        5. Check regime change for TACTICAL_BUY
+        Tasks (exit engine v2):
+        1. Enforce hard stops for every monitored thesis (active + pending_exit)
+        2. Update cushion-gated Chandelier/EMA trailing stops for ALL buy types
+        3. Check trailing stop breaches + EMA-close exits (rule 4.4)
+        4. Profit-taking into strength with fast-move exception (rule 4.3)
+        5. Time stops: dead money + catalyst positions (rule 4.5)
+        6. Earnings risk with 1R gap sizing (rule 4.6)
+        7. Machine-checkable thesis-break conditions (rule 4.7)
+        8. Regime change/exit for TACTICAL_BUY
+        9. Scale-out milestones
+        10. Portfolio circuit breaker gating (max exits/day, drawdown pause)
 
         Returns list of SellSignals to be sent as alerts.
         """
@@ -247,9 +317,11 @@ class SellEngine:
         except Exception as e:
             logger.warning("[sell_engine] Stale pending cleanup failed: %s", e)
 
-        active_theses = self.tracker.get_all_active()
+        # Include pending_exit positions — a position awaiting execution must
+        # not free-fall unwatched between the exit call and the actual sell.
+        monitored_theses = self.tracker.get_all_monitored()
 
-        for thesis in active_theses:
+        for thesis in monitored_theses:
             ticker = thesis.ticker
             if ticker not in quotes:
                 continue
@@ -264,32 +336,52 @@ class SellEngine:
                 self.aggregator.record(hard_stop_signal)
                 continue
 
-            # --- Trailing stop update (TACTICAL_BUY) ---
-            if thesis.position_type == "TACTICAL_BUY":
+            # --- Trailing stop update (all buy-type positions, rule 4.4) ---
+            if thesis.position_type in TRAIL_MANAGED_POSITION_TYPES:
                 try:
                     price_history = self._get_price_history(ticker)
-                    new_stop, is_breached = self.trailing_stop_mgr.update_position_trailing_stop(
+                    trail = self.trailing_stop_mgr.evaluate_trail(
                         thesis=thesis,
                         current_price=current_price,
                         price_history=price_history,
                     )
+                    new_stop = float(trail["new_stop"] or 0)
                     # FIX D: sync trailing stop from thesis DB → portfolio.json so monitor reads current value
-                    if new_stop is not None:
+                    if new_stop > 0:
                         pos = portfolio.get_position(ticker)
                         if pos is not None and pos.trailing_stop_price != new_stop:
                             pos.trailing_stop_price = new_stop
                             _portfolio_dirty = True
-                    if is_breached:
+                    if trail["is_breached"]:
                         signal = SellSignal(
                             ticker=ticker,
                             thesis_id=thesis.thesis_id,
-                            signal_type="trailing_stop",
+                            signal_type=SIGNAL_TRAILING_STOP,
                             severity="URGENT",
                             source="trailing_stop_manager",
                             message=(
                                 f"📉 TRAILING STOP TRIGGERED: {ticker} at ${current_price:.2f} "
                                 f"breached trailing stop ${new_stop:.2f}. "
-                                f"Exit TACTICAL_BUY position (thesis: {thesis.thesis_id[:8]})."
+                                f"Exit {thesis.position_type} position (thesis: {thesis.thesis_id[:8]})."
+                            ),
+                            action_recommended="EXIT",
+                        )
+                        signals.append(signal)
+                        self.aggregator.record(signal)
+                    elif trail.get("ema_exit"):
+                        ema_details = trail.get("ema_details") or {}
+                        signal = SellSignal(
+                            ticker=ticker,
+                            thesis_id=thesis.thesis_id,
+                            signal_type=SIGNAL_TRAILING_STOP,
+                            severity="HIGH",
+                            source="ema_close_trail",
+                            message=(
+                                f"📉 EMA-CLOSE EXIT: {ticker} closed "
+                                f"${ema_details.get('last_close') or 0:.2f}, below its "
+                                f"{ema_details.get('ema_period')}-day EMA "
+                                f"${ema_details.get('ema') or 0:.2f} with cushion established. "
+                                f"Rule 4.4 exit into strength (thesis: {thesis.thesis_id[:8]})."
                             ),
                             action_recommended="EXIT",
                         )
@@ -298,13 +390,30 @@ class SellEngine:
                 except Exception as ts_e:
                     logger.warning("[sell_engine] Trailing stop update failed for %s: %s", ticker, ts_e)
 
-            # --- Scale-out milestone check ---
+            # Positions already awaiting sell execution only need stop/trail
+            # protection — no new lifecycle signals.
+            if thesis.is_waiting_to_sell:
+                continue
+
             if thesis.entry_price and thesis.entry_price > 0:
+                # --- Profit-taking / fast-move exception (rule 4.3) ---
+                signals.extend(self._check_profit_take(thesis, current_price))
+
+                # --- Time stops: dead money + catalyst (rule 4.5) ---
+                signals.extend(self._check_dead_money(thesis, current_price))
+
+                # --- Earnings risk (rule 4.6) ---
+                signals.extend(self._check_earnings_risk(thesis, current_price))
+
+                # --- Machine-checkable thesis-break conditions (rule 4.7) ---
+                signals.extend(self._check_thesis_break(thesis, current_price))
+
+                # --- Scale-out milestone check ---
                 signals.extend(self._check_scale_out(thesis, current_price))
 
             # --- Regime change check for TACTICAL_BUY ---
             if thesis.position_type == "TACTICAL_BUY":
-                signals.extend(self._check_regime_change(thesis))
+                signals.extend(self._check_regime_change(thesis, current_price))
 
         # FIX D: persist trailing stop changes to portfolio.json
         if _portfolio_dirty:
@@ -315,6 +424,46 @@ class SellEngine:
             except Exception as save_e:
                 logger.warning("[sell_engine] Failed to sync trailing stop to portfolio.json: %s", save_e)
 
+        # --- Portfolio circuit breaker gating ---
+        signals = self._apply_circuit_breaker(signals)
+
+        return signals
+
+    def _apply_circuit_breaker(self, signals: list[SellSignal]) -> list[SellSignal]:
+        """Annotate portfolio stress without suppressing Sell Council review.
+
+        A drawdown is relevant evidence for Sell Council, but it must not make
+        a held position disappear from the review pipeline. The actual daily
+        exit cap is enforced from filled broker orders at the final auto-sell
+        authorization gate, where it reflects real executions rather than
+        generated alerts.
+        """
+        if not signals:
+            return signals
+
+        non_urgent_exits = [
+            s for s in signals
+            if s.severity != "URGENT" and (s.action_recommended or "").upper() in {"EXIT", "SELL"}
+        ]
+        in_drawdown = False
+        if non_urgent_exits:
+            try:
+                in_drawdown = self.circuit_breaker.is_portfolio_in_drawdown()
+            except Exception as cb_e:
+                logger.warning("[sell_engine] Drawdown check failed: %s", cb_e)
+
+        for signal in signals:
+            is_exit = (signal.action_recommended or "").upper() in {"EXIT", "SELL"}
+            if in_drawdown and is_exit and signal.severity != "URGENT":
+                context = (
+                    "Portfolio drawdown guard is active; this is review context only. "
+                    "Sell Council must independently confirm any exit."
+                )
+                signal.message = f"{signal.message} | {context}" if signal.message else context
+                logger.warning(
+                    "[sell_engine] Passing %s exit for %s to Sell Council with drawdown context",
+                    signal.signal_type, signal.ticker,
+                )
         return signals
 
     def _check_hard_stop(
@@ -346,13 +495,439 @@ class SellEngine:
             sell_score=100.0,
         )
 
-    def _get_price_history(self, ticker: str, days: int = 20) -> list[dict]:
-        """Fetch recent price history for ATR computation."""
+    def _get_price_history(self, ticker: str, period: str = "6mo") -> list[dict]:
+        """Fetch recent daily OHLCV history for ATR/EMA computation.
+
+        Uses the lightweight FMP history endpoint (single call) with a
+        yfinance fallback instead of the full ``collect_stock`` pipeline —
+        this now runs for every monitored position on every price check.
+        """
         try:
-            data = self.collector.collect_stock(ticker)
-            return data.get("price_history") or []
+            rows = self.collector.fmp.history(ticker, period)
+            if rows and len(rows) >= 20:
+                return rows
+        except Exception as fmp_e:
+            logger.debug("[sell_engine] FMP history failed for %s: %s", ticker, fmp_e)
+        try:
+            rows = self.collector.yf.history(ticker, period)
+            return rows or []
         except Exception:
             return []
+
+    # ------------------------------------------------------------------ rule 4.3
+    def _check_profit_take(
+        self,
+        thesis: PositionThesis,
+        current_price: float,
+    ) -> list[SellSignal]:
+        """Rule 4.3 profit-taking: +20%+ gains taking >3 weeks are sold into
+        strength (50-100%); gains of +20% within 15 trading days suppress
+        profit-taking (8-week-hold tag, disaster stop + trail only)."""
+        signals: list[SellSignal] = []
+        entry = float(thesis.entry_price or 0)
+        if entry <= 0:
+            return signals
+
+        gain_pct = (current_price - entry) / entry
+        if gain_pct < Config.SELL_PROFIT_TAKE_MIN_GAIN_PCT:
+            return signals
+
+        completed = thesis.scale_out_completed or []
+        tdays = _trading_days_held(thesis)
+
+        # Fast-move exception: +20% within 15 trading days → tag for 8-week
+        # hold; only the disaster stop and the trail manage the position.
+        if tdays <= Config.SELL_FAST_MOVE_TRADING_DAYS:
+            if _MARKER_FAST_MOVE_HOLD not in completed:
+                self.tracker.record_scale_out(thesis.thesis_id, _MARKER_FAST_MOVE_HOLD)
+                signal = SellSignal(
+                    ticker=thesis.ticker,
+                    thesis_id=thesis.thesis_id,
+                    signal_type=SIGNAL_PROFIT_TAKE,
+                    severity="LOW",
+                    source="sell_engine",
+                    message=(
+                        f"🚀 FAST MOVE: {thesis.ticker} gained {gain_pct:+.1%} within "
+                        f"{tdays} trading days. Profit-taking SUPPRESSED — tagged "
+                        f"{_MARKER_FAST_MOVE_HOLD} (rule 4.3 exception): hold "
+                        f"~{Config.SELL_FAST_MOVE_HOLD_TRADING_DAYS} trading days with "
+                        "disaster stop + trail only."
+                    ),
+                    action_recommended="HOLD",
+                )
+                signals.append(signal)
+                self.aggregator.record(signal)
+                logger.info(
+                    "[sell_engine] Fast-move exception tagged for %s (+%.1f%% in %dtd)",
+                    thesis.ticker, gain_pct * 100, tdays,
+                )
+            return signals
+
+        # Still inside a tagged 8-week hold window → no profit-taking yet
+        if (
+            _MARKER_FAST_MOVE_HOLD in completed
+            and tdays < Config.SELL_FAST_MOVE_HOLD_TRADING_DAYS
+        ):
+            return signals
+
+        if _MARKER_PROFIT_TAKE in completed:
+            return signals
+
+        self.tracker.record_scale_out(thesis.thesis_id, _MARKER_PROFIT_TAKE)
+        signal = SellSignal(
+            ticker=thesis.ticker,
+            thesis_id=thesis.thesis_id,
+            signal_type=SIGNAL_PROFIT_TAKE,
+            severity="HIGH",
+            source="sell_engine",
+            message=(
+                f"💰 PROFIT-TAKE (rule 4.3): {thesis.ticker} is {gain_pct:+.1%} from "
+                f"${entry:.2f} after {tdays} trading days (>3 weeks). "
+                "Sell 50-100% into strength."
+            ),
+            action_recommended="TRIM",
+            sell_score=float(Config.SELL_SCORE_TRIM_THRESHOLD),
+        )
+        signals.append(signal)
+        self.aggregator.record(signal)
+        logger.info("[sell_engine] Profit-take signal for %s (+%.1f%%)", thesis.ticker, gain_pct * 100)
+        return signals
+
+    # ------------------------------------------------------------------ rule 4.5
+    def _check_dead_money(
+        self,
+        thesis: PositionThesis,
+        current_price: float,
+    ) -> list[SellSignal]:
+        """Rule 4.5 time stops.
+
+        - Any position stuck between -3% and +5% after 20 trading days →
+          DEAD_MONEY_TIME_STOP exit signal.
+        - Catalyst positions (TACTICAL_BUY) below entry after 15 trading
+          days → exit.
+        """
+        signals: list[SellSignal] = []
+        entry = float(thesis.entry_price or 0)
+        if entry <= 0:
+            return signals
+
+        pnl_pct = (current_price - entry) / entry
+        tdays = _trading_days_held(thesis)
+
+        is_dead_money = (
+            tdays >= Config.SELL_DEAD_MONEY_TRADING_DAYS
+            and Config.SELL_DEAD_MONEY_MIN_PNL_PCT <= pnl_pct <= Config.SELL_DEAD_MONEY_MAX_PNL_PCT
+        )
+        is_stalled_catalyst = (
+            thesis.position_type == "TACTICAL_BUY"
+            and tdays >= Config.SELL_CATALYST_TIME_STOP_TRADING_DAYS
+            and pnl_pct < 0
+        )
+
+        if is_stalled_catalyst:
+            message = (
+                f"⏱ CATALYST TIME STOP (rule 4.5): {thesis.ticker} TACTICAL_BUY is "
+                f"{pnl_pct:+.1%} after {tdays} trading days — the catalyst has not "
+                "worked. Exit and recycle capital."
+            )
+        elif is_dead_money:
+            message = (
+                f"⏱ DEAD MONEY (rule 4.5): {thesis.ticker} is {pnl_pct:+.1%} after "
+                f"{tdays} trading days (flat between "
+                f"{Config.SELL_DEAD_MONEY_MIN_PNL_PCT:+.0%} and "
+                f"{Config.SELL_DEAD_MONEY_MAX_PNL_PCT:+.0%}). Time stop — exit and "
+                "redeploy into a working idea."
+            )
+        else:
+            return signals
+
+        signal = SellSignal(
+            ticker=thesis.ticker,
+            thesis_id=thesis.thesis_id,
+            signal_type=SIGNAL_DEAD_MONEY_TIME_STOP,
+            severity="HIGH",
+            source="sell_engine",
+            message=message,
+            action_recommended="EXIT",
+            sell_score=float(Config.SELL_SCORE_EXIT_TACTICAL),
+        )
+        signals.append(signal)
+        self.aggregator.record(signal)
+        logger.info(
+            "[sell_engine] Time-stop signal for %s (pnl=%+.1f%%, %dtd)",
+            thesis.ticker, pnl_pct * 100, tdays,
+        )
+        return signals
+
+    # ------------------------------------------------------------------ rule 4.6
+    def _get_earnings_context_cached(self, ticker: str) -> Any:
+        """Fetch earnings context at most once per ticker per day."""
+        today = _utcnow().date().isoformat()
+        cache_key = (ticker, today)
+        if cache_key in self._earnings_cache:
+            return self._earnings_cache[cache_key]
+        ctx = None
+        try:
+            from .earnings_calendar import get_earnings_context
+            ctx = get_earnings_context(ticker)
+        except Exception as e:
+            logger.debug("[sell_engine] Earnings context failed for %s: %s", ticker, e)
+        # Drop stale entries for this ticker
+        self._earnings_cache = {
+            k: v for k, v in self._earnings_cache.items() if k[1] == today
+        }
+        self._earnings_cache[cache_key] = ctx
+        return ctx
+
+    def _check_earnings_risk(
+        self,
+        thesis: PositionThesis,
+        current_price: float,
+    ) -> list[SellSignal]:
+        """Rule 4.6: scheduled earnings ahead with unrealized gain < +10% →
+        TRIM/EXIT flag sized so a -15% gap costs <= 1R. Cushion >= +10% →
+        hold through with trail (no signal)."""
+        signals: list[SellSignal] = []
+        entry = float(thesis.entry_price or 0)
+        if entry <= 0:
+            return signals
+
+        ctx = self._get_earnings_context_cached(thesis.ticker)
+        days_to_earnings = getattr(ctx, "days_to_earnings", None) if ctx else None
+        if days_to_earnings is None or not (
+            0 <= int(days_to_earnings) <= Config.SELL_EARNINGS_RISK_LOOKAHEAD_DAYS
+        ):
+            return signals
+
+        gain_pct = (current_price - entry) / entry
+        if gain_pct >= Config.SELL_EARNINGS_MIN_CUSHION_PCT:
+            logger.debug(
+                "[sell_engine] %s holds through earnings with %+.1f%% cushion (trail active)",
+                thesis.ticker, gain_pct * 100,
+            )
+            return signals
+
+        # Size the keep-fraction so a -15% gap on retained shares costs <= 1R
+        hard_stop = float(thesis.hard_stop_price or 0)
+        r_per_share = entry - hard_stop if 0 < hard_stop < entry else entry * Config.SELL_INITIAL_STOP_PCT
+        gap_loss_per_share = Config.SELL_EARNINGS_GAP_RISK_PCT * current_price
+        keep_fraction = min(1.0, r_per_share / gap_loss_per_share) if gap_loss_per_share > 0 else 1.0
+        trim_fraction = max(0.0, 1.0 - keep_fraction)
+
+        action = "TRIM" if trim_fraction < 0.99 else "EXIT"
+        signal = SellSignal(
+            ticker=thesis.ticker,
+            thesis_id=thesis.thesis_id,
+            signal_type=SIGNAL_EARNINGS_RISK,
+            severity="HIGH",
+            source="sell_engine",
+            message=(
+                f"📅 EARNINGS RISK (rule 4.6): {thesis.ticker} reports in "
+                f"{int(days_to_earnings)} day(s) ({getattr(ctx, 'earnings_date', None) or '?'}) with only "
+                f"{gain_pct:+.1%} cushion (<{Config.SELL_EARNINGS_MIN_CUSHION_PCT:.0%}). "
+                f"{action} ~{trim_fraction:.0%} so a "
+                f"-{Config.SELL_EARNINGS_GAP_RISK_PCT:.0%} gap costs <= 1R "
+                f"(R=${r_per_share:.2f}/share)."
+            ),
+            action_recommended=action,
+            sell_score=float(Config.SELL_SCORE_TRIM_THRESHOLD),
+            trim_pct=trim_fraction if action == "TRIM" else None,
+        )
+        signals.append(signal)
+        self.aggregator.record(signal)
+        logger.info(
+            "[sell_engine] Earnings-risk signal for %s (%d days out, cushion %+.1f%%)",
+            thesis.ticker, int(days_to_earnings), gain_pct * 100,
+        )
+        return signals
+
+    # ------------------------------------------------------------------ rule 4.7
+    def _check_thesis_break(
+        self,
+        thesis: PositionThesis,
+        current_price: float,
+        extra_metrics: Optional[dict[str, Any]] = None,
+    ) -> list[SellSignal]:
+        """Rule 4.7: evaluate machine-checkable invalidation conditions.
+
+        Structured conditions ({"metric", "op", "value"}) are checked against
+        observed metrics; legacy free-text conditions are skipped here (they
+        remain council-review material).
+        """
+        signals: list[SellSignal] = []
+        structured = thesis.structured_conditions
+        if not structured:
+            return signals
+
+        entry = float(thesis.entry_price or 0)
+        metrics: dict[str, Any] = {
+            "price": current_price,
+            "pnl_pct": ((current_price - entry) / entry * 100) if entry > 0 else None,
+            "days_held": thesis.days_held,
+            "trading_days_held": _trading_days_held(thesis),
+        }
+        if extra_metrics:
+            metrics.update(extra_metrics)
+
+        results = evaluate_invalidation_conditions(structured, metrics)
+        triggered = [r for r in results if r["status"] == "triggered"]
+        if not triggered:
+            return signals
+
+        details = "; ".join(
+            f"{r['metric']} {r['condition'].get('op')} {r['threshold']} "
+            f"(observed {r['observed']})"
+            for r in triggered
+        )
+        signal = SellSignal(
+            ticker=thesis.ticker,
+            thesis_id=thesis.thesis_id,
+            signal_type=SIGNAL_THESIS_BREAK,
+            severity="HIGH",
+            source="invalidation_checker",
+            message=(
+                f"🧨 THESIS BREAK (rule 4.7): {thesis.ticker} triggered "
+                f"{len(triggered)} machine-checked invalidation condition(s): {details}. "
+                "Exit review required."
+            ),
+            action_recommended="EXIT",
+            sell_score=float(Config.SELL_SCORE_EXIT_TACTICAL),
+        )
+        signals.append(signal)
+        self.aggregator.record(signal)
+        logger.info(
+            "[sell_engine] Thesis-break signal for %s: %s", thesis.ticker, details
+        )
+        return signals
+
+    def check_fy1_consensus_cut(
+        self,
+        thesis: PositionThesis,
+        analyst_estimates: Optional[dict] = None,
+    ) -> Optional[SellSignal]:
+        """Rule 4.7: FY1 EPS consensus cut >= 1% over 4 weeks → exit signal
+        for catalyst (TACTICAL_BUY) positions.
+
+        Maintains a small local history file of FY1 EPS consensus per ticker
+        (data/fy1_consensus_history.json) and compares today's value against
+        the oldest sample inside the 4-week window. Intended to be called from
+        the daily review path where ``analyst_estimates`` is already collected.
+        """
+        ticker = thesis.ticker
+        fy1_eps = self._extract_fy1_eps(analyst_estimates)
+        change_pct = self._update_fy1_history(ticker, fy1_eps)
+        if change_pct is None:
+            return None
+        if thesis.position_type != "TACTICAL_BUY":
+            return None
+        if change_pct > -Config.SELL_FY1_CUT_EXIT_THRESHOLD_PCT:
+            return None
+
+        signal = SellSignal(
+            ticker=ticker,
+            thesis_id=thesis.thesis_id,
+            signal_type=SIGNAL_THESIS_BREAK,
+            severity="HIGH",
+            source="fy1_consensus_tracker",
+            message=(
+                f"🧨 FY1 CONSENSUS CUT (rule 4.7): {ticker} FY1 EPS consensus cut "
+                f"{change_pct:+.1f}% over the last "
+                f"{Config.SELL_FY1_CUT_WINDOW_DAYS} days (threshold "
+                f"-{Config.SELL_FY1_CUT_EXIT_THRESHOLD_PCT:.1f}%). Catalyst position — exit."
+            ),
+            action_recommended="EXIT",
+            sell_score=float(Config.SELL_SCORE_EXIT_TACTICAL),
+        )
+        self.aggregator.record(signal)
+        return signal
+
+    @staticmethod
+    def _extract_fy1_eps(analyst_estimates: Optional[dict]) -> Optional[float]:
+        """Pull the forward-FY EPS consensus from a get_analyst_estimates payload."""
+        if not isinstance(analyst_estimates, dict):
+            return None
+        annual = analyst_estimates.get("annual_estimates") or []
+        today = _utcnow().date().isoformat()
+        future = [
+            row for row in annual
+            if isinstance(row, dict) and str(row.get("date") or "") >= today
+            and row.get("estimated_eps_avg") is not None
+        ]
+        # annual_estimates is sorted newest-first; FY1 = nearest future FY end
+        candidates = sorted(future, key=lambda r: str(r.get("date")))
+        if candidates:
+            try:
+                return float(candidates[0]["estimated_eps_avg"])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _update_fy1_history(self, ticker: str, fy1_eps: Optional[float]) -> Optional[float]:
+        """Append today's FY1 EPS sample and return the pct change over the window."""
+        import json
+        from pathlib import Path
+
+        history_path = (
+            Path(__file__).resolve().parent.parent / "data" / "fy1_consensus_history.json"
+        )
+        try:
+            history = {}
+            if history_path.exists():
+                with open(history_path, encoding="utf-8") as f:
+                    history = json.load(f) or {}
+            samples = history.get(ticker) or []
+            today = _utcnow().date().isoformat()
+            window_start = (
+                _utcnow() - timedelta(days=Config.SELL_FY1_CUT_WINDOW_DAYS)
+            ).date().isoformat()
+
+            if fy1_eps is not None and not any(s.get("date") == today for s in samples):
+                samples.append({"date": today, "fy1_eps": fy1_eps})
+            samples = [s for s in samples if str(s.get("date") or "") >= window_start]
+            samples.sort(key=lambda s: str(s.get("date") or ""))
+            history[ticker] = samples
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+
+            if fy1_eps is None or len(samples) < 2:
+                return None
+            baseline = samples[0].get("fy1_eps")
+            if not baseline:
+                return None
+            return (fy1_eps - float(baseline)) / abs(float(baseline)) * 100.0
+        except Exception as e:
+            logger.warning("[sell_engine] FY1 history update failed for %s: %s", ticker, e)
+            return None
+
+    def flag_material_news_review(
+        self,
+        ticker: str,
+        headline: str,
+        source: str = "news_sentinel",
+    ) -> Optional[SellSignal]:
+        """Rule 4.7: strongly negative material news day → REVIEW_EXIT signal.
+
+        Hook for the sentinel/scheduler news path (wired in Wave 2).
+        """
+        thesis = self.tracker.get_active(ticker)
+        if not thesis:
+            return None
+        signal = SellSignal(
+            ticker=ticker,
+            thesis_id=thesis.thesis_id,
+            signal_type=SIGNAL_REVIEW_EXIT,
+            severity="HIGH",
+            source=source,
+            message=(
+                f"📰 REVIEW_EXIT (rule 4.7): strongly negative material news for "
+                f"{ticker}: {headline[:200]}. Run immediate sell review."
+            ),
+            action_recommended="REVIEW",
+            sell_score=float(Config.SELL_SCORE_TRIM_THRESHOLD),
+        )
+        self.aggregator.record(signal)
+        return signal
 
     def _check_scale_out(
         self,
@@ -403,8 +978,17 @@ class SellEngine:
 
         return signals
 
-    def _check_regime_change(self, thesis: PositionThesis) -> list[SellSignal]:
-        """Flag TACTICAL_BUY positions when regime has changed since entry."""
+    def _check_regime_change(
+        self,
+        thesis: PositionThesis,
+        current_price: float = 0.0,
+    ) -> list[SellSignal]:
+        """Flag TACTICAL_BUY positions when regime has changed since entry.
+
+        A persisted regime change (>=3 days) escalates to a REGIME_EXIT signal
+        when the tactical position has no meaningful gain to protect; positions
+        already working (+5% or better) get the softer regime_change review.
+        """
         signals: list[SellSignal] = []
         if not thesis.entry_regime:
             return signals
@@ -433,20 +1017,43 @@ class SellEngine:
                         changed_dt = changed_dt.replace(tzinfo=timezone.utc)
                     days_changed = (_utcnow() - changed_dt).days
                     if days_changed >= 3:
-                        signal = SellSignal(
-                            ticker=thesis.ticker,
-                            thesis_id=thesis.thesis_id,
-                            signal_type="regime_change",
-                            severity="HIGH",
-                            source="sell_engine",
-                            message=(
-                                f"⚠️ REGIME CHANGE: {thesis.ticker} TACTICAL_BUY entered in "
-                                f"'{thesis.entry_regime}' regime. Now '{current_regime}' for "
-                                f"{days_changed} days. Review thesis assumptions."
-                            ),
-                            action_recommended="REVIEW",
-                            sell_score=float(Config.SELL_REGIME_MISMATCH_TACTICAL_BONUS),
+                        entry = float(thesis.entry_price or 0)
+                        pnl_pct = (
+                            (current_price - entry) / entry
+                            if entry > 0 and current_price > 0
+                            else None
                         )
+                        if pnl_pct is not None and pnl_pct < 0.05:
+                            signal = SellSignal(
+                                ticker=thesis.ticker,
+                                thesis_id=thesis.thesis_id,
+                                signal_type=SIGNAL_REGIME_EXIT,
+                                severity="HIGH",
+                                source="sell_engine",
+                                message=(
+                                    f"⚠️ REGIME EXIT: {thesis.ticker} TACTICAL_BUY entered in "
+                                    f"'{thesis.entry_regime}' regime; now '{current_regime}' for "
+                                    f"{days_changed} days with only {pnl_pct:+.1%} to protect. "
+                                    "The regime that justified this trade is gone — exit."
+                                ),
+                                action_recommended="EXIT",
+                                sell_score=float(Config.SELL_SCORE_EXIT_TACTICAL),
+                            )
+                        else:
+                            signal = SellSignal(
+                                ticker=thesis.ticker,
+                                thesis_id=thesis.thesis_id,
+                                signal_type="regime_change",
+                                severity="HIGH",
+                                source="sell_engine",
+                                message=(
+                                    f"⚠️ REGIME CHANGE: {thesis.ticker} TACTICAL_BUY entered in "
+                                    f"'{thesis.entry_regime}' regime. Now '{current_regime}' for "
+                                    f"{days_changed} days. Review thesis assumptions."
+                                ),
+                                action_recommended="REVIEW",
+                                sell_score=float(Config.SELL_REGIME_MISMATCH_TACTICAL_BONUS),
+                            )
                         signals.append(signal)
                         self.aggregator.record(signal)
         except Exception as e:

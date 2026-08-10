@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use Artha Council, please cite this repository."
+title: "Artha Council"
+type: software
+authors:
+  - family-names: "Sarath"
+    alias: "akira231097"
+version: 1.0.0
+date-released: 2026-08-10
+repository-code: "https://github.com/akira231097/artha-council"
+url: "https://github.com/akira231097/artha-council"
+license: Apache-2.0
+abstract: >-
+  An AI-assisted equity research, multi-agent investment council, portfolio
+  monitoring, and broker-aware execution system with deterministic safety gates.

@@ -40,9 +40,14 @@ class ChatGPTBackendClient:
         """Send one user prompt and return model text output."""
         return self._chat_with_model(prompt, self.model)
 
+    # Models that rejected the temperature parameter this process — skip it on
+    # every later call instead of paying a rejected round-trip + WARNING per call.
+    _temperature_unsupported: set[str] = set()
+
     def _chat_with_model(self, prompt: str, model: str) -> str:
         access_token = self._get_valid_access_token()
-        response = self._send_request(prompt, model, access_token)
+        include_temperature = model not in self._temperature_unsupported
+        response = self._send_request(prompt, model, access_token, include_temperature=include_temperature)
 
         if response.status_code == 401:
             logger.warning("ChatGPT backend returned 401, refreshing token and retrying")
@@ -58,10 +63,10 @@ class ChatGPTBackendClient:
             return self._chat_with_model(prompt, Config.GPT_FALLBACK_MODEL)
 
         if response.status_code == 400 and "Unsupported parameter: temperature" in response.text:
-            logger.warning(
-                "ChatGPT backend rejected temperature=%s; retrying with reasoning.effort=%s only",
-                self.temperature,
-                self.reasoning_effort,
+            self._temperature_unsupported.add(model)
+            logger.info(
+                "ChatGPT model %s does not accept temperature; dropping it for all further calls this run",
+                model,
             )
             response = self._send_request(prompt, model, access_token, include_temperature=False)
 

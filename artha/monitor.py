@@ -38,6 +38,21 @@ NEWS_TRIGGER_WORDS = (
     "investigation",
     "fraud",
 )
+# Severity ranking for dedupe bypass: a severity UPGRADE (e.g. WARNING →
+# CRITICAL) must alert immediately even inside the dedupe window.
+_SEVERITY_RANK = {"INFO": 0, "WARNING": 1, "CRITICAL": 2}
+
+# Alert types representing an active stop breach. While the breach persists,
+# CRITICAL alerts repeat every Config.SELL_STOP_BREACH_REPEAT_HOURS (4h)
+# instead of the normal 24h dedupe — a breached position must not go quiet.
+STOP_BREACH_ALERT_TYPES = frozenset({
+    "hard_stop_breached",
+    "trailing_stop_breached",
+    "stop_loss",
+    "sell_engine_hard_stop",
+    "sell_engine_trailing_stop",
+})
+
 FOMC_DATES_2026 = [
     date(2026, 1, 28),
     date(2026, 3, 18),
@@ -152,11 +167,31 @@ class AlertManager:
     def _alert_key(self, alert: Alert) -> str:
         return f"{alert.ticker.upper()}|{alert.alert_type}"
 
+    @staticmethod
+    def _severity_rank(severity: Any) -> int:
+        return _SEVERITY_RANK.get(str(severity or "").upper(), 0)
+
+    @classmethod
+    def _effective_window_hours(cls, alert: Alert, within_hours: int) -> int:
+        """Per-alert dedupe window.
+
+        CRITICAL stop-breach alerts repeat every SELL_STOP_BREACH_REPEAT_HOURS
+        (default 4h) until the position is closed or the stop clears — they
+        never fall under the long dedupe window.
+        """
+        if (
+            alert.severity.upper() == "CRITICAL"
+            and alert.alert_type in STOP_BREACH_ALERT_TYPES
+        ):
+            return min(within_hours, Config.SELL_STOP_BREACH_REPEAT_HOURS)
+        return within_hours
+
     def should_send(self, alert: Alert, within_hours: int = 24) -> bool:
         history = self._read_history()
         now = _utcnow()
-        limit = timedelta(hours=within_hours)
+        limit = timedelta(hours=self._effective_window_hours(alert, within_hours))
         key = self._alert_key(alert)
+        new_rank = self._severity_rank(alert.severity)
         for entry in history.get("alerts", []):
             if not isinstance(entry, dict):
                 continue
@@ -164,6 +199,9 @@ class AlertManager:
                 continue
             sent_at = _parse_iso_utc(str(entry.get("sent_at", "")))
             if sent_at and (now - sent_at) <= limit:
+                # Severity upgrade bypasses the dedupe window
+                if new_rank > self._severity_rank(entry.get("severity")):
+                    continue
                 return False
         return True
 
@@ -214,7 +252,6 @@ class AlertManager:
                 existing = history.get("alerts", [])
                 now = _utcnow()
                 keep_after = now - timedelta(days=30)
-                dedupe_cutoff = now - timedelta(hours=max(within_hours, 0))
 
                 cleaned: list[dict[str, Any]] = []
                 for entry in existing:
@@ -225,12 +262,19 @@ class AlertManager:
                 fresh: list[Alert] = []
                 for alert in alerts:
                     key = self._alert_key(alert)
+                    alert_cutoff = now - timedelta(
+                        hours=max(self._effective_window_hours(alert, within_hours), 0)
+                    )
+                    new_rank = self._severity_rank(alert.severity)
                     duplicate = False
                     for entry in cleaned:
                         if not isinstance(entry, dict) or entry.get("key") != key:
                             continue
                         sent_at = _parse_iso_utc(str(entry.get("sent_at", "")))
-                        if sent_at and sent_at >= dedupe_cutoff:
+                        if sent_at and sent_at >= alert_cutoff:
+                            # Severity upgrade bypasses the dedupe window
+                            if new_rank > self._severity_rank(entry.get("severity")):
+                                continue
                             duplicate = True
                             break
                     if duplicate:
@@ -253,6 +297,38 @@ class AlertManager:
         except Exception as e:
             logger.error(f"Atomic alert claim failed: {e}")
             return alerts
+
+    def release_alerts(self, alerts: list[Alert], claimed_within_minutes: int = 30) -> int:
+        """Remove recently claimed history entries for undelivered alerts.
+
+        Used when Telegram delivery fails AFTER a claim: releasing the claim
+        lets the next monitoring cycle re-send instead of silently dropping
+        the alert for the full dedupe window. Returns count released.
+        """
+        if not alerts:
+            return 0
+        released = 0
+        try:
+            with _alert_history_lock(self.lock_path, exclusive=True):
+                history = self._load_history_unlocked()
+                entries = history.get("alerts", [])
+                now = _utcnow()
+                cutoff = now - timedelta(minutes=claimed_within_minutes)
+                keys = {self._alert_key(a) for a in alerts}
+                kept: list[dict[str, Any]] = []
+                for entry in entries:
+                    if isinstance(entry, dict) and entry.get("key") in keys:
+                        sent_at = _parse_iso_utc(str(entry.get("sent_at", "")))
+                        if sent_at and sent_at >= cutoff:
+                            released += 1
+                            continue
+                    kept.append(entry)
+                if released:
+                    history["alerts"] = kept
+                    self._write_history_unlocked(history)
+        except Exception as e:
+            logger.error(f"Failed to release undelivered alerts: {e}")
+        return released
 
     def format_for_telegram(self, alerts: list[Alert]) -> str:
         if not alerts:
@@ -308,7 +384,7 @@ class PriceMonitor:
     def _is_sell_engine_managed_position(pos: Position) -> bool:
         """Return True when sell/thesis lifecycle alerts belong to the new sell engine.
 
-        Sarath's directive (2026-04-05):
+        Operator policy:
         - old monitor => general market / portfolio alerts
         - new sell engine => thesis-driven sell alerts + buy/sell lifecycle
         """
@@ -833,10 +909,31 @@ class PriceMonitor:
             logger.error(f"Monitor check failed: {e}")
         return alerts
 
-    def run_and_dedupe(self) -> list[Alert]:
-        """Run check + suppress duplicate alerts within 24h."""
+    def run_and_dedupe(self, send_fn: Optional[Any] = None) -> list[Alert]:
+        """Run check + suppress duplicate alerts within 24h.
+
+        Args:
+            send_fn: Optional delivery callable ``(message: str) -> bool``.
+                When provided, alerts are only kept marked as 'sent' if
+                delivery succeeds — a failed send releases the claim so the
+                next cycle retries instead of losing the alert for 24h.
+        """
         generated = self.run_check()
-        return self.alert_manager.claim_new_alerts(generated, within_hours=24)
+        fresh = self.alert_manager.claim_new_alerts(generated, within_hours=24)
+        if send_fn is not None and fresh:
+            try:
+                delivered = bool(send_fn(self.alert_manager.format_for_telegram(fresh)))
+            except Exception as send_e:
+                logger.error(f"Alert delivery failed: {send_e}")
+                delivered = False
+            if not delivered:
+                released = self.alert_manager.release_alerts(fresh)
+                logger.warning(
+                    "Delivery failed — released %d/%d claimed alert(s) for retry next cycle",
+                    released,
+                    len(fresh),
+                )
+        return fresh
 
     def one_shot_status(self) -> dict[str, Any]:
         """Run one-shot health check and return useful metadata for CLI usage."""

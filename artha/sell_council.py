@@ -29,10 +29,22 @@ from .sell_prompts import (
     SELL_CONTRARIAN_ANALYST,
     SELL_CONDITION_REVIEW_FORMAT,
     build_sell_context,
+    build_blind_sell_context,
     build_sell_synthesis_prompt,
 )
 
 logger = logging.getLogger(__name__)
+
+# Trigger types that represent mechanically triggered exits (rule 4.8):
+# the LLM may never soften these — negative CIO adjustments are rejected.
+MECHANICAL_EXIT_TRIGGERS = frozenset({
+    "hard_stop",
+    "trailing_stop",
+    "dead_money_time_stop",
+    "thesis_break",
+    "earnings_risk",
+    "regime_exit",
+})
 
 
 def _utcnow() -> datetime:
@@ -60,6 +72,7 @@ class SellAnalystReport:
     sell_score: int     # 0-100 component score
     confidence: int     # 1-10
     report: str
+    would_initiate: Optional[bool] = None  # blind re-evaluation answer (None = unparsed)
 
 
 @dataclass
@@ -239,6 +252,28 @@ def _parse_confidence(report: str) -> int:
     return 5
 
 
+def _parse_would_initiate(report: str) -> Optional[bool]:
+    """Extract the blind re-evaluation answer: WOULD INITIATE TODAY: YES/NO."""
+    match = re.search(
+        r"WOULD\s+INITIATE\s+TODAY:?\*{0,2}\s*:?\s*\*{0,2}\s*\[?\s*(YES|NO)\b",
+        report,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).upper() == "YES"
+    return None
+
+
+def _is_blind_sell_vote(report: Optional[str]) -> bool:
+    """A blind SELL/AVOID vote: EXIT verdict, or explicit would-not-initiate."""
+    if not report:
+        return False
+    verdict = _parse_sell_verdict(report)
+    if verdict in ("EXIT", "URGENT_EXIT"):
+        return True
+    return _parse_would_initiate(report) is False and verdict != "HOLD"
+
+
 def _parse_synthesis_json(synthesis: str) -> dict:
     """Extract JSON block from CIO synthesis."""
     json_match = re.search(r"```json\s*(\{.*?\})\s*```", synthesis, re.DOTALL)
@@ -349,22 +384,28 @@ class SellCouncil:
         stock_data: dict,
         macro_data: Optional[dict] = None,
         trigger_type: str = "periodic_review",
-        current_regime: str = "unknown",
+        current_regime: Optional[str] = None,
     ) -> Optional[SellDecision]:
         """Run full sell council review for a position.
+
+        The three analysts run BLIND (no cost basis / P&L / holding period —
+        Odean disposition-effect mitigation); only the CIO synthesis sees the
+        full position context.
 
         Args:
             thesis: PositionThesis object (or dict with same fields)
             stock_data: Collected stock data from DataCollector
             macro_data: Optional macro data
             trigger_type: Why this review was triggered
-            current_regime: Current MROL regime label
+            current_regime: Current MROL regime label (None → "unknown"; the
+                scheduler wires the live regime in Wave 2)
 
         Returns:
             SellDecision or None on catastrophic failure
         """
         ticker = getattr(thesis, "ticker", None) or thesis.get("ticker", "?")
         position_type = getattr(thesis, "position_type", "BUY") or "BUY"
+        current_regime = current_regime or "unknown"
         logger.info(
             "[sell_council] Starting review ticker=%s type=%s trigger=%s",
             ticker,
@@ -372,12 +413,31 @@ class SellCouncil:
             trigger_type,
         )
 
-        # Build shared context
+        # Full context is reserved for the CIO; the analysts get the blind
+        # re-evaluation context ("would you initiate this today at $X?").
         try:
             position_context = build_sell_context(thesis, stock_data, current_regime)
         except Exception as ctx_e:
             logger.warning("[sell_council] Context build failed: %s", ctx_e)
             position_context = f"Position: {ticker} ({position_type})"
+        try:
+            blind_context = build_blind_sell_context(thesis, stock_data, current_regime)
+        except Exception as blind_e:
+            logger.warning("[sell_council] Blind context build failed: %s", blind_e)
+            blind_context = f"Position under blind review: {ticker} ({position_type})"
+        trigger_payload = stock_data.get("_sell_trigger") if isinstance(stock_data, dict) else None
+        trigger_context = {
+            "trigger_type": str(trigger_type or "periodic_review"),
+            "observed_at": _utcnow_iso(),
+            "details": trigger_payload if isinstance(trigger_payload, dict) else {},
+        }
+        trigger_block = (
+            "\n\nSELL REVIEW TRIGGER (structured, current-cycle evidence):\n"
+            + json.dumps(trigger_context, sort_keys=True, ensure_ascii=True)
+            + "\nTreat this as the reason for review, not as an automatic sell verdict."
+        )
+        position_context += trigger_block
+        blind_context += trigger_block
 
         # Run 3 analysts in parallel
         fundamental_report: Optional[str] = None
@@ -386,9 +446,9 @@ class SellCouncil:
 
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
-                executor.submit(_run_sell_fundamental, stock_data, position_context, thesis): "fundamental",
-                executor.submit(_run_sell_technical, stock_data, position_context): "technical",
-                executor.submit(_run_sell_contrarian, stock_data, position_context): "contrarian",
+                executor.submit(_run_sell_fundamental, stock_data, blind_context, thesis): "fundamental",
+                executor.submit(_run_sell_technical, stock_data, blind_context): "technical",
+                executor.submit(_run_sell_contrarian, stock_data, blind_context): "contrarian",
             }
             # FIX 6: Wrap as_completed in try/except to handle overall timeout gracefully
             try:
@@ -465,6 +525,7 @@ class SellCouncil:
             stock_data=stock_data,
             current_regime=current_regime,
             analyst_reports=[fundamental_report, technical_report, contrarian_report],
+            trigger_type=trigger_type,
         )
         adjustments = self._build_adjustments_text(base_sell_score, rule_adjustments)
 
@@ -499,8 +560,25 @@ class SellCouncil:
         cio_gate = self._validate_cio_score_adjustment(
             synth_data=synth_data,
             source_corpus=source_corpus,
+            trigger_type=trigger_type,
         )
         sell_score = _clamp_score(rule_score + float(cio_gate["accepted_value"]))
+
+        # Mandatory rebuttal rule: an analyst TRIM/EXIT vote >= 60 may not be
+        # weighted-averaged away — the CIO must explicitly rebut it with
+        # supported evidence, otherwise the final score is floored at that
+        # analyst's component score.
+        rebuttal_audit = self._enforce_rebuttal_floor(
+            synth_data=synth_data,
+            source_corpus=source_corpus,
+            analyst_components=[
+                ("fundamental", fundamental_report, f_score),
+                ("technical", technical_report, t_score),
+                ("contrarian", contrarian_report, c_score),
+            ],
+            sell_score=sell_score,
+        )
+        sell_score = float(rebuttal_audit["final_score"])
 
         # CIO model score is logged for audit only; the final score is the
         # deterministic base + code rules + bounded evidence-gated CIO adjustment.
@@ -524,7 +602,22 @@ class SellCouncil:
         score_action = self._action_from_score(sell_score, position_type)
         action = self._reconcile_cio_action(cio_action, score_action)
 
-        # Validate action against hard portfolio lifecycle gates.
+        # Two consecutive blind SELL/AVOID council verdicts escalate to EXIT
+        # (override only moves toward earlier selling — rule 4.8 compliant).
+        blind_exit_now = self._session_blind_exit_vote(
+            [fundamental_report, technical_report, contrarian_report]
+        )
+        consecutive_blind_exit = False
+        if blind_exit_now and action not in ("EXIT", "URGENT_EXIT"):
+            if self._previous_session_blind_exit(ticker):
+                consecutive_blind_exit = True
+                logger.info(
+                    "[sell_council] Two consecutive blind SELL/AVOID verdicts for %s — "
+                    "escalating %s to EXIT",
+                    ticker,
+                    action,
+                )
+                action = "EXIT"
         action = self._validate_action(action, sell_score, position_type, thesis)
         is_urgent = action == "URGENT_EXIT"
 
@@ -535,6 +628,9 @@ class SellCouncil:
             "forced_score": forced_score,
             "rule_adjusted_score": round(rule_score, 3),
             "cio_adjustment": cio_gate,
+            "rebuttal_enforcement": rebuttal_audit,
+            "blind_exit_vote": blind_exit_now,
+            "consecutive_blind_exit": consecutive_blind_exit,
             "final_sell_score": round(sell_score, 3),
             "cio_requested_action": cio_action,
             "score_mapped_action": score_action,
@@ -545,6 +641,13 @@ class SellCouncil:
         next_review_date = _add_days(next_review_days)
 
         key_reasons = _parse_key_reasons(synthesis_raw)
+        if consecutive_blind_exit:
+            key_reasons.insert(
+                0,
+                "Two consecutive blind council reviews voted SELL/AVOID — "
+                "disposition-effect override to EXIT.",
+            )
+            key_reasons = key_reasons[:5]
 
         # FIX 7: Build analyst report objects only for available analysts (None for missing)
         fundamental = SellAnalystReport(
@@ -554,6 +657,7 @@ class SellCouncil:
             sell_score=f_score if f_score is not None else 50,
             confidence=_parse_confidence(fundamental_report),
             report=fundamental_report,
+            would_initiate=_parse_would_initiate(fundamental_report),
         ) if fundamental_report else None
         technical = SellAnalystReport(
             analyst_name="Technical",
@@ -562,6 +666,7 @@ class SellCouncil:
             sell_score=t_score if t_score is not None else 50,
             confidence=_parse_confidence(technical_report),
             report=technical_report,
+            would_initiate=_parse_would_initiate(technical_report),
         ) if technical_report else None
         contrarian = SellAnalystReport(
             analyst_name="Contrarian",
@@ -570,6 +675,7 @@ class SellCouncil:
             sell_score=c_score if c_score is not None else 50,
             confidence=_parse_confidence(contrarian_report),
             report=contrarian_report,
+            would_initiate=_parse_would_initiate(contrarian_report),
         ) if contrarian_report else None
 
         session_id = str(uuid.uuid4())
@@ -583,7 +689,11 @@ class SellCouncil:
             fundamental=fundamental,
             technical=technical,
             contrarian=contrarian,
-            synthesis_report=synthesis_raw,
+            synthesis_report=(
+                synthesis_raw
+                + f"\n\nFINAL ACTION NORMALIZATION: audited action={action}; "
+                f"audited sell_score={sell_score:.1f}/100."
+            ),
             key_reasons=key_reasons,
             next_review_date=next_review_date,
             is_urgent=is_urgent,
@@ -657,6 +767,7 @@ class SellCouncil:
         stock_data: dict,
         current_regime: str,
         analyst_reports: list[str | None],
+        trigger_type: str = "periodic_review",
     ) -> list[dict[str, Any]]:
         """Build deterministic score adjustments that the code will apply."""
         adjustments: list[dict[str, Any]] = []
@@ -673,6 +784,16 @@ class SellCouncil:
                 "reason": (
                     f"{ticker} current price ${current_price:.2f} is at/below "
                     f"hard stop ${hard_stop:.2f}; force urgent exit score."
+                ),
+            })
+
+        if str(trigger_type or "").lower() in {"hard_stop", "trailing_stop"}:
+            adjustments.append({
+                "name": "mechanical_stop_review",
+                "value": 20,
+                "reason": (
+                    f"A live {trigger_type} threshold caused this review. "
+                    "The council must explicitly assess whether the breach is valid and actionable."
                 ),
             })
 
@@ -795,14 +916,120 @@ class SellCouncil:
         )
         return "\n".join(lines)
 
+    def _session_blind_exit_vote(self, reports: list[Optional[str]]) -> bool:
+        """True when a majority of available blind analysts voted SELL/AVOID."""
+        available = [r for r in reports if r]
+        if not available:
+            return False
+        sell_votes = sum(1 for r in available if _is_blind_sell_vote(r))
+        return sell_votes * 2 > len(available)
+
+    def _previous_session_blind_exit(self, ticker: str) -> bool:
+        """Check whether the most recent PRIOR council session for this ticker
+        was also a majority blind SELL/AVOID vote."""
+        try:
+            with self.journal._connect() as conn:
+                row = conn.execute(
+                    "SELECT fundamental_report, technical_report, contrarian_report "
+                    "FROM sell_sessions WHERE ticker = ? "
+                    "ORDER BY datetime(created_at) DESC LIMIT 1",
+                    ((ticker or "").upper().strip(),),
+                ).fetchone()
+        except Exception as e:
+            logger.warning("[sell_council] Previous-session lookup failed for %s: %s", ticker, e)
+            return False
+        if not row:
+            return False
+        return self._session_blind_exit_vote([row[0], row[1], row[2]])
+
+    def _enforce_rebuttal_floor(
+        self,
+        synth_data: dict[str, Any],
+        source_corpus: str,
+        analyst_components: list[tuple[str, Optional[str], Optional[int]]],
+        sell_score: float,
+    ) -> dict[str, Any]:
+        """Enforce the mandatory rebuttal rule.
+
+        Any analyst voting TRIM/EXIT with a component score >= 60 must be
+        explicitly rebutted by the CIO (``rebuttals`` JSON field with supported
+        evidence). Unrebutted high sell votes floor the final score at that
+        analyst's component score instead of being averaged away.
+        """
+        audit: dict[str, Any] = {
+            "floored": False,
+            "floor_score": None,
+            "unrebutted": [],
+            "rebutted": [],
+            "final_score": _clamp_score(sell_score),
+        }
+        rebuttals = synth_data.get("rebuttals")
+        rebuttal_map: dict[str, dict[str, Any]] = {}
+        if isinstance(rebuttals, list):
+            for item in rebuttals:
+                if isinstance(item, dict):
+                    name = str(item.get("analyst") or "").strip().lower()
+                    if name:
+                        rebuttal_map[name] = item
+
+        floor = 0.0
+        for name, report, score in analyst_components:
+            if not report or score is None or score < 60:
+                continue
+            verdict = _parse_sell_verdict(report)
+            if verdict not in ("TRIM", "EXIT", "URGENT_EXIT"):
+                continue
+            rebuttal = rebuttal_map.get(name)
+            rebuttal_supported = False
+            if rebuttal:
+                evidence = _listify_evidence(rebuttal.get("evidence"))
+                text = str(rebuttal.get("rebuttal") or "").strip()
+                rebuttal_supported = bool(text) and _evidence_is_supported(
+                    evidence + [text], source_corpus
+                )
+            if rebuttal_supported:
+                audit["rebutted"].append({"analyst": name, "score": score, "verdict": verdict})
+                continue
+            audit["unrebutted"].append({"analyst": name, "score": score, "verdict": verdict})
+            floor = max(floor, float(score))
+
+        if floor > 0 and floor > sell_score:
+            audit["floored"] = True
+            audit["floor_score"] = floor
+            audit["final_score"] = _clamp_score(floor)
+            logger.info(
+                "[sell_council] Rebuttal rule floored sell score %.1f → %.1f "
+                "(unrebutted high sell votes: %s)",
+                sell_score,
+                floor,
+                [u["analyst"] for u in audit["unrebutted"]],
+            )
+        return audit
+
     def _validate_cio_score_adjustment(
         self,
         synth_data: dict[str, Any],
         source_corpus: str,
+        trigger_type: str = "periodic_review",
     ) -> dict[str, Any]:
         requested = _as_float(synth_data.get("cio_score_adjustment"), 0.0) or 0.0
         max_pos = float(Config.SELL_CIO_ADJUSTMENT_MAX_POSITIVE)
         max_neg = float(Config.SELL_CIO_ADJUSTMENT_MAX_NEGATIVE)
+        # Rule 4.8 anti-disposition: for mechanically triggered exit reviews
+        # the CIO may only push TOWARD earlier selling — negative (hold-
+        # direction) adjustments are rejected outright.
+        if str(trigger_type or "").lower() in MECHANICAL_EXIT_TRIGGERS and requested < 0:
+            return {
+                "requested_value": requested,
+                "accepted_value": 0.0,
+                "status": "rejected_anti_disposition",
+                "category": str(synth_data.get("cio_adjustment_category") or "none").strip()[:80],
+                "reason": (
+                    f"Trigger '{trigger_type}' is a mechanical exit — LLM overrides "
+                    "may only move toward earlier selling (rule 4.8)."
+                ),
+                "evidence": _listify_evidence(synth_data.get("cio_adjustment_evidence")),
+            }
         clipped = max(max_neg, min(max_pos, requested))
         confidence = int(_as_float(synth_data.get("confidence"), 0.0) or 0)
         category = str(synth_data.get("cio_adjustment_category") or "none").strip()[:80]
@@ -909,7 +1136,7 @@ class SellCouncil:
 
         # 2. Cooldown period
         in_cooldown = getattr(thesis, "in_cooldown", False)
-        if in_cooldown and action in ("TRIM", "EXIT"):
+        if in_cooldown and action in ("TRIM", "EXIT") and sell_score < 85:
             logger.info("[sell_council] Cooldown active — holding action to HOLD")
             return "HOLD"
 

@@ -510,7 +510,7 @@ def _generate_recommendations(packet: RegimePacket) -> None:
         packet.avoid_list = []
         return
 
-    # Core: Sarath already has $350/month FXAIX auto-recurring
+    # Example policy: a separately managed index-fund core may already exist.
     packet.core_recommendation = {
         "ticker": "FXAIX",
         "action": "ALREADY_SET",
@@ -761,7 +761,7 @@ def format_regime_report(packet: RegimePacket) -> str:
         lines.append(f"   • {core.get('ticker', 'FXAIX')} — {core.get('reason', 'Auto-recurring. No changes needed.')}")
         lines.append("")
 
-    # Tactical (only if Sarath re-enables the Artha satellite budget)
+    # Tactical sleeve (only if the operator enables the satellite budget)
     if packet.tactical_recommendations:
         budget = BEGINNER_RULES.get("monthly_budget", 0)
         lines.append(f"🟡 ARTHA COUNCIL PICKS ({budget} USD satellite budget)")
