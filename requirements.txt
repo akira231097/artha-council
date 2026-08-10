@@ -2,5 +2,5 @@ python-dotenv>=1.2.2
 requests>=2.34.2
 yfinance>=0.2.36
 anthropic>=0.42.0
-google-generativeai>=0.8.0
+google-generativeai>=0.8.6
 pandas>=2.2.0
