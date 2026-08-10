@@ -12,6 +12,9 @@ uses deterministic broker gates before an order can proceed.
 
 Created and maintained by **Sarath** ([@akira231097](https://github.com/akira231097)).
 
+See the [design notes and architecture diagram](docs/DESIGN.md) for a visual
+walkthrough of the research, Council, execution, and audit boundaries.
+
 > Artha is research software, not financial advice. Public defaults cannot place
 > live trades. Anyone enabling broker integration is responsible for reviewing
 > the source, their configuration, broker terms, and applicable requirements.
@@ -131,6 +134,18 @@ python -m artha.test_production_hardening
 
 Tests use synthetic fixtures and must not require real broker credentials.
 
+### Docker
+
+The included image supports the core Python research CLI:
+
+```bash
+docker build -t artha-council .
+docker run --rm --env-file .env artha-council overview
+```
+
+The broker snapshot helper is intentionally outside this minimal Python image;
+it requires a separately configured Node.js MCP runtime and broker access.
+
 ## Public Release Boundary
 
 This repository contains source, tests, documentation, and safe configuration
@@ -151,6 +166,7 @@ The Apache license covers Artha's source code, not provider data or broker acces
 ## Project Documents
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Design notes and diagram](docs/DESIGN.md)
 - [Public release and data boundary](docs/PUBLIC_RELEASE.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
