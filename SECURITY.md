@@ -5,9 +5,9 @@ money-moving deployment as security-sensitive infrastructure.
 
 ## Reporting a Vulnerability
 
-Use GitHub's private vulnerability reporting feature from the repository Security
-tab. Do not place credentials, account identifiers, exploit details, or private
-broker output in a public issue.
+Use [GitHub private vulnerability reporting](https://github.com/akira231097/artha-council/security/advisories/new).
+Do not place credentials, account identifiers, exploit details, or private broker
+output in a public issue.
 
 Include:
 
