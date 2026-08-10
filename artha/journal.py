@@ -380,6 +380,20 @@ class DecisionJournal:
                     "benchmark_ticker": "TEXT",
                 },
             )
+            self._ensure_columns(conn, "sell_signals", {"trim_pct": "REAL"})
+            self._ensure_columns(
+                conn,
+                "defer_watchlist",
+                {"review_failure_count": "INTEGER NOT NULL DEFAULT 0"},
+            )
+            conn.execute(
+                """
+                UPDATE defer_watchlist
+                SET review_failure_count = 1
+                WHERE status = 'review_failed'
+                  AND COALESCE(review_failure_count, 0) = 0
+                """
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_decision_features_ticker ON decision_features(ticker)"
             )
@@ -664,6 +678,30 @@ class DecisionJournal:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_pending_order_rechecks_ticker ON pending_order_rechecks(ticker)"
+            )
+            # ---------------------------------------------------------------
+            # Pending EXIT confirmations. Non-urgent EXIT signals must persist
+            # across restarts: the scheduler counts TRADING days here instead
+            # of an in-memory dict, with score hysteresis (a single
+            # below-threshold day decrements rather than discards).
+            # ---------------------------------------------------------------
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_exit_confirmations (
+                    thesis_id TEXT PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    first_signal_at TEXT NOT NULL,
+                    last_score REAL,
+                    days_confirmed INTEGER NOT NULL DEFAULT 1,
+                    last_counted_date TEXT,
+                    updated_at TEXT NOT NULL,
+                    notes TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_exit_confirmations_ticker "
+                "ON pending_exit_confirmations(ticker)"
             )
             # ---------------------------------------------------------------
             # Supervisor health checks: one row per run for audit and
@@ -1142,6 +1180,21 @@ class DecisionJournal:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_all_sell_monitored_theses(self) -> list[dict[str, Any]]:
+        """Get theses that protect currently held positions from being unmonitored.
+
+        ``pending_exit`` is intentionally included here: the sell engine has
+        already issued an exit/trim review, so the position is not unprotected
+        even though it should not be treated as a normal active thesis for due
+        review scheduling.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM position_theses WHERE status IN ('active', 'pending_exit') "
+                "ORDER BY datetime(created_at) ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_due_reviews(self) -> list[dict[str, Any]]:
         """Get active theses whose next_review_date has passed."""
         ts = self._utcnow_iso()
@@ -1358,13 +1411,13 @@ class DecisionJournal:
 
     def invalidate_implausible_defer_watches(
         self,
-        min_ratio: float = 0.35,
-        max_ratio: float = 2.5,
+        min_ratio: float = 0.55,
+        max_ratio: float = 1.45,
     ) -> int:
         """Quarantine active entry watches that are clearly parsed non-price ranges."""
         ts = self._utcnow_iso()
-        min_ratio = max(0.01, float(min_ratio or 0.35))
-        max_ratio = max(min_ratio, float(max_ratio or 2.5))
+        min_ratio = max(0.01, float(min_ratio or 0.55))
+        max_ratio = max(min_ratio, float(max_ratio or 1.45))
         note = (
             "Auto-invalidated implausible entry zone: zone was outside "
             f"{min_ratio:.0%}-{max_ratio:.0%} of recorded current price."
@@ -1419,6 +1472,64 @@ class DecisionJournal:
             )
             conn.commit()
             return int(cursor.rowcount or 0)
+
+    def requeue_failed_defer_auto_reviews(
+        self,
+        retry_delay_minutes: int = 60,
+        max_failures: int = 3,
+    ) -> int:
+        """Retry transient watch-review failures without creating an endless loop."""
+        ts = self._utcnow_iso()
+        delay = max(1, int(retry_delay_minutes or 1))
+        failure_cap = max(1, int(max_failures or 1))
+        note = (
+            "Auto-review failure requeued after "
+            f"{delay} minute cooldown; retry remains bounded to {failure_cap} failures."
+        )
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE defer_watchlist
+                SET status = 'active',
+                    updated_at = ?,
+                    notes = CASE
+                        WHEN notes IS NULL OR notes = '' THEN ?
+                        ELSE notes || char(10) || ?
+                    END
+                WHERE status = 'review_failed'
+                  AND COALESCE(review_failure_count, 0) < ?
+                  AND datetime(updated_at) < datetime(?, '-' || ? || ' minutes')
+                  AND (
+                    entry_valid_until IS NULL
+                    OR entry_valid_until = ''
+                    OR datetime(entry_valid_until) >= datetime(?)
+                  )
+                """,
+                (ts, note, note, failure_cap, ts, delay, ts),
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def mark_defer_watch_review_failed(self, watch_id: str, notes: str) -> None:
+        """Record a failed attempt and keep its retry count auditable."""
+        ts = self._utcnow_iso()
+        note = str(notes or "Auto-review failed.")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE defer_watchlist
+                SET status = 'review_failed',
+                    review_failure_count = COALESCE(review_failure_count, 0) + 1,
+                    updated_at = ?,
+                    notes = CASE
+                        WHEN notes IS NULL OR notes = '' THEN ?
+                        ELSE notes || char(10) || ?
+                    END
+                WHERE watch_id = ?
+                """,
+                (ts, note, note, str(watch_id or "")),
+            )
+            conn.commit()
 
     def mark_defer_watch_triggered(self, watch_id: str, trigger_price: float, notes: str = "") -> None:
         """Mark a DEFER/WATCH entry condition as triggered."""
@@ -1933,7 +2044,7 @@ class DecisionJournal:
         allowed = {
             "status", "broker_order_id", "guardrail_status", "guardrail_json",
             "response_json", "submitted_at", "filled_at", "canceled_at", "dry_run", "notes",
-            "quantity", "notional", "estimated_price",
+            "quantity", "notional", "estimated_price", "thesis_id",
         }
         ts = self._utcnow_iso()
         clauses: list[str] = []
@@ -2083,6 +2194,16 @@ class DecisionJournal:
             rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
+    def get_trade_action_by_intent_id(self, order_intent_id: str) -> dict[str, Any] | None:
+        """Return the trade action linked to an execution intent."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM trade_actions WHERE order_intent_id = ? "
+                "ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+                (str(order_intent_id or ""),),
+            ).fetchone()
+        return dict(row) if row else None
+
     def update_trade_action(self, action_id: str, updates: dict[str, Any]) -> None:
         """Update one trade action row."""
         import json
@@ -2103,6 +2224,113 @@ class DecisionJournal:
             conn.execute(
                 f"UPDATE trade_actions SET {clauses} WHERE action_id = ?",
                 (*updates.values(), str(action_id or "")),
+            )
+            conn.commit()
+
+    def reconcile_trade_actions_from_execution_orders(self) -> int:
+        """Repair action-state drift from the linked execution audit row."""
+        ts = self._utcnow_iso()
+        terminal_statuses = ("filled", "partially_filled", "canceled", "rejected", "failed", "blocked")
+        placeholders = ", ".join("?" for _ in terminal_statuses)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE trade_actions
+                SET status = (
+                        SELECT eo.status
+                        FROM execution_orders eo
+                        WHERE eo.order_intent_id = trade_actions.order_intent_id
+                        ORDER BY datetime(eo.updated_at) DESC, eo.id DESC
+                        LIMIT 1
+                    ),
+                    updated_at = ?,
+                    notes = CASE
+                        WHEN notes IS NULL OR notes = '' THEN 'Status reconciled from execution audit.'
+                        ELSE notes || char(10) || 'Status reconciled from execution audit.'
+                    END
+                WHERE order_intent_id IS NOT NULL
+                  AND order_intent_id != ''
+                  AND EXISTS (
+                    SELECT 1
+                    FROM execution_orders eo
+                    WHERE eo.order_intent_id = trade_actions.order_intent_id
+                      AND eo.status IN ({placeholders})
+                      AND eo.status != trade_actions.status
+                  )
+                """,
+                (ts, *terminal_statuses),
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def expire_stale_trade_actions(self) -> int:
+        """Close expired, unsubmitted review cards without touching broker orders."""
+        ts = self._utcnow_iso()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE trade_actions
+                SET status = 'expired',
+                    updated_at = ?,
+                    notes = CASE
+                        WHEN notes IS NULL OR notes = '' THEN 'Action expired before submission.'
+                        ELSE notes || char(10) || 'Action expired before submission.'
+                    END
+                WHERE status IN ('queued', 'review_ready')
+                  AND expires_at IS NOT NULL
+                  AND expires_at != ''
+                  AND datetime(expires_at) < datetime(?)
+                """,
+                (ts, ts),
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
+
+    # -----------------------------------------------------------------------
+    # Pending EXIT Confirmation Methods (restart-safe trading-day counter)
+    # -----------------------------------------------------------------------
+
+    def get_pending_exit_confirmation(self, thesis_id: str) -> dict[str, Any] | None:
+        """Return the persisted EXIT-confirmation row for one thesis."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pending_exit_confirmations WHERE thesis_id = ? LIMIT 1",
+                (str(thesis_id or ""),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_pending_exit_confirmations(self) -> list[dict[str, Any]]:
+        """Return all persisted EXIT-confirmation rows."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_exit_confirmations ORDER BY datetime(first_signal_at) ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_pending_exit_confirmation(self, row_data: dict[str, Any]) -> None:
+        """Insert/update one EXIT-confirmation row keyed by thesis_id."""
+        payload = dict(row_data)
+        payload["updated_at"] = self._utcnow_iso()
+        payload.setdefault("first_signal_at", payload["updated_at"])
+        if payload.get("ticker"):
+            payload["ticker"] = str(payload["ticker"]).upper().strip()
+        cols = list(payload.keys())
+        placeholders = ", ".join(["?"] * len(cols))
+        updates = ", ".join(f"{c} = excluded.{c}" for c in cols if c != "thesis_id")
+        sql = (
+            f"INSERT INTO pending_exit_confirmations ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(thesis_id) DO UPDATE SET {updates}"
+        )
+        with self._connect() as conn:
+            conn.execute(sql, [payload[c] for c in cols])
+            conn.commit()
+
+    def delete_pending_exit_confirmation(self, thesis_id: str) -> None:
+        """Drop one EXIT-confirmation row (confirmed, discarded, or urgent)."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM pending_exit_confirmations WHERE thesis_id = ?",
+                (str(thesis_id or ""),),
             )
             conn.commit()
 

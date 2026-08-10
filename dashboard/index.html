@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>ARTHA — Live</title>
+<style>
+:root{
+  --bg:#0b0f14; --panel:#121821; --panel2:#0f141c; --line:#1f2937;
+  --text:#e8edf4; --muted:#9aa7b8; --dim:#7a8797;
+  --green:#22c55e; --green-soft:rgba(34,197,94,.12);
+  --red:#ef4444; --red-soft:rgba(239,68,68,.12);
+  --amber:#f59e0b; --amber-soft:rgba(245,158,11,.14);
+  --blue:#3b82f6; --blue-soft:rgba(59,130,246,.14);
+  --radius:14px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.45;padding-bottom:40px}
+.wrap{max-width:1060px;margin:0 auto;padding:0 14px}
+a{color:var(--blue)}
+
+/* header */
+header{position:sticky;top:0;z-index:10;background:rgba(11,15,20,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.hrow{display:flex;align-items:center;gap:10px;padding:12px 0;flex-wrap:wrap}
+.logo{font-weight:800;font-size:20px;letter-spacing:.5px}
+.logo span{color:var(--green)}
+.chip{font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.chip.on{color:var(--green);border-color:rgba(34,197,94,.4);background:var(--green-soft)}
+.chip.warn{color:var(--amber);border-color:rgba(245,158,11,.4);background:var(--amber-soft)}
+.chip.danger{color:var(--red);border-color:rgba(239,68,68,.5);background:var(--red-soft)}
+.chip.off{color:var(--dim)}
+.live{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-left:auto}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+.dot.stale{background:var(--amber);animation:none}
+@keyframes pulse{0%{opacity:1}50%{opacity:.35}100%{opacity:1}}
+
+/* cards */
+.grid{display:grid;grid-template-columns:1fr;gap:14px;margin-top:14px}
+@media(min-width:860px){.grid.two{grid-template-columns:1fr 1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
+.card h2{font-size:15px;font-weight:700;display:flex;align-items:center;gap:8px}
+.card .sub{font-size:12.5px;color:var(--muted);margin:2px 0 12px}
+.banner{border-radius:var(--radius);padding:12px 14px;font-size:14px;margin-top:14px;display:none}
+.banner.err{display:block;background:var(--red-soft);border:1px solid rgba(239,68,68,.4);color:#fca5a5}
+.banner.warn{display:block;background:var(--amber-soft);border:1px solid rgba(245,158,11,.4);color:#fcd34d}
+
+/* hero */
+.hero{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px 26px;margin-top:16px}
+.hero .big{font-size:44px;font-weight:800;letter-spacing:-1px;font-variant-numeric:tabular-nums}
+.hero .delta{font-size:17px;font-weight:700}
+.hero .lbl{font-size:12px;color:var(--muted);display:block;margin-bottom:2px}
+.pos{color:var(--green)}.neg{color:var(--red)}.flat{color:var(--muted)}
+.hero-caption{width:100%;color:var(--muted);font-size:13px}
+
+/* chart */
+svg{display:block;width:100%}
+.range{display:flex;gap:6px;margin-left:auto}
+.range button{background:var(--panel2);border:1px solid var(--line);color:var(--muted);font-size:13px;padding:8px 14px;border-radius:9px;cursor:pointer;min-height:34px}
+.range button.on{color:var(--text);border-color:var(--blue);background:var(--blue-soft)}
+
+/* positions */
+.pos-row{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
+.pos-row:first-of-type{border-top:none}
+.tick{font-weight:800;font-size:16px;width:52px}
+.pos-mid{flex:1;min-width:0}
+.pos-meta{font-size:12px;color:var(--muted)}
+.stopbar{height:6px;border-radius:4px;background:var(--panel2);margin-top:6px;position:relative;overflow:hidden}
+.stopbar i{position:absolute;left:0;top:0;bottom:0;border-radius:4px}
+.pos-right{text-align:right;min-width:86px}
+.pv{font-weight:700;font-variant-numeric:tabular-nums}
+.pp{font-size:13px;font-weight:700}
+.badge{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:6px;margin-left:6px;vertical-align:middle}
+.badge.lock{background:var(--green-soft);color:var(--green)}
+.badge.act{background:var(--amber-soft);color:var(--amber)}
+
+/* timeline */
+.tl{list-style:none}
+.tl.capped{max-height:430px;overflow-y:auto}
+.showmore{width:100%;margin-top:10px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);padding:9px;border-radius:9px;cursor:pointer;font-size:13px}
+.tl li{display:flex;gap:10px;padding:8px 0;border-top:1px solid var(--line);font-size:13.5px}
+.tl li:first-child{border-top:none}
+.tl .t{color:var(--dim);font-size:12px;min-width:64px;text-align:right;font-variant-numeric:tabular-nums;padding-top:1px}
+.tl .ic{width:20px;text-align:center}
+.tl .tx{flex:1;color:#c8d2de}
+
+/* decisions */
+.dec{border-top:1px solid var(--line);padding:9px 0;font-size:13.5px;cursor:pointer}
+.dec:first-of-type{border-top:none}
+.dec .head{display:flex;align-items:center;gap:8px}
+.abadge{font-size:11px;font-weight:800;padding:2px 8px;border-radius:6px;min-width:52px;text-align:center}
+.A-BUY,.A-TACTICAL_BUY{background:var(--green-soft);color:var(--green)}
+.A-SELL,.A-URGENT_EXIT{background:var(--red-soft);color:var(--red)}
+.A-TRIM{background:var(--amber-soft);color:var(--amber)}
+.A-AVOID{background:#232d3b;color:#a7b2c2}
+.A-DEFER,.A-WATCH{background:var(--blue-soft);color:var(--blue)}
+.A-HOLD{background:var(--amber-soft);color:var(--amber)}
+.dec .when{color:var(--dim);font-size:11.5px;margin-left:auto;white-space:nowrap}
+.dec .why{color:var(--muted);font-size:12.5px;margin-top:4px;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
+.dec.open .why{-webkit-line-clamp:unset}
+
+/* report card */
+.rc{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.ring{position:relative;width:110px;height:110px;flex:none}
+.ring .num{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;font-weight:800;font-size:22px}
+.ring .num small{font-size:10.5px;color:var(--muted);font-weight:600}
+.rc-stats{flex:1;min-width:180px}
+.rc-line{display:flex;justify-content:space-between;font-size:13px;padding:4px 0;border-bottom:1px dashed var(--line)}
+.rc-line b{font-variant-numeric:tabular-nums}
+.lesson{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 11px;font-size:12.5px;color:#c8d2de;margin-top:8px}
+.lesson small{color:var(--dim)}
+
+/* system */
+.sys{display:flex;gap:10px;padding:9px 0;border-top:1px solid var(--line);font-size:13.5px;align-items:flex-start}
+.sys:first-of-type{border-top:none}
+.sdot{width:10px;height:10px;border-radius:50%;margin-top:5px;flex:none}
+.s-ok{background:var(--green)}.s-warn{background:var(--amber)}.s-down{background:var(--red);animation:pulse 1.2s infinite}
+.sys b{font-size:13.5px}
+.sys .sd{color:var(--muted);font-size:12.5px}
+
+/* improvements */
+.commit{display:flex;gap:10px;font-size:13px;padding:7px 0;border-top:1px solid var(--line)}
+.commit:first-of-type{border-top:none}
+.commit .d{color:var(--dim);min-width:52px;font-size:12px;padding-top:1px}
+.commit .s{color:#c8d2de}
+
+/* how it works */
+details{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);margin-top:14px}
+summary{padding:14px 16px;font-weight:700;font-size:15px;cursor:pointer;list-style:none}
+summary::-webkit-details-marker{display:none}
+.steps{padding:0 16px 16px;display:grid;gap:10px}
+.step{display:flex;gap:12px;font-size:13.5px}
+.step .n{width:26px;height:26px;border-radius:50%;background:var(--blue-soft);color:var(--blue);font-weight:800;display:flex;align-items:center;justify-content:center;flex:none;font-size:13px}
+.step .sd{color:var(--muted);font-size:12.5px}
+footer{text-align:center;color:var(--dim);font-size:11.5px;margin-top:26px}
+.empty{color:var(--dim);font-size:13px;padding:8px 0}
+</style>
+</head>
+<body>
+<header><div class="wrap hrow">
+  <div class="logo">ARTHA<span>●</span></div>
+  <span class="chip" id="chip-market">…</span>
+  <span class="chip" id="chip-regime">…</span>
+  <span class="chip warn" id="chip-pause" style="display:none">Buys paused today</span>
+  <span class="live"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
+</div></header>
+
+<div class="wrap">
+  <div class="banner err" id="banner-err"></div>
+  <div class="banner warn" id="banner-warn"></div>
+
+  <div class="hero">
+    <div><span class="lbl">Portfolio value</span><span class="big" id="v-total">$—</span></div>
+    <div><span class="lbl" id="lbl-today">Today</span><span class="delta" id="v-today">—</span></div>
+    <div><span class="lbl" id="lbl-start">Since start</span><span class="delta" id="v-all">—</span></div>
+    <div class="hero-caption" id="v-caption"></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>📈 Portfolio over time <span class="range" id="range"></span></h2>
+      <div class="sub">Every dot on the line is your real money at that moment. Triangles mark buys ▲ and sells ▼. Dashed line = the $350 you put in.</div>
+      <div id="chart"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>💼 Positions <span class="chip" id="pos-count"></span></h2>
+      <div class="sub">What ARTHA owns right now. Every position has an automatic safety net — if the price falls to that level, ARTHA sells on its own. The bar shows how much cushion is left (longer = safer).</div>
+      <div id="positions"></div>
+    </div>
+  </div>
+
+  <div class="grid two">
+    <div class="card">
+      <h2>🕑 Today’s activity</h2>
+      <div class="sub">Everything ARTHA did today, newest first — scans, research verdicts, orders.</div>
+      <ul class="tl" id="activity"></ul><div id="activity-more"></div>
+    </div>
+    <div class="card">
+      <h2>🧠 Recent decisions</h2>
+      <div class="sub">The research council’s latest verdicts. Tap one to read the full reasoning.</div>
+      <div id="decisions"></div>
+    </div>
+  </div>
+
+  <div class="grid two">
+    <div class="card">
+      <h2>🎓 Report card</h2>
+      <div class="sub">ARTHA grades its own judgment ~30 days after each call. So far almost all graded calls are “don’t buy” verdicts (skipping a stock that then soared counts as a mistake). Its real buys get graded as they mature. Wrong calls become lessons fed back into its brain.</div>
+      <div class="rc">
+        <div class="ring" id="ring"></div>
+        <div class="rc-stats" id="rc-stats"></div>
+      </div>
+      <div id="lessons"></div>
+    </div>
+    <div class="card">
+      <h2>🩺 System health</h2>
+      <div class="sub">The machinery that keeps ARTHA safe. Green = fine. Anything red alerts the operator on Telegram automatically.</div>
+      <div id="system"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>🔧 Fixes & self-improvement</h2>
+      <div class="sub">Recent upgrades to ARTHA itself, plus rules it is quietly test-driving on paper (“shadow rules”) before any real money follows them.</div>
+      <div id="improvements"></div>
+    </div>
+  </div>
+
+  <details>
+    <summary>🤖 How ARTHA works — 60-second tour</summary>
+    <div class="steps">
+      <div class="step"><span class="n">1</span><div><b>Scan</b> — every trading day at 11:30 &amp; 2:15 (CT) it screens the market with proven, research-backed filters (momentum, strength near 52-week highs, quality trends).<div class="sd">Junk and lottery-ticket stocks are excluded automatically.</div></div></div>
+      <div class="step"><span class="n">2</span><div><b>Research</b> — promising names get deep diligence: live news, filings, earnings, then a council of 3 AI analysts (bull, technician, skeptic) votes with a score out of 100.</div></div>
+      <div class="step"><span class="n">3</span><div><b>Guardrails</b> — even a “buy” must pass hard limits: max $25/order, $50/day, 2 buys/day, 6 positions. The dashboard shows when a buy is blocked and why.</div></div>
+      <div class="step"><span class="n">4</span><div><b>Execute</b> — approved orders are placed on the real Robinhood account (the $350 pilot), each with an automatic stop-loss safety net from second one.</div></div>
+      <div class="step"><span class="n">5</span><div><b>Protect &amp; review</b> — stops trail up as positions win; the sell council re-examines every holding twice a day. Mechanical stops fire instantly; judgment sells follow the configured approval policy.</div></div>
+      <div class="step"><span class="n">6</span><div><b>Learn</b> — every night at 9pm it grades its past calls against the market, turns mistakes into lessons, and each Saturday researches the web for ways to improve itself.</div></div>
+    </div>
+  </details>
+
+  <footer id="foot">Auto-refreshes · ARTHA dashboard v1</footer>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const fmt$ = (v, d=2) => (v==null||isNaN(v)) ? "—" : "$" + Number(v).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+const fmtPct = v => (v==null||isNaN(v)) ? "" : (v>=0?"+":"") + Number(v).toFixed(2) + "%";
+const cls = v => v>0.001 ? "pos" : v<-0.001 ? "neg" : "flat";
+const esc = s => String(s??"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+let DATA = null, range = "1M", lastOK = 0;
+
+async function refresh(){
+  try{
+    const r = await fetch("/api/dashboard", {cache:"no-store"});
+    if(r.status===401){
+      $("banner-err").textContent = "🔑 Access key needed — open the dashboard from your saved link (the one with the key in it), then this page stays signed in.";
+      $("banner-err").style.display="block";
+      schedule(); return;
+    }
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    DATA = await r.json();
+    lastOK = Date.now();
+    $("banner-err").style.display="none";   // render() may re-show it (kill switch / stale data)
+    render();
+  }catch(e){
+    $("banner-err").textContent = "⚠️ Can’t reach ARTHA right now ("+e.message+"). Showing the last data received. If this persists, the Mac mini or dashboard service may be off.";
+    $("banner-err").style.display="block";
+    $("livedot").classList.add("stale");
+  }
+  schedule();
+}
+function schedule(){
+  const open = DATA?.market?.open;
+  setTimeout(refresh, open ? 15000 : 60000);
+}
+setInterval(()=>{ // staleness indicator
+  const s = (Date.now()-lastOK)/1000;
+  $("livedot").classList.toggle("stale", s>90);
+}, 5000);
+
+function render(){
+  const d = DATA, v = d.vitals;
+  $("banner-err").style.display = "none";   // each render re-decides every banner
+  $("banner-warn").style.display = "none";
+  // header
+  $("chip-market").textContent = d.market.phase + " · " + d.market.ct_time;
+  $("chip-market").className = "chip " + (d.market.open ? "on" : "off");
+  const regimeNice = {RISK_ON:"Market climate: Favorable ☀️", RISK_OFF:"Market climate: Caution 🌧", HARD_RISK_OFF:"Market climate: Defensive ⛈"}[v.regime] || ("Regime: "+v.regime);
+  $("chip-regime").textContent = regimeNice;
+  $("chip-regime").className = "chip " + (v.regime==="RISK_ON" ? "on" : v.regime==="HARD_RISK_OFF" ? "danger" : "warn");
+  $("chip-pause").style.display = v.buys_paused ? "" : "none";
+  $("updated").textContent = "updated " + new Date().toLocaleTimeString([], {hour:"numeric",minute:"2-digit"});
+
+  // banners
+  if (v.trading_disabled){
+    $("banner-err").textContent = "🛑 KILL SWITCH IS ON — ARTHA will not place any orders. " + (v.kill_reason||"");
+    $("banner-err").style.display = "block";
+  } else if (v.portfolio_missing){
+    $("banner-err").textContent = "⚠️ ARTHA’s portfolio file is unavailable right now — money numbers are hidden until it’s back (usually within minutes).";
+    $("banner-err").style.display = "block";
+  } else if (v.recent_contribution){
+    const rc=v.recent_contribution, amt=Number(rc.amount||0);
+    $("banner-warn").textContent = amt>=0
+      ? `💰 New money detected: +${fmt$(amt)} was added to the account. It's counted as a contribution (not profit). ARTHA holds it in cash until you tell it to raise its budget.`
+      : `🏧 Withdrawal detected: ${fmt$(Math.abs(amt))} left the account. Booked as money taken out, not a loss.`;
+    $("banner-warn").style.display = "block";
+  } else if (v.prices_age_minutes!=null && ((DATA.market.open && v.prices_age_minutes>45) || v.prices_age_minutes>1200)){
+    $("banner-err").textContent = `⏱ Prices were last refreshed ${v.prices_age_minutes>120? (v.prices_age_minutes/60).toFixed(1)+" hours":Math.round(v.prices_age_minutes)+" minutes"} ago — values below may lag the live market.`;
+    $("banner-err").style.display = "block";
+  }
+  const down = (d.system||[]).filter(s=>s.status==="down");
+  if (down.length){
+    $("banner-warn").textContent = "⚠️ Attention: " + down.map(s=>s.name).join(", ") + " — see System health below.";
+    $("banner-warn").style.display = "block";
+  }
+
+  // hero
+  $("v-total").textContent = v.total_value==null ? "—" : fmt$(v.total_value);
+  $("lbl-today").textContent = v.pnl_baseline_label ? `Since ${v.pnl_baseline_label}` : "Since last close";
+  $("lbl-start").textContent = `Since start (${fmt$(v.base,0)} in)`;
+  const t = $("v-today");
+  if (v.pnl_today==null){ t.textContent = "—"; t.className = "delta flat"; }
+  else { t.textContent = `${v.pnl_today>=0?"+":""}${fmt$(Math.abs(v.pnl_today)).replace("$", v.pnl_today<0?"-$":"$")} (${fmtPct(v.pnl_today_pct)})`; t.className = "delta "+cls(v.pnl_today); }
+  const a = $("v-all");
+  if (v.pnl_total==null){ a.textContent="—"; a.className="delta flat"; }
+  else { a.textContent = `${v.pnl_total>=0?"+":"-"}${fmt$(Math.abs(v.pnl_total))} (${fmtPct(v.pnl_total_pct)})`; a.className = "delta "+cls(v.pnl_total); }
+  $("v-caption").textContent = `${fmt$(v.cash)} cash ready · ${fmt$(v.invested)} invested across ${v.position_count} positions` + (v.buys_paused ? " · buys resume next trading day" : "");
+
+  renderChart(); renderPositions(); renderActivity(); renderDecisions(); renderReport(); renderSystem(); renderImprovements();
+}
+
+/* ---------- chart ---------- */
+function renderChart(){
+  const wrapW = $("chart").clientWidth || 640, H = 210, W = Math.max(320, wrapW);
+  const eq = DATA.equity || {points:[],markers:[]};
+  const now = Date.now();
+  const spans = {"1W":7*864e5, "1M":30*864e5, "3M":90*864e5, "All":Infinity};
+  // range buttons
+  $("range").innerHTML = Object.keys(spans).map(k=>`<button class="${k===range?'on':''}" onclick="setRange('${k}')">${k}</button>`).join("");
+  let pts = eq.points.map(p=>({t:Date.parse(p.t), v:p.v})).filter(p=>!isNaN(p.t));
+  pts = pts.filter(p=> now - p.t <= spans[range]);
+  if (pts.length < 2){ $("chart").innerHTML = "<div class='empty'>Not enough history in this range yet — it builds automatically as ARTHA runs.</div>"; return; }
+  const xs = pts.map(p=>p.t), ys = pts.map(p=>p.v);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  let y0 = Math.min(...ys, eq.base), y1 = Math.max(...ys, eq.base);
+  const pad = Math.max((y1-y0)*0.12, 1); y0-=pad; y1+=pad;
+  const X = t => 46 + (W-56) * (t-x0)/(x1-x0 || 1);
+  const Y = val => 8 + (H-34) * (1 - (val-y0)/(y1-y0 || 1));
+  const line = pts.map((p,i)=>`${i?"L":"M"}${X(p.t).toFixed(1)},${Y(p.v).toFixed(1)}`).join(" ");
+  const area = line + ` L${X(x1).toFixed(1)},${H-26} L${X(x0).toFixed(1)},${H-26} Z`;
+  const up = ys[ys.length-1] >= (eq.base||ys[0]);
+  const col = up ? "var(--green)" : "var(--red)";
+  const gy = [y0+pad, (y0+y1)/2, y1-pad];
+  let g = gy.map(v=>`<line x1="46" x2="${W-10}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)" stroke-dasharray="2 4"/><text x="2" y="${Y(v)+4}" fill="var(--dim)" font-size="10">$${v.toFixed(0)}</text>`).join("");
+  const bY = Y(eq.base);
+  const baseline = (bY>4 && bY<H-28) ? `<line x1="46" x2="${W-10}" y1="${bY}" y2="${bY}" stroke="var(--dim)" stroke-dasharray="6 4"/><text x="${W-42}" y="${bY-4}" fill="var(--dim)" font-size="10">$${eq.base}</text>` : "";
+  const marks = (eq.markers||[]).map(m=>{
+    const t = Date.parse(m.t); if (isNaN(t) || t<x0 || t>x1) return "";
+    // y: nearest point value
+    let near = pts[0]; for (const p of pts) if (Math.abs(p.t-t)<Math.abs(near.t-t)) near = p;
+    const y = Y(near.v), x = X(t);
+    return m.side==="buy"
+      ? `<path d="M${x-4},${y+9} L${x+4},${y+9} L${x},${y+2} Z" fill="var(--green)"><title>Bought ${esc(m.ticker)}</title></path>`
+      : `<path d="M${x-4},${y-9} L${x+4},${y-9} L${x},${y-2} Z" fill="var(--red)"><title>Sold ${esc(m.ticker)}</title></path>`;
+  }).join("");
+  // x labels: 3
+  const xt = [x0, (x0+x1)/2, x1].map(t=>`<text x="${X(t)}" y="${H-8}" fill="var(--dim)" font-size="10" text-anchor="middle">${new Date(t).toLocaleDateString([],{month:"short",day:"numeric"})}</text>`).join("");
+  $("chart").innerHTML =
+   `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:${H}px">
+      <defs><linearGradient id="ag" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${up?'rgba(34,197,94,.28)':'rgba(239,68,68,.28)'}"/>
+        <stop offset="100%" stop-color="rgba(0,0,0,0)"/></linearGradient></defs>
+      ${g}${baseline}
+      <path d="${area}" fill="url(#ag)"/>
+      <path d="${line}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round"/>
+      <circle cx="${X(pts[pts.length-1].t)}" cy="${Y(pts[pts.length-1].v)}" r="3.5" fill="${col}"/>
+      ${marks}${xt}
+    </svg>`;
+}
+window.setRange = k => { range = k; renderChart(); };
+
+/* ---------- positions ---------- */
+function renderPositions(){
+  const ps = DATA.positions||[];
+  $("pos-count").textContent = ps.length + " held · " + fmt$(DATA.vitals.cash) + " cash";
+  if (!ps.length){ $("positions").innerHTML = "<div class='empty'>No open positions — ARTHA is all cash and hunting.</div>"; return; }
+  $("positions").innerHTML = ps.map(p=>{
+    if (p.unmanaged) return `<div class="pos-row">
+      <div class="tick">${esc(p.ticker)}</div>
+      <div class="pos-mid">
+        <div class="pos-meta">⚠️ In your Robinhood account but <b>not managed by ARTHA</b> — no automatic safety net on this one (${Number(p.shares).toFixed(4)} sh)</div>
+      </div></div>`;
+    const distFrac = p.stop_dist_pct==null ? 0.5 : Math.max(0.04, Math.min(1, p.stop_dist_pct/25));
+    const barColor = p.stop_dist_pct==null ? "var(--dim)" : p.stop_dist_pct < 4 ? "var(--red)" : p.stop_dist_pct < 8 ? "var(--amber)" : "var(--green)";
+    const badges =
+      (p.pending_action ? `<span class="badge act">${esc(String(p.pending_action).toUpperCase())} awaiting your OK ✋</span>` : "") +
+      (p.stop_locked_profit ? `<span class="badge lock">🔒 profit locked in</span>` : "");
+    return `<div class="pos-row">
+      <div class="tick">${esc(p.ticker)}</div>
+      <div class="pos-mid">
+        <div class="pos-meta">bought ${fmt$(p.avg_cost)} → now ${fmt$(p.price)} ${badges}</div>
+        <div class="stopbar"><i style="width:${(distFrac*100).toFixed(0)}%;background:${barColor}"></i></div>
+        <div class="pos-meta">${p.stop ? `safety net: sells automatically at ${fmt$(p.stop)} (${p.stop_dist_pct!=null? p.stop_dist_pct.toFixed(1)+"% below" : ""})` : "no stop recorded"}</div>
+      </div>
+      <div class="pos-right">
+        <div class="pv">${fmt$(p.market_value)}</div>
+        <div class="pp ${cls(p.pnl_pct)}">${fmtPct(p.pnl_pct)}</div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+/* ---------- activity ---------- */
+let activityExpanded = false;
+window.toggleActivity = ()=>{ activityExpanded = !activityExpanded; renderActivity(); };
+function renderActivity(){
+  const ev = DATA.activity||[];
+  if (!ev.length){
+    $("activity").innerHTML = "<div class='empty'>Quiet so far today — next scheduled scan runs on the trading calendar (11:30 AM & 2:15 PM CT).</div>";
+    $("activity-more").innerHTML = "";
+    return;
+  }
+  const shown = activityExpanded ? ev : ev.slice(0,12);
+  $("activity").className = "tl" + (activityExpanded ? " capped" : "");
+  $("activity").innerHTML = shown.map(e=>`<li><span class="t">${esc(e.time)}</span><span class="ic">${e.icon}</span><span class="tx">${esc(e.text)}</span></li>`).join("");
+  $("activity-more").innerHTML = ev.length>12
+    ? `<button class="showmore" onclick="toggleActivity()">${activityExpanded? "Show less" : `Show all ${ev.length} events`}</button>` : "";
+}
+
+/* ---------- decisions ---------- */
+function renderDecisions(){
+  const ds = DATA.decisions||[];
+  $("decisions").innerHTML = ds.length ? ds.slice(0,14).map((d,i)=>`
+    <div class="dec" onclick="this.classList.toggle('open')">
+      <div class="head">
+        <span class="abadge A-${esc(d.action)}">${esc(d.action.replace("_"," "))}</span>
+        <b>${esc(d.ticker)}</b>
+        <span style="color:var(--dim);font-size:12px">${d.confidence!=null ? "confidence "+d.confidence+"/10" : ""}</span>
+        <span class="when">${esc(d.when)}</span>
+      </div>
+      <div class="why">${esc(d.why||"")}</div>
+    </div>`).join("") : "<div class='empty'>No council decisions recorded yet.</div>";
+}
+
+/* ---------- report card ---------- */
+function renderReport(){
+  const rc = DATA.report_card||{};
+  const pct = rc.accuracy_pct;
+  const r = 46, c = 2*Math.PI*r, fill = pct!=null ? c*pct/100 : 0;
+  $("ring").innerHTML = `
+    <svg viewBox="0 0 110 110">
+      <circle cx="55" cy="55" r="${r}" fill="none" stroke="var(--panel2)" stroke-width="11"/>
+      <circle cx="55" cy="55" r="${r}" fill="none" stroke="${pct>=60?'var(--green)':pct>=45?'var(--amber)':'var(--red)'}"
+        stroke-width="11" stroke-linecap="round" stroke-dasharray="${fill} ${c}" transform="rotate(-90 55 55)"/>
+    </svg>
+    <div class="num">${pct!=null? pct.toFixed(0)+"%" : "—"}<small>call accuracy</small></div>`;
+  $("rc-stats").innerHTML = `
+    <div class="rc-line"><span>✅ Correct calls</span><b>${rc.correct??"—"}</b></div>
+    <div class="rc-line"><span>❌ Wrong calls</span><b>${rc.incorrect??"—"}</b></div>
+    <div class="rc-line"><span>➗ Partly right</span><b>${rc.partial??"—"}</b></div>
+    <div class="rc-line"><span>⏳ Waiting to be graded</span><b>${rc.pending??"—"}</b></div>
+    ${rc.due_tonight?`<div class="rc-line"><span>🌙 Being graded tonight (9 PM)</span><b>${rc.due_tonight}</b></div>`:""}`;
+  const lessons = (rc.lessons||[]).filter(l=>l.text);
+  $("lessons").innerHTML = lessons.length
+    ? "<div style='font-size:12px;color:var(--dim);margin-top:12px'>WHAT IT’S LEARNING FROM</div>" +
+      lessons.slice(0,3).map(l=>`<div class="lesson">📌 ${esc(l.text)}${l.action?`<br><small>→ ${esc(l.action)}</small>`:""}</div>`).join("")
+    : "";
+}
+
+/* ---------- system ---------- */
+function renderSystem(){
+  const sys = DATA.system||[];
+  $("system").innerHTML = sys.map(s=>`
+    <div class="sys"><span class="sdot s-${esc(s.status)}"></span>
+      <div><b>${esc(s.name)}</b><div class="sd">${esc(s.detail)}</div></div>
+    </div>`).join("") || "<div class='empty'>No health data.</div>";
+}
+
+/* ---------- improvements ---------- */
+function renderImprovements(){
+  const im = DATA.improvements||{};
+  const commits = (im.commits||[]).slice(0,7).map(c=>`
+    <div class="commit"><span class="d">${esc(c.date)}</span><span class="s">${esc(c.subject)}</span></div>`).join("");
+  const shadow = im.shadow||{};
+  const briefs = (im.research_briefs||[]).map(b=>`<div class="commit"><span class="d">${esc(b.date)}</span><span class="s">🔬 ${esc(b.title||"Strategy research brief")}</span></div>`).join("");
+  $("improvements").innerHTML =
+    (briefs ? "<div style='font-size:12px;color:var(--dim);margin-bottom:4px'>SELF-RESEARCH BRIEFS</div>"+briefs : "") +
+    `<div style="font-size:12px;color:var(--dim);margin:${briefs?'12px':'0'} 0 4px">RECENT FIXES & UPGRADES</div>` + (commits || "<div class='empty'>—</div>") +
+    `<div class="lesson" style="margin-top:12px">🧪 <b>${shadow.rules??0}</b> candidate rules in paper-trading trials (<b>${shadow.trials??0}</b> practice runs so far) — a rule only touches real money after proving itself (20+ trials, 65%+ win rate) <i>and</i> the operator approves it.` +
+    ((im.research_briefs||[]).length ? "" : " First weekly self-research brief lands Saturday 10 AM.") + `</div>`;
+}
+
+refresh();
+</script>
+</body>
+</html>

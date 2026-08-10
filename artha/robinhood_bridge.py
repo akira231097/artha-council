@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import secrets
 import uuid
@@ -25,6 +24,12 @@ from .execution import (
 )
 from .journal import DecisionJournal
 from .portfolio import PORTFOLIO_FILE, Portfolio, Position
+from .stand_down import (
+    buying_paused,
+    control_file_lock,
+    maybe_pause_buying_for_limit,
+    read_control_file,
+)
 from .thesis_tracker import ThesisTracker, _HARD_STOP, _REVIEW_DAYS, _add_days
 
 logger = logging.getLogger(__name__)
@@ -339,13 +344,30 @@ def get_trading_control(path: str | Path | None = None) -> dict[str, Any]:
 
 
 def set_trading_disabled(disabled: bool, reason: str = "", path: str | Path | None = None) -> dict[str, Any]:
+    """Flip the operator kill switch, preserving every other control key.
+
+    Runs under the shared control-file lock so it can never interleave with
+    a concurrent buy-pause write (and vice versa). An unreadable existing
+    file is replaced only because the operator is explicitly setting the
+    switch — their intent overrides whatever the corrupt file held.
+    """
     target = Path(path or Config.ROBINHOOD_CONTROL_FILE).expanduser()
-    payload = {
-        "trading_disabled": bool(disabled),
-        "reason": str(reason or ("Disabled by Telegram kill switch." if disabled else "Re-enabled by operator.")),
-        "updated_at": _utcnow_iso(),
-    }
-    _atomic_write_json(target, payload)
+    with control_file_lock(target):
+        existing, status = read_control_file(target)
+        payload = dict(existing or {})
+        payload.update(
+            {
+                "trading_disabled": bool(disabled),
+                "reason": str(reason or ("Disabled by Telegram kill switch." if disabled else "Re-enabled by operator.")),
+                "updated_at": _utcnow_iso(),
+            }
+        )
+        if status == "unreadable":
+            logger.warning(
+                "[control] replacing unreadable control file at operator request (disabled=%s)",
+                disabled,
+            )
+        _atomic_write_json(target, payload)
     return {**payload, "path": str(target)}
 
 
@@ -380,7 +402,7 @@ def _broker_position_avg_cost(row: dict[str, Any]) -> float | None:
     return None
 
 
-def _broker_position_price(row: dict[str, Any], avg_cost: float | None = None) -> float | None:
+def _broker_position_live_price(row: dict[str, Any]) -> float | None:
     for key in ("market_price", "current_price", "last_price", "price"):
         value = _as_float(row.get(key))
         if value is not None and value > 0:
@@ -389,7 +411,45 @@ def _broker_position_price(row: dict[str, Any], avg_cost: float | None = None) -
     qty = _broker_position_quantity(row)
     if market_value and qty > 0:
         return market_value / qty
+    return None
+
+
+def _broker_position_price(row: dict[str, Any], avg_cost: float | None = None) -> float | None:
+    live_price = _broker_position_live_price(row)
+    if live_price is not None and live_price > 0:
+        return live_price
     return avg_cost
+
+
+def _fetch_mark_to_market_prices(tickers: list[str]) -> tuple[dict[str, float], list[str]]:
+    """Fetch live-ish quotes for held symbols when the broker snapshot lacks marks."""
+    unique = sorted({str(t or "").upper().strip() for t in tickers if str(t or "").strip()})
+    if not unique:
+        return {}, []
+    prices: dict[str, float] = {}
+    warnings: list[str] = []
+    try:
+        from .collector import FMPCollector
+
+        fmp = FMPCollector()
+    except Exception as exc:
+        return {}, [f"mark-to-market quote provider unavailable: {type(exc).__name__}: {exc}"]
+
+    for ticker in unique:
+        try:
+            quote = fmp.quote(ticker) or {}
+            price = _as_float(
+                quote.get("price")
+                or quote.get("lastPrice")
+                or quote.get("previousClose")
+            )
+            if price and price > 0:
+                prices[ticker] = float(price)
+            else:
+                warnings.append(f"{ticker}: quote did not include a usable price")
+        except Exception as exc:
+            warnings.append(f"{ticker}: quote fetch failed: {type(exc).__name__}: {exc}")
+    return prices, warnings
 
 
 def _same_number(left: Any, right: Any, tolerance: float = 0.0001) -> bool:
@@ -448,20 +508,210 @@ def _position_already_reflects_fill(
     row: dict[str, Any],
     quantity: float,
     avg_price: float,
+    *,
+    portfolio_updated_at: Any = None,
+    fill_time: Any = None,
 ) -> bool:
     if not pos or not thesis:
         return False
     if getattr(pos, "thesis_id", None) and getattr(pos, "thesis_id", None) != getattr(thesis, "thesis_id", None):
         return False
-    if not _same_number(getattr(pos, "shares", None), quantity, tolerance=0.000001):
-        return False
-    if not _same_number(getattr(pos, "avg_cost", None), avg_price, tolerance=0.01):
-        return False
     position_time = _parse_dt(getattr(pos, "opened_at", None))
     order_time = _parse_dt(row.get("submitted_at") or row.get("created_at"))
-    if position_time is None or order_time is None:
+    if (
+        _same_number(getattr(pos, "shares", None), quantity, tolerance=0.000001)
+        and _same_number(getattr(pos, "avg_cost", None), avg_price, tolerance=0.01)
+        and position_time is not None
+        and order_time is not None
+    ):
+        return position_time >= order_time - timedelta(minutes=5)
+
+    # A broker snapshot can update an existing holding before the separate fill
+    # callback reaches Artha. In that top-up race, the position contains total
+    # post-fill shares/cost, not just the single fill quantity.
+    portfolio_time = _parse_dt(portfolio_updated_at)
+    event_time = _parse_dt(fill_time) or order_time
+    shares = _as_float(getattr(pos, "shares", None))
+    if portfolio_time is None or event_time is None or shares is None:
         return False
-    return position_time >= order_time - timedelta(minutes=5)
+    if portfolio_time < event_time - timedelta(minutes=5):
+        return False
+    return shares >= quantity - 0.000001
+
+
+EXTERNAL_SELL_TRACKER_FILE = Path(__file__).resolve().parent.parent / "data" / "robinhood" / "external_sell_tracker.json"
+CONTRIBUTIONS_FILE = Path(__file__).resolve().parent.parent / "data" / "contributions.jsonl"
+TRANSFER_DETECT_THRESHOLD = 10.0
+EXTERNAL_SELL_CONFIRMATIONS = 3
+TRANSFER_ORDER_EFFECT_LOOKBACK = timedelta(hours=36)
+TRANSFER_ORDER_EFFECT_GRACE = timedelta(minutes=5)
+
+
+def _snapshot_order_fills_effect(
+    snapshot: dict[str, Any],
+    journal: DecisionJournal,
+    *,
+    since: datetime | None = None,
+) -> float:
+    """Cash effect of filled orders that explain broker cash movement.
+
+    Sells add cash, buys remove it. With a prior sync time, include Artha-known
+    fills too so fresh buys are not mistaken for withdrawals. Without one, keep
+    the legacy behavior and only include non-Artha broker fills.
+    """
+    known_ids = {
+        str(row.get("broker_order_id"))
+        for row in journal.get_execution_orders(limit=500)
+        if row.get("broker_order_id")
+    }
+    snapshot_time = _parse_dt(snapshot.get("generated_at")) or _utcnow()
+    lower_bound = snapshot_time - TRANSFER_ORDER_EFFECT_LOOKBACK
+    if since is not None:
+        lower_bound = max(lower_bound, since - TRANSFER_ORDER_EFFECT_GRACE)
+    effect = 0.0
+    for raw in snapshot.get("orders") or []:
+        if not isinstance(raw, dict):
+            continue
+        broker_order_id = str(raw.get("id") or "")
+        if broker_order_id in known_ids and since is None:
+            continue
+        if str(raw.get("state") or "").lower() != "filled":
+            continue
+        fill_time = _parse_dt(raw.get("last_transaction_at") or raw.get("updated_at") or raw.get("created_at"))
+        if fill_time is None and since is not None:
+            continue
+        if fill_time is not None and fill_time < lower_bound:
+            continue
+        try:
+            qty = float(raw.get("cumulative_quantity") or raw.get("quantity") or 0)
+            price = float(raw.get("average_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0 or price <= 0:
+            continue
+        notional = qty * price
+        effect += notional if str(raw.get("side") or "").lower() == "sell" else -notional
+    return effect
+
+
+def _artha_managed_sell_tickers(snapshot: dict[str, Any], journal: DecisionJournal) -> set[str]:
+    """Tickers missing from positions because an Artha sell is in flight or filled."""
+    snapshot_time = _parse_dt(snapshot.get("generated_at")) or _utcnow()
+    lower_bound = snapshot_time - TRANSFER_ORDER_EFFECT_LOOKBACK
+    snapshot_orders = {
+        str(raw.get("id") or ""): raw
+        for raw in (snapshot.get("orders") or [])
+        if isinstance(raw, dict) and raw.get("id")
+    }
+    managed: set[str] = set()
+    for row in journal.get_execution_orders(limit=500):
+        if str(row.get("side") or "").lower() != "sell":
+            continue
+        ticker = str(row.get("ticker") or "").upper().strip()
+        if not ticker:
+            continue
+        status = str(row.get("status") or "").lower()
+        broker_order_id = str(row.get("broker_order_id") or "")
+        raw = snapshot_orders.get(broker_order_id)
+        if raw:
+            state = str(raw.get("state") or "").lower()
+            if state in OPEN_ORDER_STATES or state in {"filled", "partially_filled"}:
+                managed.add(ticker)
+                continue
+        if status not in {"submitted", "filled", "partially_filled"}:
+            continue
+        order_time = _parse_dt(row.get("submitted_at") or row.get("updated_at") or row.get("created_at"))
+        if order_time and order_time >= lower_bound:
+            managed.add(ticker)
+    return managed
+
+
+def _record_contribution(amount: float, note: str) -> None:
+    CONTRIBUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONTRIBUTIONS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": _utcnow_iso(), "amount": round(amount, 2), "note": note}) + "\n")
+
+
+def _detect_cash_transfer(
+    prior_cash: float,
+    snapshot_cash: float,
+    snapshot: dict[str, Any],
+    journal: DecisionJournal,
+    *,
+    since: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Flag unexplained cash jumps (deposits/withdrawals) and log + notify once.
+
+    Best-effort by design: returns None on any internal error so snapshot
+    reconciliation is never blocked by detection.
+    """
+    try:
+        delta = snapshot_cash - prior_cash
+        if abs(delta) < TRANSFER_DETECT_THRESHOLD:
+            return None
+        residual = delta - _snapshot_order_fills_effect(snapshot, journal, since=since)
+        if abs(residual) < TRANSFER_DETECT_THRESHOLD:
+            return None
+        direction = "deposit" if residual > 0 else "withdrawal"
+        if not Config.ROBINHOOD_AUTO_BOOK_CASH_TRANSFERS:
+            logger.warning(
+                "[transfer_detect] unbooked suspected %s: %.2f (cash %.2f -> %.2f)",
+                direction,
+                residual,
+                prior_cash,
+                snapshot_cash,
+            )
+            return {
+                "direction": direction,
+                "amount": round(residual, 2),
+                "booked": False,
+                "reason": "auto_book_cash_transfers_disabled",
+            }
+        _record_contribution(residual, "auto_detected_transfer")
+        try:
+            from .telegram import TelegramSender
+
+            TelegramSender().send_message(
+                (
+                    f"💰 New money detected: +${residual:,.2f} landed in the Agentic account.\n"
+                    "• Artha's cash updated automatically and the dashboard counts it as a "
+                    "contribution (not profit).\n"
+                    f"• BUT my spending caps still assume the old budget "
+                    f"(${Config.MONTHLY_BUDGET:,.0f}/month, ${Config.ROBINHOOD_PILOT_MAX_ACCOUNT_VALUE:,.0f} account cap).\n"
+                    "👉 You: if you want me to invest the new money, say so — your assistant "
+                    "sets ARTHA_MONTHLY_BUDGET / ARTHA_ROBINHOOD_PILOT_MAX_ACCOUNT_VALUE in "
+                    ".env and restarts me. Until then I hold it safely in cash."
+                    if residual > 0
+                    else f"🏧 Withdrawal detected: -${abs(residual):,.2f} left the Agentic account.\n"
+                    "• Artha's cash updated automatically; the dashboard books it as money "
+                    "you took out (not a loss).\n"
+                    "👉 You: nothing needed."
+                ),
+                parse_mode=None,
+            )
+        except Exception as exc:
+            logger.warning("[transfer_detect] Telegram failed: %s", exc)
+        logger.info("[transfer_detect] %s detected: %.2f (cash %.2f -> %.2f)", direction, residual, prior_cash, snapshot_cash)
+        return {"direction": direction, "amount": round(residual, 2), "booked": True}
+    except Exception as exc:
+        logger.warning("[transfer_detect] detection failed: %s", exc)
+        return None
+
+
+def _load_external_sell_tracker() -> dict[str, Any]:
+    try:
+        payload = json.loads(EXTERNAL_SELL_TRACKER_FILE.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_external_sell_tracker(payload: dict[str, Any]) -> None:
+    try:
+        EXTERNAL_SELL_TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(EXTERNAL_SELL_TRACKER_FILE, payload)
+    except Exception as exc:
+        logger.warning("[external_sell] tracker save failed: %s", exc)
 
 
 def sync_snapshot_to_artha(
@@ -485,6 +735,10 @@ def sync_snapshot_to_artha(
     if snapshot.get("status") in {"MISSING", "WARN"} and not snapshot.get("fresh"):
         return {"status": "WARN", "applied": False, "reason": "Snapshot is missing or stale.", "snapshot": snapshot}
 
+    prior_portfolio = Portfolio.load(Path(portfolio_path))
+    prior_cash_available = float(prior_portfolio.cash_available or 0.0)
+    prior_portfolio_updated_at = _parse_dt(prior_portfolio.last_updated)
+
     order_sync = sync_orders_to_artha(snapshot, journal=journal, portfolio_path=portfolio_path)
     tracker = ThesisTracker(journal)
     portfolio = Portfolio.load(Path(portfolio_path))
@@ -492,21 +746,49 @@ def sync_snapshot_to_artha(
     activated: list[dict[str, Any]] = []
     updated: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
+    mark_to_market_warnings: list[str] = []
+
+    # Side-effectful reconciliation extras (transfer ledger, external-sell
+    # tracker, Telegram) only run against the production portfolio — or when a
+    # test has explicitly redirected the module target files elsewhere.
+    _default_targets = (
+        CONTRIBUTIONS_FILE == Path(__file__).resolve().parent.parent / "data" / "contributions.jsonl"
+    )
+    side_effects_allowed = (Path(portfolio_path).resolve() == Path(PORTFOLIO_FILE).resolve()) or not _default_targets
 
     snapshot_cash = _cash_from_snapshot(snapshot)
-    if snapshot_cash is not None and abs(float(portfolio.cash_available or 0.0) - snapshot_cash) > 0.005:
+    transfer_detected = None
+    if snapshot_cash is not None and abs(prior_cash_available - snapshot_cash) > 0.005:
+        if side_effects_allowed:
+            transfer_detected = _detect_cash_transfer(
+                prior_cash_available,
+                float(snapshot_cash),
+                snapshot,
+                journal,
+                since=prior_portfolio_updated_at,
+            )
         portfolio.cash_available = round(snapshot_cash, 2)
         changed = True
 
-    for raw in snapshot.get("positions") or []:
-        if not isinstance(raw, dict):
-            continue
+    positions_raw = [raw for raw in (snapshot.get("positions") or []) if isinstance(raw, dict)]
+    quote_needed = [
+        _broker_position_symbol(raw)
+        for raw in positions_raw
+        if _broker_position_symbol(raw) and _broker_position_live_price(raw) is None
+    ]
+    quote_prices, quote_warnings = _fetch_mark_to_market_prices(quote_needed)
+    mark_to_market_warnings.extend(quote_warnings)
+
+    for raw in positions_raw:
         ticker = _broker_position_symbol(raw)
         qty = _broker_position_quantity(raw)
         if not ticker or qty <= 0:
             continue
         avg_cost = _broker_position_avg_cost(raw)
-        price = _broker_position_price(raw, avg_cost)
+        broker_price = _broker_position_live_price(raw)
+        quote_price = quote_prices.get(ticker)
+        price = broker_price or quote_price or avg_cost
+        price_source = "broker_snapshot" if broker_price else ("fmp_quote" if quote_price else "average_cost_fallback")
         if avg_cost is None or avg_cost <= 0:
             unresolved.append({"ticker": ticker, "reason": "Broker position is missing average cost.", "quantity": qty})
             continue
@@ -533,7 +815,7 @@ def sync_snapshot_to_artha(
             )
             _attach_sell_fields(pos, active, avg_cost)
             portfolio.positions.append(pos)
-            activated.append({"ticker": ticker, "quantity": qty, "avg_cost": avg_cost, "thesis_id": active.thesis_id})
+            activated.append({"ticker": ticker, "quantity": qty, "avg_cost": avg_cost, "price": price, "price_source": price_source, "thesis_id": active.thesis_id})
             changed = True
             continue
 
@@ -554,8 +836,70 @@ def sync_snapshot_to_artha(
             if _sell_field_tuple(pos) != before_sell_fields:
                 position_changed = True
         if position_changed:
-            updated.append({"ticker": ticker, "quantity": qty, "avg_cost": avg_cost, "thesis_id": getattr(pos, "thesis_id", None)})
+            updated.append({"ticker": ticker, "quantity": qty, "avg_cost": avg_cost, "price": price, "price_source": price_source, "thesis_id": getattr(pos, "thesis_id", None)})
             changed = True
+
+    # Positions Artha holds that the broker no longer shows were sold outside
+    # Artha (manually or by another agent). Guarded against API glitches: the
+    # snapshot must be fresh AND non-empty, and the absence must repeat on
+    # EXTERNAL_SELL_CONFIRMATIONS consecutive syncs before the book is healed.
+    externally_closed: list[dict[str, Any]] = []
+    try:
+        if apply and side_effects_allowed and positions_raw and snapshot.get("fresh", False):
+            broker_tickers = {_broker_position_symbol(raw) for raw in positions_raw}
+            artha_managed_sell_tickers = _artha_managed_sell_tickers(snapshot, journal)
+            tracker_state = _load_external_sell_tracker()
+            still_missing: dict[str, Any] = {}
+            for pos in list(portfolio.positions):
+                ticker = str(pos.ticker or "").upper()
+                if ticker in broker_tickers:
+                    continue
+                if ticker in artha_managed_sell_tickers:
+                    logger.info("[external_sell] skip ticker=%s reason=artha_managed_sell_order", ticker)
+                    continue
+                count = int((tracker_state.get(ticker) or {}).get("count", 0)) + 1
+                if count < EXTERNAL_SELL_CONFIRMATIONS:
+                    still_missing[ticker] = {"count": count, "first_seen": (tracker_state.get(ticker) or {}).get("first_seen") or _utcnow_iso()}
+                    continue
+                price = float(pos.current_price or pos.avg_cost or 0)
+                shares = float(pos.shares or 0)
+                pnl = portfolio.sell_position(
+                    ticker, shares, price,
+                    notes="Sold outside Artha (broker shows zero); auto-reconciled from snapshot.",
+                )
+                active = tracker.get_active(ticker)
+                if active:
+                    try:
+                        tracker.update_thesis_fields(
+                            active.thesis_id,
+                            status="archived",
+                            notes="Position sold outside Artha; thesis archived by snapshot reconciliation.",
+                        )
+                    except Exception as thesis_exc:
+                        logger.warning("[external_sell] thesis archive failed for %s: %s", ticker, thesis_exc)
+                externally_closed.append({"ticker": ticker, "shares": shares, "price": price, "realized_pnl": pnl})
+                changed = True
+            _save_external_sell_tracker(still_missing)
+            if externally_closed:
+                try:
+                    from .telegram import TelegramSender
+
+                    lines = "\n".join(
+                        f"• {row['ticker']}: {row['shares']:.6f} sh — removed from Artha's book"
+                        for row in externally_closed
+                    )
+                    TelegramSender().send_message(
+                        "🔄 Sold outside Artha — book auto-reconciled.\n"
+                        f"{lines}\n"
+                        "• The broker confirmed these positions are gone (3 checks in a row), "
+                        "so Artha stopped tracking them. Proceeds are already in cash.\n"
+                        "👉 You: nothing needed — unless this wasn't you, in which case check the Robinhood app.",
+                        parse_mode=None,
+                    )
+                except Exception as exc:
+                    logger.warning("[external_sell] Telegram failed: %s", exc)
+    except Exception as exc:
+        logger.warning("[external_sell] auto-close pass failed: %s", exc)
 
     if apply and changed:
         portfolio.last_updated = _utcnow_iso()
@@ -567,9 +911,12 @@ def sync_snapshot_to_artha(
         "activated": activated,
         "updated": updated,
         "unresolved": unresolved,
+        "externally_closed": externally_closed,
+        "transfer_detected": transfer_detected,
         "order_sync": order_sync,
         "snapshot_status": snapshot.get("status"),
         "position_count": len(snapshot.get("positions") or []),
+        "mark_to_market_warnings": mark_to_market_warnings,
     }
 
 
@@ -603,6 +950,17 @@ def queue_trade_action_from_order_payload(
     side = str(intent.get("side") or "").lower()
     ticker = str(intent.get("ticker") or "").upper()
     action = (action_type or ("trim" if side == "sell" else "buy")).lower()
+    thesis_id = str(intent.get("thesis_id") or "").strip()
+    if action == "auto_buy" and side == "buy" and ticker and not thesis_id:
+        tracker = ThesisTracker(journal)
+        matched_thesis = tracker.get_active(ticker) or tracker.get_pending_for_ticker(ticker)
+        if matched_thesis:
+            thesis_id = matched_thesis.thesis_id
+            intent["thesis_id"] = thesis_id
+            order_payload["intent"] = intent
+            order_intent_id = str(intent.get("order_intent_id") or "")
+            if order_intent_id:
+                journal.update_execution_order(order_intent_id, {"thesis_id": thesis_id})
     status = "review_ready" if str(broker.get("status") or "") in {"review_ready", "reviewed"} else "blocked"
     action_id = f"ta_{uuid.uuid4().hex[:12]}"
     expires_at = (_utcnow() + timedelta(minutes=max(1, int(Config.ROBINHOOD_ACTION_TOKEN_TTL_MINUTES)))).isoformat()
@@ -615,7 +973,7 @@ def queue_trade_action_from_order_payload(
         "side": side,
         "execution_order_row": row_id,
         "order_intent_id": intent.get("order_intent_id"),
-        "thesis_id": intent.get("thesis_id"),
+        "thesis_id": thesis_id,
         "account_number_masked": mask_account_number(Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER),
         "token_review": _new_token(),
         "token_place": _new_token(),
@@ -625,17 +983,24 @@ def queue_trade_action_from_order_payload(
         "notes": "Created from Artha execution order review.",
     }
     journal.save_trade_action(row)
-    row["reply_markup"] = build_trade_action_reply_markup(row)
-    row["callback_data"] = {
-        "review": _callback("review", action_id, row["token_review"]),
-        "place": _callback("place", action_id, row["token_place"]),
-        "skip": _callback("skip", action_id, row["token_skip"]),
-    }
+    is_automatic = action in {"auto_buy", "auto_sell"}
+    row["reply_markup"] = None if is_automatic else build_trade_action_reply_markup(row)
+    row["callback_data"] = (
+        {}
+        if is_automatic
+        else {
+            "review": _callback("review", action_id, row["token_review"]),
+            "place": _callback("place", action_id, row["token_place"]),
+            "skip": _callback("skip", action_id, row["token_skip"]),
+        }
+    )
     return row
 
 
 def build_trade_action_reply_markup(action: dict[str, Any]) -> dict[str, Any] | None:
     if not action:
+        return None
+    if str(action.get("action_type") or "").lower() in {"auto_buy", "auto_sell"}:
         return None
     action_id = str(action.get("action_id") or "")
     ticker = str(action.get("ticker") or "?").upper()
@@ -660,6 +1025,8 @@ def build_trade_action_reply_markup(action: dict[str, Any]) -> dict[str, Any] | 
 
 def build_review_confirmation_reply_markup(action: dict[str, Any]) -> dict[str, Any] | None:
     if not action:
+        return None
+    if str(action.get("action_type") or "").lower() in {"auto_buy", "auto_sell"}:
         return None
     action_id = str(action.get("action_id") or "")
     ticker = str(action.get("ticker") or "?").upper()
@@ -704,9 +1071,9 @@ def build_trade_action_notice(action: dict[str, Any]) -> str:
 
 def build_snapshot_refresh_operation() -> dict[str, Any]:
     """Return the exact read-only MCP sequence OpenClaw should run for a fresh snapshot."""
-    handoff_path = str(
-        Path(os.getenv("ARTHA_OPENCLAW_TMP_DIR", "/tmp")) / "artha_robinhood_snapshot.json"
-    )
+    project_dir = Path(__file__).resolve().parent.parent
+    tmp_dir = Path(Config.OPENCLAW_TMP_DIR).expanduser()
+    handoff_path = str(tmp_dir / "artha_robinhood_snapshot.json")
     lock_file = "/tmp/artha-robinhood-snapshot-sync.lock"
     return {
         "success": True,
@@ -751,11 +1118,11 @@ def build_snapshot_refresh_operation() -> dict[str, Any]:
 def build_auto_buy_runner_operation() -> dict[str, Any]:
     """Return the durable OpenClaw cron contract for unattended auto-buy drain."""
     project_dir = str(Path(__file__).resolve().parent.parent)
-    tmp_dir = os.getenv("ARTHA_OPENCLAW_TMP_DIR", "/tmp")
-    telegram_chat = Config.TELEGRAM_CHAT_ID or "<telegram-chat-id>"
-    bootstrap_message = f"""ARTHA ROBINHOOD AUTO-BUY RUNNER BOOTSTRAP
+    tmp_dir = str(Path(Config.OPENCLAW_TMP_DIR).expanduser())
+    telegram_chat = Config.TELEGRAM_CHAT_ID or "<TELEGRAM_CHAT_ID>"
+    bootstrap_message = f"""ARTHA ROBINHOOD AUTO-TRADE RUNNER BOOTSTRAP
 
-Goal: make the idle path fast and only load the full money-moving contract when Artha has queued auto_buy work.
+Goal: make the idle path fast and only load the full money-moving contract when Artha has queued auto_buy or auto_sell work.
 
 Run exactly:
 cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-queue-status
@@ -772,16 +1139,18 @@ If operation_count is greater than 0:
 - Follow the returned instructions exactly.
 - Never call place_equity_order unless those returned instructions and Artha commands explicitly allow it.
 """
-    runner_message = f"""ARTHA ROBINHOOD AUTO-BUY RUNNER (agentic, money-moving)
+    runner_message = f"""ARTHA ROBINHOOD AUTO-TRADE RUNNER (agentic, money-moving, buys AND sells)
 
-Goal: drain Artha's queued auto_buy actions during regular market hours using Robinhood MCP as the execution source of truth. This job may place real Robinhood equity orders only when every Artha and Robinhood gate below passes.
+Goal: drain Artha's queued auto_buy AND auto_sell actions during regular market hours using Robinhood MCP as the execution source of truth. This job may place real Robinhood equity orders only when every Artha and Robinhood gate below passes. Artha queues auto_sell for stop-triggered exits (trailing/hard stops), URGENT_EXIT council verdicts, and 2-day-confirmed EXITs; the queue serves sells FIRST, then buys by score.
 
 Hard boundaries:
 - Long US equities only. No options, margin, shorts, crypto, watchlist writes, cancel_order, or manual order edits.
 - Use the Agentic cash account ending {Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER[-4:]} only.
-- Never invent order parameters. place_equity_order must use the exact place_mcp_args returned by Artha.
-- Max two auto_buy actions per cron turn. If more are queued, leave them for the next turn.
+- Never invent order parameters. place_equity_order must use the exact place_mcp_args returned by Artha. Every operation carries a side field (buy or sell); the side inside place_mcp_args is authoritative and must never be edited.
+- Sell orders sell ONLY the exact quantity in place_mcp_args (never more than Artha's thesis quantity; Artha already caps it at the held quantity).
+- Max two auto actions per cron turn (sells count first). If more are queued, leave them for the next turn.
 - If any command or MCP call is ambiguous, stale, missing, or fails, block and send a concise Telegram alert to {telegram_chat}.
+- If an Artha command returns operation=regenerated or operation=blocked_transient, that is NOT an error: reply AUTO_BUY_BLOCKED and let the next cron turn retry (run robinhood-snapshot-sync-direct first if the message mentions a stale snapshot).
 - Do not use shell heredocs. Use bash only for date/run_id generation, atomic base64 JSON writes, and Artha commands.
 
 Market-time gate:
@@ -791,52 +1160,56 @@ Market-time gate:
 Cheap queue preflight:
 3. Run:
    cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-queue-status
-4. If operation_count is 0, final reply exactly: AUTO_BUY_IDLE. Do not refresh Robinhood and do not call review_equity_order/place_equity_order.
+4. If operation_count is 0, final reply exactly: AUTO_BUY_IDLE. Do not refresh Robinhood and do not call review_equity_order/place_equity_order. (The status output lists both auto_buy and auto_sell actions with their side.)
 
 Fresh snapshot gate:
-5. Refresh Robinhood snapshot using read-only MCP tools: get_accounts, get_portfolio, get_equity_positions, get_equity_orders.
-6. Build a minimal canonical snapshot envelope with run_id, generated_at, source=\"robinhood_mcp\", selected account, accounts, portfolio, positions, and orders.
-7. Base64-encode that envelope and atomically write it to {tmp_dir}/artha_robinhood_snapshot.json.
-8. Run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-snapshot-import --strict --expect-run-id RUN_ID --min-generated-at SYNC_STARTED_AT --max-handoff-age-minutes 10 --lock-file /tmp/artha-robinhood-snapshot-sync.lock --file {tmp_dir}/artha_robinhood_snapshot.json
-9. If import/sync is not PASS, stop before review/place and alert Telegram.
+5. Run the deterministic read-only MCP snapshot sync:
+   cd {project_dir} && .venv/bin/python run.py robinhood-snapshot-sync-direct
+6. If that command does not return success=true/status PASS, stop before review/place and alert Telegram.
 
 Queue drain:
-10. Run:
+7. Run:
    cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-action
-11. If operation_count is 0, final reply exactly: AUTO_BUY_IDLE
-12. For each returned operation, process at most two successful/blocked actions and never skip ahead to manual buy actions.
+8. If operation_count is 0, final reply exactly: AUTO_BUY_IDLE
+9. For each returned operation, process at most two successful/blocked actions in the order Artha returned them (sells first) and never skip ahead to manual buy/sell actions.
 
-Per-action agentic clearance:
-13. Require operation=auto_tradability_review_then_place_equity_order, action_id, tradability_mcp_args, and review_mcp_args.
-14. Call Robinhood MCP get_equity_quotes for the operation symbol.
-15. Call get_equity_tradability with exactly tradability_mcp_args.
-16. Call review_equity_order with exactly review_mcp_args. This is still preview only.
-17. Atomically write quote, tradability, and review responses to JSON files under {tmp_dir}/artha_auto_buy_<ACTION_ID>_quote.json, _tradability.json, and _review.json.
-18. Run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-agentic-clearance ACTION_ID --quote-file {tmp_dir}/artha_auto_buy_<ACTION_ID>_quote.json --tradability-file {tmp_dir}/artha_auto_buy_<ACTION_ID>_tradability.json --review-file {tmp_dir}/artha_auto_buy_<ACTION_ID>_review.json
-19. If that command does not return allow_place=true/status PASS, do not place. Alert Telegram with ticker/action_id and the block reason.
+Per-action agentic clearance (identical commands for buy and sell operations):
+10. Require operation=auto_tradability_review_then_place_equity_order, action_id, side, tradability_mcp_args, and review_mcp_args.
+11. Call Robinhood MCP get_equity_quotes for the operation symbol.
+12. Call get_equity_tradability with exactly tradability_mcp_args.
+13. Call review_equity_order with exactly review_mcp_args. This is still preview only.
+14. Atomically write quote, tradability, and review responses to JSON files under {tmp_dir}/artha_auto_trade_<ACTION_ID>_quote.json, _tradability.json, and _review.json.
+15. Run:
+   cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-agentic-clearance ACTION_ID --quote-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_quote.json --tradability-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_tradability.json --review-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_review.json
+   Both buys and sells run deterministic gates plus the agentic Execution Officer; the command and outputs are identical.
+16. If that command does not return allow_place=true/status PASS, do not place. Alert Telegram with ticker/action_id/side and the block reason.
 
 Final broker review immediately before place:
-20. Run:
+17. Run:
    cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-action ACTION_ID
-21. Require operation=tradability_then_review_then_place_equity_order and place_mcp_args.
-22. Repeat get_equity_tradability and review_equity_order with exactly the returned args.
-23. Write those second responses to JSON files and run:
+18. Require operation=tradability_then_review_then_place_equity_order and place_mcp_args.
+19. Repeat get_equity_tradability and review_equity_order with exactly the returned args.
+20. Write those second responses to JSON files and run:
    cd {project_dir} && .venv/bin/python run.py robinhood-record-review ACTION_ID --tradability-file SECOND_TRADABILITY_FILE --review-file SECOND_REVIEW_FILE
-24. Run:
+21. Run:
    cd {project_dir} && .venv/bin/python run.py robinhood-final-clearance ACTION_ID
-25. If final clearance is not allow_place=true/status PASS, do not place. Alert Telegram with the block reason.
-26. Run:
+22. If final clearance is not allow_place=true/status PASS, do not place. Alert Telegram with the block reason.
+23. Run:
    cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-action ACTION_ID
-27. Require place_mcp_args still exists and exactly matches the reviewed order. Then call place_equity_order with exactly place_mcp_args.
-28. Write the place response JSON and run:
+24. Require place_mcp_args still exists and exactly matches the reviewed order (same symbol, side, quantity/dollar_amount). Then call place_equity_order with exactly place_mcp_args.
+25. Write the place response JSON and run:
    cd {project_dir} && .venv/bin/python run.py robinhood-record-submission ACTION_ID --file PLACE_RESPONSE_FILE
-29. Refresh/import snapshot again using the read-only snapshot gate, then send Telegram success/failure with ticker, notional/quantity, order id/state, and action_id.
+26. Run the deterministic snapshot sync again:
+   cd {project_dir} && .venv/bin/python run.py robinhood-snapshot-sync-direct
+27. Send Telegram success/failure with ticker, side, notional/quantity, order id/state, and action_id.
+
+Sell-specific notes:
+- A stop-triggered sell may show a bid below Artha's reference price. Artha's drift gate already re-anchors for trailing_stop/hard_stop/urgent_exit sells (fat-finger floor 25% of reference). Do NOT block a sell yourself because the price fell; only Artha's clearance commands decide.
+- Never sell a symbol that robinhood-auto-buy-action did not return, and never adjust the quantity.
 
 Final reply rules:
 - If no queue work: AUTO_BUY_IDLE
-- If all queued work blocked safely: AUTO_BUY_BLOCKED
+- If all queued work blocked safely (including regenerated/blocked_transient): AUTO_BUY_BLOCKED
 - If at least one order was placed and recorded: AUTO_BUY_PLACED
 """
     return {
@@ -856,10 +1229,6 @@ Final reply rules:
         "runner_message": runner_message,
         "bootstrap_message": bootstrap_message,
         "mcp_tools_required": [
-            "get_accounts",
-            "get_portfolio",
-            "get_equity_positions",
-            "get_equity_orders",
             "get_equity_quotes",
             "get_equity_tradability",
             "review_equity_order",
@@ -867,7 +1236,7 @@ Final reply rules:
         ],
         "artha_commands_required": [
             "robinhood-auto-buy-queue-status",
-            "robinhood-snapshot-import",
+            "robinhood-snapshot-sync-direct",
             "robinhood-auto-buy-action",
             "robinhood-auto-buy-agentic-clearance",
             "robinhood-record-review",
@@ -892,28 +1261,95 @@ Final reply rules:
     }
 
 
+def write_runner_message_v2(path: str | Path | None = None) -> dict[str, Any]:
+    """Persist the buy+sell runner contract for the OpenClaw cron update.
+
+    The orchestrator reads data/robinhood/runner_message_v2.txt and swaps it
+    into the 'Artha Robinhood Auto-Buy Runner' cron message.
+    """
+    operation = build_auto_buy_runner_operation()
+    target = Path(
+        path
+        or Path(Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE).expanduser().parent / "runner_message_v2.txt"
+    ).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        f"{operation['runner_message']}\n"
+        "\n"
+        "================ BOOTSTRAP MESSAGE (cron --message payload) ================\n"
+        "\n"
+        f"{operation['bootstrap_message']}"
+    )
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(target)
+    return {"success": True, "path": str(target), "bytes": len(content)}
+
+
+AUTO_TRADE_ACTION_TYPES = ("auto_sell", "auto_buy")
+
+
+def _action_adjusted_score(row: dict[str, Any]) -> float | None:
+    """Extract the council adjusted/opportunity score stored with the action."""
+    payload = _as_json(row.get("payload_json"))
+    intent = payload.get("intent") if isinstance(payload.get("intent"), dict) else {}
+    evidence = intent.get("evidence") if isinstance(intent.get("evidence"), dict) else {}
+    for key in ("adjusted_score", "opportunity_score"):
+        value = _as_float(evidence.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _auto_trade_drain_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order queued unattended actions: sells first (oldest first), then buys
+    by adjusted_score DESC (not FIFO) so the best idea drains first."""
+    sells = [row for row in rows if str(row.get("action_type") or "").lower() == "auto_sell"]
+    buys = [row for row in rows if str(row.get("action_type") or "").lower() == "auto_buy"]
+    sells.sort(key=lambda row: str(row.get("created_at") or ""))
+    buys.sort(
+        key=lambda row: (
+            -(_action_adjusted_score(row) if _action_adjusted_score(row) is not None else float("-inf")),
+            str(row.get("created_at") or ""),
+        )
+    )
+    return sells + buys
+
+
 def build_pending_auto_buy_queue_status(*, journal: DecisionJournal | None = None, limit: int = 10) -> dict[str, Any]:
-    """Return queued auto-buy actions without mutating gates or statuses."""
+    """Return queued auto-buy/auto-sell actions without mutating gates or statuses."""
     journal = journal or DecisionJournal()
-    actions = []
+    eligible: list[dict[str, Any]] = []
     skipped = []
     for row in journal.get_trade_actions(limit=max(1, int(limit) * 5)):
-        if str(row.get("action_type") or "").lower() != "auto_buy":
+        if str(row.get("action_type") or "").lower() not in AUTO_TRADE_ACTION_TYPES:
             continue
         status = str(row.get("status") or "").lower()
-        item = {
+        if status in {"review_ready", "review_requested", "auto_review_requested", "review_clear", "reviewed"}:
+            eligible.append(row)
+        else:
+            skipped.append(
+                {
+                    "action_id": row.get("action_id"),
+                    "ticker": row.get("ticker"),
+                    "side": row.get("side"),
+                    "action_type": str(row.get("action_type") or "").lower(),
+                    "status": status,
+                    "expires_at": row.get("expires_at"),
+                }
+            )
+    actions = [
+        {
             "action_id": row.get("action_id"),
             "ticker": row.get("ticker"),
             "side": row.get("side"),
-            "status": status,
+            "action_type": str(row.get("action_type") or "").lower(),
+            "status": str(row.get("status") or "").lower(),
+            "adjusted_score": _action_adjusted_score(row),
             "expires_at": row.get("expires_at"),
         }
-        if status in {"review_ready", "review_clear", "reviewed"}:
-            actions.append(item)
-        else:
-            skipped.append(item)
-        if len(actions) >= limit:
-            break
+        for row in _auto_trade_drain_order(eligible)[: max(1, int(limit))]
+    ]
     return {
         "success": True,
         "operation": "auto_buy_queue_status",
@@ -928,10 +1364,12 @@ def queue_review_actions_for_ready_orders(
     journal: DecisionJournal | None = None,
     limit: int = 20,
 ) -> dict[str, Any]:
-    """Create Telegram Review actions for fresh buy-side execution proposals.
+    """Recover fresh buy-side execution proposals without bypassing authorization.
 
-    Pending theses are only intentions. This promotes the already-audited
-    execution_order rows behind those theses into durable Review buttons.
+    In auto-buy mode, only rows carrying an explicit Execution Officer
+    ``auto_buy_eligible`` decision become durable unattended actions. Legacy or
+    incomplete rows are left as audit records; they are never converted into
+    manual approval buttons as a fallback.
     """
     journal = journal or DecisionJournal()
     existing_by_intent = {
@@ -966,6 +1404,18 @@ def queue_review_actions_for_ready_orders(
         if not decision_gate.get("passed"):
             skipped.append({"ticker": order.get("ticker"), "order_intent_id": intent_id, "reason": "stale_decision", "gate": decision_gate})
             continue
+        evidence = _as_json(order.get("evidence_json"))
+        execution_officer = evidence.get("execution_officer") if isinstance(evidence.get("execution_officer"), dict) else {}
+        auto_authorized = bool(execution_officer.get("auto_buy_eligible"))
+        if Config.ROBINHOOD_AUTO_BUY_ENABLED and not auto_authorized:
+            skipped.append(
+                {
+                    "ticker": order.get("ticker"),
+                    "order_intent_id": intent_id,
+                    "reason": "execution_officer_auto_buy_authorization_missing",
+                }
+            )
+            continue
         payload = {
             "row_id": order.get("id"),
             "intent": _as_json(order.get("request_json")),
@@ -975,9 +1425,13 @@ def queue_review_actions_for_ready_orders(
         }
         action = queue_trade_action_from_order_payload(
             payload,
-            action_type="buy",
+            action_type="auto_buy" if Config.ROBINHOOD_AUTO_BUY_ENABLED else "buy",
             journal=journal,
-            message=f"Fresh Review action created from pending Artha buy thesis for {order.get('ticker')}.",
+            message=(
+                f"Fresh unattended auto-buy action recovered from pending Artha buy thesis for {order.get('ticker')}."
+                if Config.ROBINHOOD_AUTO_BUY_ENABLED
+                else f"Fresh Review action created from pending Artha buy thesis for {order.get('ticker')}."
+            ),
         )
         created.append({k: v for k, v in action.items() if k not in {"payload_json"}})
     return {
@@ -1239,6 +1693,7 @@ def _review_price_drift_gate(
     if execution_price is None:
         execution_price = quote.get("last")
     max_drift = Config.ROBINHOOD_MARKET_ORDER_MAX_PRICE_DRIFT_PCT
+    stop_exempt = side == "sell" and _sell_trigger_drift_exempt(intent)
     checks = {
         "applies": True,
         "order_type": order_type,
@@ -1249,6 +1704,8 @@ def _review_price_drift_gate(
         "ask": quote.get("ask"),
         "last": quote.get("last"),
         "maximum_drift_pct": max_drift,
+        "stop_exempt": stop_exempt,
+        "reanchored_reference": execution_price if stop_exempt else None,
         "quote_disclosure": quote.get("disclosure"),
     }
     if reference is None or reference <= 0:
@@ -1262,16 +1719,37 @@ def _review_price_drift_gate(
                 f"by more than {max_drift:.2%}; re-review before buying."
             )
         elif side == "sell" and execution_price < reference * (1 - max_drift):
-            reasons.append(
-                f"Robinhood review quote USD {execution_price:.2f} is below Artha reference USD {reference:.2f} "
-                f"by more than {max_drift:.2%}; re-review before selling."
-            )
+            if stop_exempt:
+                # A falling bid is WHY a stop-driven sell exists. Re-anchor the
+                # reference to the fresh quote; refuse only below the
+                # fat-finger floor.
+                floor = reference * Config.ROBINHOOD_SELL_DRIFT_FLOOR_RATIO
+                if execution_price < floor:
+                    reasons.append(
+                        f"Robinhood review quote USD {execution_price:.2f} is below "
+                        f"{Config.ROBINHOOD_SELL_DRIFT_FLOOR_RATIO:.0%} of Artha reference USD {reference:.2f}; "
+                        "fat-finger guard blocked this stop sell."
+                    )
+            else:
+                reasons.append(
+                    f"Robinhood review quote USD {execution_price:.2f} is below Artha reference USD {reference:.2f} "
+                    f"by more than {max_drift:.2%}; re-review before selling."
+                )
     return {
         "passed": not reasons,
         "status": "PASS" if not reasons else "BLOCKED",
         "reasons": reasons,
         "checks": checks,
     }
+
+
+def _sell_trigger_drift_exempt(intent: Any) -> bool:
+    """True when the sell intent's trigger_type exempts it from drift blocking."""
+    evidence = getattr(intent, "evidence", None)
+    if not isinstance(evidence, dict):
+        return False
+    trigger = str(evidence.get("trigger_type") or "").lower().strip()
+    return trigger in set(Config.ROBINHOOD_SELL_DRIFT_EXEMPT_TRIGGERS)
 
 
 def _evaluate_tradability_for_request(request: dict[str, Any], tradability_response: dict[str, Any] | None) -> dict[str, Any]:
@@ -1484,6 +1962,11 @@ def _auto_buy_authorization_gate(row: dict[str, Any], journal: DecisionJournal) 
     checks["runtime_control"] = control
     if control.get("trading_disabled"):
         reasons.append(f"Trading is disabled: {control.get('reason') or 'runtime control'}")
+    paused, pause_reason = buying_paused(control)
+    if paused:
+        reasons.append(
+            f"Buy-side paused until the next trading day: {pause_reason} Sells are unaffected."
+        )
     if Config.ROBINHOOD_REVIEW_ONLY or Config.ROBINHOOD_DRY_RUN_ONLY or not Config.ROBINHOOD_AGENTIC_ENABLED or Config.ROBINHOOD_KILL_SWITCH:
         reasons.append("Live placement is blocked by Artha config: review-only/dry-run/agentic-disabled/kill-switch safety cage.")
 
@@ -1504,6 +1987,30 @@ def _auto_buy_authorization_gate(row: dict[str, Any], journal: DecisionJournal) 
         intent = None
         notional = None
         reasons.append(f"Could not reconstruct order intent: {type(exc).__name__}: {exc}")
+    thesis_id = str(row.get("thesis_id") or getattr(intent, "thesis_id", "") or "").strip()
+    thesis_row = journal.get_thesis(thesis_id) if thesis_id else None
+    thesis_status = str((thesis_row or {}).get("status") or "").lower()
+    thesis_ticker = str((thesis_row or {}).get("ticker") or "").upper().strip()
+    pending_expiry = _parse_dt((thesis_row or {}).get("pending_expiry"))
+    pending_expired = bool(
+        thesis_status == "pending" and pending_expiry and pending_expiry <= _utcnow()
+    )
+    checks["thesis"] = {
+        "found": bool(thesis_row),
+        "thesis_id": thesis_id or None,
+        "status": thesis_status or None,
+        "ticker": thesis_ticker or None,
+        "pending_expiry": (thesis_row or {}).get("pending_expiry"),
+        "pending_expired": pending_expired,
+    }
+    if not thesis_row:
+        reasons.append("Auto-buy requires a matching pending or active investment thesis before placement.")
+    elif thesis_status not in {"pending", "active"}:
+        reasons.append(f"Auto-buy thesis status is {thesis_status or 'UNKNOWN'}, not pending or active.")
+    elif pending_expired:
+        reasons.append("Auto-buy pending thesis has expired; fresh Council review is required.")
+    elif thesis_ticker != str(row.get("ticker") or "").upper().strip():
+        reasons.append("Auto-buy thesis ticker does not match the queued order ticker.")
     checks["notional"] = notional
     if notional is None or notional <= 0:
         reasons.append("Auto-buy notional could not be resolved.")
@@ -1536,6 +2043,13 @@ def _auto_buy_authorization_gate(row: dict[str, Any], journal: DecisionJournal) 
         if not broker_check.get("passed"):
             reasons.extend(str(reason) for reason in broker_check.get("reasons") or [])
 
+    buy_pause = maybe_pause_buying_for_limit(
+        reasons,
+        source=f"auto_buy_authorization_gate:{row.get('ticker')}:{row.get('action_id')}",
+    )
+    if buy_pause:
+        checks["buy_pause"] = buy_pause
+
     return {
         "passed": not reasons,
         "status": "PASS" if not reasons else "BLOCKED",
@@ -1544,32 +2058,400 @@ def _auto_buy_authorization_gate(row: dict[str, Any], journal: DecisionJournal) 
     }
 
 
+def _configured_agentic_account_record() -> dict[str, Any]:
+    """Allowlisted Agentic account record for review-only audits."""
+    return {
+        "account_number": Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+        "type": Config.ROBINHOOD_EXPECTED_ACCOUNT_TYPE,
+        "nickname": Config.ROBINHOOD_EXPECTED_ACCOUNT_NICKNAME,
+        "agentic_allowed": True,
+        "state": "active",
+        "deactivated": False,
+        "permanently_deactivated": False,
+    }
+
+
+def _snapshot_held_quantity_for_ticker(snapshot: dict[str, Any], ticker: str) -> float:
+    wanted = str(ticker or "").upper().strip()
+    total = 0.0
+    for raw in snapshot.get("positions") or []:
+        if isinstance(raw, dict) and _broker_position_symbol(raw) == wanted:
+            total += max(0.0, _broker_position_quantity(raw))
+    return total
+
+
+def _auto_sell_authorization_gate(row: dict[str, Any], journal: DecisionJournal) -> dict[str, Any]:
+    """Hard gates for the unattended sell drain.
+
+    Sells never add exposure, so the buy-side position-cap/Execution Officer
+    gates do not apply. Instead: never sell more than the held quantity,
+    market-hours only, and require an active thesis or reconciled position.
+    """
+    reasons: list[str] = []
+    checks: dict[str, Any] = {
+        "auto_sell_enabled": Config.ROBINHOOD_AUTO_SELL_ENABLED,
+        "review_only": Config.ROBINHOOD_REVIEW_ONLY,
+        "dry_run_only": Config.ROBINHOOD_DRY_RUN_ONLY,
+        "agentic_enabled": Config.ROBINHOOD_AGENTIC_ENABLED,
+        "kill_switch": Config.ROBINHOOD_KILL_SWITCH,
+    }
+    ticker = str(row.get("ticker") or "").upper().strip()
+    if not Config.ROBINHOOD_AUTO_SELL_ENABLED:
+        reasons.append("Robinhood auto-sell is disabled.")
+    if str(row.get("action_type") or "").lower() != "auto_sell":
+        reasons.append("Trade action is not an auto-sell action.")
+    if str(row.get("side") or "").lower() != "sell":
+        reasons.append("Only sell actions can use auto-sell.")
+    if str(row.get("status") or "").lower() in {"blocked", "skipped", "expired"}:
+        reasons.append(f"Trade action status is {row.get('status')}; auto-sell is not allowed.")
+    if _trade_action_expired(row):
+        reasons.append("Auto-sell action token expired.")
+    control = get_trading_control()
+    checks["runtime_control"] = control
+    if control.get("trading_disabled"):
+        reasons.append(f"Trading is disabled: {control.get('reason') or 'runtime control'}")
+    if Config.ROBINHOOD_REVIEW_ONLY or Config.ROBINHOOD_DRY_RUN_ONLY or not Config.ROBINHOOD_AGENTIC_ENABLED or Config.ROBINHOOD_KILL_SWITCH:
+        reasons.append("Live placement is blocked by Artha config: review-only/dry-run/agentic-disabled/kill-switch safety cage.")
+
+    try:
+        from .scheduler import MarketHours
+
+        market_open = MarketHours().is_market_open()
+    except Exception:
+        market_open = False
+    checks["market_open"] = market_open
+    if not market_open:
+        reasons.append("Auto-sell orders can only run during regular market hours.")
+
+    decision_gate = _action_decision_fresh_gate(row, journal)
+    checks["decision_freshness"] = decision_gate
+    if not decision_gate.get("passed"):
+        reasons.extend(str(reason) for reason in decision_gate.get("reasons") or [])
+
+    try:
+        intent = _order_intent_for_action(row)
+        quantity = _as_float(getattr(intent, "quantity", None))
+    except Exception as exc:
+        intent = None
+        quantity = None
+        reasons.append(f"Could not reconstruct order intent: {type(exc).__name__}: {exc}")
+    checks["quantity"] = quantity
+    if quantity is None or quantity <= 0:
+        reasons.append("Auto-sell quantity could not be resolved.")
+
+    evidence = getattr(intent, "evidence", None) if intent is not None else None
+    council_evidence = (
+        evidence.get("sell_council")
+        if isinstance(evidence, dict) and isinstance(evidence.get("sell_council"), dict)
+        else {}
+    )
+    council_action = str(council_evidence.get("action") or "").upper().strip()
+    council_dossier = str(council_evidence.get("dossier_path") or "").strip()
+    council_session = str(council_evidence.get("session_id") or "").strip()
+    council_gate = {
+        "confirmed": bool(council_evidence.get("confirmed")),
+        "action": council_action,
+        "session_id": council_session or None,
+        "dossier_path": council_dossier or None,
+    }
+    checks["sell_council"] = council_gate
+    if not council_gate["confirmed"]:
+        reasons.append("Auto-sell lacks an explicit Sell Council approval.")
+    if council_action not in {"TRIM", "EXIT", "URGENT_EXIT"}:
+        reasons.append("Auto-sell Sell Council action is missing or not actionable.")
+    if not council_session:
+        reasons.append("Auto-sell is missing the Sell Council session id.")
+    if not council_dossier or not Path(council_dossier).expanduser().is_file():
+        reasons.append("Auto-sell is missing a readable Sell Council dossier.")
+    if council_action == "EXIT":
+        today = _utcnow().date()
+        exited_tickers: set[str] = set()
+        for execution_row in journal.get_execution_orders(status="filled", limit=500):
+            if str(execution_row.get("side") or "").lower() != "sell":
+                continue
+            created_at = _parse_dt(execution_row.get("filled_at") or execution_row.get("created_at"))
+            if not created_at or created_at.date() != today:
+                continue
+            prior_evidence = _as_json(execution_row.get("evidence_json"))
+            prior_council = (
+                prior_evidence.get("sell_council")
+                if isinstance(prior_evidence.get("sell_council"), dict)
+                else {}
+            )
+            if str(prior_council.get("action") or "").upper() in {"EXIT", "URGENT_EXIT"}:
+                exited_tickers.add(str(execution_row.get("ticker") or "").upper())
+        checks["full_exits_today"] = sorted(exited_tickers)
+        checks["max_full_exits_per_day"] = Config.SELL_MAX_EXITS_PER_DAY
+        if ticker not in exited_tickers and len(exited_tickers) >= Config.SELL_MAX_EXITS_PER_DAY:
+            reasons.append(
+                f"Daily full-exit cap is already reached ({len(exited_tickers)}/"
+                f"{Config.SELL_MAX_EXITS_PER_DAY}); a fresh review is required next session."
+            )
+
+    snapshot = load_robinhood_snapshot()
+    held_quantity = _snapshot_held_quantity_for_ticker(snapshot, ticker)
+    checks["held_quantity"] = held_quantity
+    checks["snapshot_fresh"] = bool(snapshot.get("fresh"))
+    if quantity is not None and quantity > 0 and snapshot.get("fresh") and quantity > held_quantity + 0.000001:
+        reasons.append(
+            f"Auto-sell quantity {quantity:.6f} exceeds the {held_quantity:.6f} {ticker} shares "
+            "held in the latest Robinhood snapshot."
+        )
+
+    thesis_id = str(row.get("thesis_id") or getattr(intent, "thesis_id", "") or "")
+    thesis_row = journal.get_thesis(thesis_id) if thesis_id else None
+    thesis_status = str((thesis_row or {}).get("status") or "").lower()
+    checks["thesis"] = {"found": bool(thesis_row), "status": thesis_status or None, "thesis_id": thesis_id or None}
+    if not thesis_row or thesis_status not in {"active", "pending_exit"}:
+        reasons.append("Auto-sell requires the matching active or pending-exit thesis.")
+
+    if Config.ROBINHOOD_REQUIRE_FRESH_SNAPSHOT_FOR_REVIEW:
+        try:
+            broker_check = _broker_snapshot_gate_for_action(row)
+        except Exception as exc:
+            broker_check = {
+                "passed": False,
+                "status": "BLOCKED",
+                "reasons": [f"Could not validate latest Robinhood snapshot before auto-sell: {type(exc).__name__}: {exc}"],
+                "checks": {},
+            }
+        checks["broker_snapshot"] = broker_check
+        if not broker_check.get("passed"):
+            reasons.extend(str(reason) for reason in broker_check.get("reasons") or [])
+
+    return {
+        "passed": not reasons,
+        "status": "PASS" if not reasons else "BLOCKED",
+        "reasons": reasons,
+        "checks": checks,
+    }
+
+
+def _classify_transient_gate_failure(gate: dict[str, Any]) -> dict[str, Any]:
+    """Split gate failures into transient staleness vs permanent blocks.
+
+    Transient: stale decision (>60 min proposal age) and/or stale snapshot
+    (>10 min). Everything else is a hard block.
+    """
+    reasons = [str(reason) for reason in gate.get("reasons") or []]
+    decision_stale = [r for r in reasons if "regenerate" in r.lower()]
+    # Only the genuine staleness message (execution.evaluate_broker_snapshot_
+    # guardrails) is transient. Other snapshot-mentioning reasons — sell
+    # quantity exceeds broker-held shares, missing buying power, snapshot
+    # validation exceptions — are permanent blocks and must NOT be silently
+    # retried by the runner until token expiry.
+    snapshot_stale = [
+        r for r in reasons
+        if "fresh robinhood snapshot is required" in r.lower() and r not in decision_stale
+    ]
+    other = [r for r in reasons if r not in decision_stale and r not in snapshot_stale]
+    return {
+        "transient": bool(reasons) and not other,
+        "decision_stale": bool(decision_stale),
+        "snapshot_stale": bool(snapshot_stale),
+        "other": other,
+    }
+
+
+def _regenerations_today(journal: DecisionJournal, ticker: str, action_type: str) -> int:
+    """Count auto-regenerated actions for one ticker/type on the current day."""
+    today = _utcnow().date().isoformat()
+    count = 0
+    for row in journal.get_trade_actions(limit=300):
+        if str(row.get("ticker") or "").upper() != str(ticker or "").upper():
+            continue
+        if str(row.get("action_type") or "").lower() != str(action_type or "").lower():
+            continue
+        if "Auto-regenerated from" not in str(row.get("message") or ""):
+            continue
+        if str(row.get("created_at") or "")[:10] == today:
+            count += 1
+    return count
+
+
+def regenerate_trade_action(
+    row: dict[str, Any],
+    *,
+    journal: DecisionJournal | None = None,
+) -> dict[str, Any]:
+    """Rebuild a fresh audited review from a transiently-stale queued action.
+
+    Reuses the original order intent (fresh order_intent_id, refreshed price
+    reference), re-runs the guardrailed review, queues a new trade action with
+    the same action_type, and supersedes the old row.
+    """
+    journal = journal or DecisionJournal()
+    from .execution import OrderIntent, prepare_and_record_robinhood_review
+
+    payload = _as_json(row.get("payload_json"))
+    intent_data = payload.get("intent") if isinstance(payload.get("intent"), dict) else {}
+    fields = {
+        k: v
+        for k, v in intent_data.items()
+        if k in OrderIntent.__dataclass_fields__ and k != "order_intent_id"
+    }
+    if not fields:
+        raise ValueError("Trade action payload is missing its order intent; cannot regenerate.")
+    intent = OrderIntent(**fields).normalized()
+    intent.dry_run = bool(Config.ROBINHOOD_DRY_RUN_ONLY)
+    evidence = dict(intent.evidence or {})
+    evidence["regenerated_from_action_id"] = row.get("action_id")
+    evidence["regenerated_at"] = _utcnow_iso()
+    intent.evidence = evidence
+
+    old_order = None
+    if row.get("execution_order_row"):
+        old_order = journal.get_execution_order_by_id(int(row["execution_order_row"]))
+    if old_order is None and row.get("order_intent_id"):
+        old_order = journal.get_execution_order_by_intent_id(str(row["order_intent_id"]))
+    guardrail = _as_json((old_order or {}).get("guardrail_json"))
+    old_checks = guardrail.get("checks") if isinstance(guardrail.get("checks"), dict) else {}
+    spread = old_checks.get("spread") if isinstance(old_checks.get("spread"), dict) else {}
+    liquidity = old_checks.get("liquidity") if isinstance(old_checks.get("liquidity"), dict) else {}
+
+    fresh_price = None
+    try:
+        from .collector import FMPCollector
+
+        quote = FMPCollector().quote(intent.ticker) or {}
+        fresh_price = _as_float(quote.get("price") or quote.get("lastPrice"))
+    except Exception as exc:
+        logger.warning("[robinhood_bridge] regeneration quote fetch failed for %s: %s", intent.ticker, exc)
+    reference = fresh_price or _as_float(intent.estimated_price) or _as_float(intent.limit_price)
+    if fresh_price and fresh_price > 0:
+        intent.estimated_price = fresh_price
+    market_data = {
+        "price": reference,
+        "last_price": reference,
+        "bid": _as_float(spread.get("bid")),
+        "ask": _as_float(spread.get("ask")),
+        "volume": None,
+        "dollar_volume": _as_float(liquidity.get("dollar_volume")),
+        "regenerated": True,
+    }
+    snapshot = load_robinhood_snapshot()
+    result = prepare_and_record_robinhood_review(
+        intent,
+        _configured_agentic_account_record(),
+        market_data=market_data,
+        journal=journal,
+        send_telegram=False,
+        now=_utcnow(),
+        broker_snapshot=snapshot if snapshot.get("fresh") else None,
+    )
+    action = queue_trade_action_from_order_payload(
+        result,
+        action_type=str(row.get("action_type") or "").lower() or None,
+        journal=journal,
+        message=(
+            f"Auto-regenerated from {row.get('action_id')} after transient staleness "
+            "(stale decision/snapshot); guardrails re-evaluated."
+        ),
+    )
+    journal.update_trade_action(
+        str(row.get("action_id") or ""),
+        {
+            "status": "superseded",
+            "result_json": {"regenerated_to_action_id": action.get("action_id")},
+            "notes": f"Superseded by auto-regenerated action {action.get('action_id')}.",
+        },
+    )
+    logger.info(
+        "[robinhood_bridge] regenerated trade action %s -> %s ticker=%s type=%s status=%s",
+        row.get("action_id"),
+        action.get("action_id"),
+        intent.ticker,
+        row.get("action_type"),
+        action.get("status"),
+    )
+    return action
+
+
 def build_auto_buy_operation(action_id: str, *, journal: DecisionJournal | None = None) -> dict[str, Any]:
-    """Resolve a queued auto-buy action into the OpenClaw MCP review/place flow."""
+    """Resolve a queued auto-buy/auto-sell action into the OpenClaw MCP review/place flow."""
     journal = journal or DecisionJournal()
     row = journal.get_trade_action(action_id)
     if not row:
-        return {"success": False, "operation": "blocked", "message": "Auto-buy action was not found."}
+        return {"success": False, "operation": "blocked", "message": "Auto-trade action was not found."}
+    action_type = str(row.get("action_type") or "").lower()
+    side = str(row.get("side") or ("sell" if action_type == "auto_sell" else "buy")).lower()
     row_status = str(row.get("status") or "").lower()
     if row_status not in {"review_ready", "review_requested", "auto_review_requested", "review_clear", "reviewed"}:
         return {
             "success": False,
             "operation": "blocked",
-            "message": f"Auto-buy action status is {row_status or 'unknown'}; unattended runner only processes fresh review-ready or review-clear actions.",
+            "message": f"Auto-trade action status is {row_status or 'unknown'}; unattended runner only processes fresh review-ready or review-clear actions.",
             "action_id": row.get("action_id"),
+            "side": side,
+            "action_type": action_type,
             "status": row_status,
         }
-    gate = _auto_buy_authorization_gate(row, journal)
+    if action_type == "auto_sell":
+        gate = _auto_sell_authorization_gate(row, journal)
+    else:
+        gate = _auto_buy_authorization_gate(row, journal)
     if not gate.get("passed"):
+        staleness = _classify_transient_gate_failure(gate)
+        if staleness.get("transient"):
+            if (
+                staleness.get("decision_stale")
+                and _regenerations_today(journal, str(row.get("ticker") or ""), action_type)
+                < max(0, int(Config.ROBINHOOD_QUEUE_REGEN_PER_DAY))
+            ):
+                try:
+                    regenerated = regenerate_trade_action(row, journal=journal)
+                    return {
+                        "success": False,
+                        "operation": "regenerated",
+                        "message": (
+                            "Stale proposal was auto-regenerated with a fresh audited review; "
+                            "the new action will drain on the next queue pass."
+                        ),
+                        "action_id": row.get("action_id"),
+                        "new_action_id": regenerated.get("action_id"),
+                        "side": side,
+                        "action_type": action_type,
+                        "auto_trade_gate": gate,
+                    }
+                except Exception as regen_exc:
+                    logger.warning(
+                        "[robinhood_bridge] regeneration failed for %s: %s",
+                        row.get("action_id"),
+                        regen_exc,
+                    )
+            # Transient (snapshot/decision staleness): do not poison the action.
+            journal.update_trade_action(
+                str(row["action_id"]),
+                {
+                    "result_json": {"auto_trade_gate": gate, "transient": True},
+                    "notes": "Transient staleness; action left queued for auto-retry after refresh.",
+                },
+            )
+            return {
+                "success": False,
+                "operation": "blocked_transient",
+                "transient": True,
+                "message": "; ".join(str(reason) for reason in gate.get("reasons") or []),
+                "action_id": row.get("action_id"),
+                "side": side,
+                "action_type": action_type,
+                "auto_trade_gate": gate,
+                "snapshot_refresh_operation": build_snapshot_refresh_operation()
+                if staleness.get("snapshot_stale")
+                else None,
+            }
         journal.update_trade_action(
             str(row["action_id"]),
-            {"status": "blocked", "result_json": {"auto_buy_gate": gate}, "notes": "Auto-buy blocked by authorization gate."},
+            {"status": "blocked", "result_json": {"auto_trade_gate": gate}, "notes": f"Auto-{side} blocked by authorization gate."},
         )
         return {
             "success": False,
             "operation": "blocked",
             "message": "; ".join(str(reason) for reason in gate.get("reasons") or []),
+            "side": side,
+            "action_type": action_type,
             "auto_buy_gate": gate,
+            "auto_trade_gate": gate,
             "snapshot_refresh_operation": build_snapshot_refresh_operation()
             if any("snapshot" in str(reason).lower() for reason in gate.get("reasons") or [])
             else None,
@@ -1577,12 +2459,15 @@ def build_auto_buy_operation(action_id: str, *, journal: DecisionJournal | None 
 
     if str(row.get("status") or "").lower() == "review_clear":
         callback_data = _callback("place", str(row["action_id"]), str(row.get("token_place") or ""))
-        return build_action_operation(callback_data, journal=journal)
+        operation = build_action_operation(callback_data, journal=journal)
+        operation.setdefault("side", side)
+        operation.setdefault("action_type", action_type)
+        return operation
 
     request = _request_json_for_action(row, journal)
     journal.update_trade_action(
         str(row["action_id"]),
-        {"status": "auto_review_requested", "result_json": {"auto_buy_gate": gate}, "notes": "Auto-buy requested Robinhood review."},
+        {"status": "auto_review_requested", "result_json": {"auto_trade_gate": gate}, "notes": f"Auto-{side} requested Robinhood review."},
     )
     return {
         "success": True,
@@ -1590,27 +2475,41 @@ def build_auto_buy_operation(action_id: str, *, journal: DecisionJournal | None 
         "tradability_mcp_args": _tradability_mcp_args(request),
         "review_mcp_args": request,
         "action_id": row["action_id"],
+        "side": side,
+        "action_type": action_type,
         "auto_buy_gate": gate,
+        "auto_trade_gate": gate,
         "message": (
-            "Auto-buy flow: call get_equity_tradability and review_equity_order. "
+            f"Auto-{side} flow: call get_equity_tradability and review_equity_order. "
             "Record the review, then Artha will rebuild the place operation only if Robinhood review is still clear."
         ),
     }
 
 
 def build_pending_auto_buy_operations(*, journal: DecisionJournal | None = None, limit: int = 5) -> dict[str, Any]:
-    """Return OpenClaw operations for queued auto-buy actions."""
+    """Return OpenClaw operations for queued auto-buy/auto-sell actions.
+
+    Sells drain first (exits protect capital), then buys by adjusted_score DESC.
+    """
     journal = journal or DecisionJournal()
     operations = []
     skipped = []
+    eligible: list[dict[str, Any]] = []
     for row in journal.get_trade_actions(limit=max(1, int(limit) * 4)):
-        if len(operations) >= limit:
-            break
-        if str(row.get("action_type") or "").lower() != "auto_buy":
+        if str(row.get("action_type") or "").lower() not in AUTO_TRADE_ACTION_TYPES:
             continue
-        if str(row.get("status") or "").lower() not in {"review_ready", "review_clear"}:
-            skipped.append({"action_id": row.get("action_id"), "ticker": row.get("ticker"), "status": row.get("status")})
+        if str(row.get("status") or "").lower() not in {"review_ready", "review_requested", "auto_review_requested", "review_clear"}:
+            skipped.append(
+                {
+                    "action_id": row.get("action_id"),
+                    "ticker": row.get("ticker"),
+                    "action_type": str(row.get("action_type") or "").lower(),
+                    "status": row.get("status"),
+                }
+            )
             continue
+        eligible.append(row)
+    for row in _auto_trade_drain_order(eligible)[: max(1, int(limit))]:
         operations.append(build_auto_buy_operation(str(row["action_id"]), journal=journal))
     return {"success": True, "operation_count": len(operations), "operations": operations, "skipped": skipped}
 
@@ -1627,6 +2526,11 @@ def record_action_review(
     row = journal.get_trade_action(action_id)
     if not row:
         return {"success": False, "status": "FAIL", "message": "Trade action was not found."}
+    row_status = str(row.get("status") or "").lower()
+    manual_place_requested = (
+        row_status == "place_requested"
+        and str(row.get("action_type") or "").lower() not in AUTO_TRADE_ACTION_TYPES
+    )
     request = _request_json_for_action(row, journal)
     tradability_gate = _evaluate_tradability_for_request(request, tradability_response)
     order_checks = _review_order_checks(review_response)
@@ -1655,6 +2559,12 @@ def record_action_review(
         "tradability_response": tradability_response,
         "review_request": request,
     }
+    if manual_place_requested and review_gate["passed"]:
+        result_json["manual_place_requested"] = {
+            "passed": True,
+            "source_status": row_status,
+            "recorded_at": _utcnow_iso(),
+        }
     journal.update_trade_action(
         action_id,
         {
@@ -1709,8 +2619,17 @@ def run_final_clearance_for_action(
     else:
         from .execution_officer import robinhood_review_final_clearance
 
+        action_for_clearance = dict(action)
+        manual_place_requested = result_json.get("manual_place_requested")
+        if (
+            isinstance(manual_place_requested, dict)
+            and manual_place_requested.get("passed")
+            and str(action_for_clearance.get("action_type") or "").lower() not in AUTO_TRADE_ACTION_TYPES
+        ):
+            action_for_clearance["status"] = "place_requested"
+            action_for_clearance["manual_place_requested"] = manual_place_requested
         clearance = robinhood_review_final_clearance(
-            action=action,
+            action=action_for_clearance,
             review_response=review_response,
             tradability_response=tradability_response,
             recorded_review=recorded_review,
@@ -1774,7 +2693,10 @@ def build_review_result_notice(
         lines.extend(["", "Blocked reasons:"])
         lines.extend(f"- {reason}" for reason in reasons[:6])
     else:
-        lines.extend(["", "Review is clear. Place only if the configured execution policy allows it."])
+        if str(action.get("action_type") or "").lower() in AUTO_TRADE_ACTION_TYPES:
+            lines.extend(["", "Review is clear. Automated final clearance will decide; no user action is required."])
+        else:
+            lines.extend(["", "Review is clear. Use Place only if the operator intentionally confirms this preview."])
     return "\n".join(lines)
 
 
@@ -1835,6 +2757,8 @@ def build_action_operation(callback_data: str, *, journal: DecisionJournal | Non
             "tradability_mcp_args": _tradability_mcp_args(request),
             "review_mcp_args": request,
             "action_id": row["action_id"],
+            "side": str(row.get("side") or request.get("side") or "").lower(),
+            "action_type": str(row.get("action_type") or "").lower(),
             "message": "Call get_equity_tradability first, then review_equity_order. Record both with robinhood-record-review. Do not place an order from this operation.",
         }
 
@@ -1842,6 +2766,14 @@ def build_action_operation(callback_data: str, *, journal: DecisionJournal | Non
         control = get_trading_control()
         if control.get("trading_disabled"):
             return {"success": False, "operation": "blocked", "message": f"Trading is disabled: {control.get('reason') or 'kill switch'}"}
+        if str(row.get("side") or "").lower() == "buy":
+            paused, pause_reason = buying_paused(control)
+            if paused:
+                return {
+                    "success": False,
+                    "operation": "blocked",
+                    "message": f"Buy-side paused until the next trading day: {pause_reason} Sells are unaffected.",
+                }
         if Config.ROBINHOOD_REVIEW_ONLY or Config.ROBINHOOD_DRY_RUN_ONLY or not Config.ROBINHOOD_AGENTIC_ENABLED:
             return {
                 "success": False,
@@ -1913,6 +2845,8 @@ def build_action_operation(callback_data: str, *, journal: DecisionJournal | Non
             "review_mcp_args": request,
             "place_mcp_args": place_args,
             "action_id": row["action_id"],
+            "side": str(row.get("side") or request.get("side") or "").lower(),
+            "action_type": str(row.get("action_type") or "").lower(),
             "message": "Repeat get_equity_tradability and review_equity_order immediately before place. If tradability fails, order_checks is non-empty, or account/market/order details differ, abort. Only then call place_equity_order.",
         }
 
@@ -2027,7 +2961,18 @@ def sync_orders_to_artha(
     updated: list[dict[str, Any]] = []
     filled: list[dict[str, Any]] = []
     unmatched_agentic: list[dict[str, Any]] = []
-    for raw in snapshot.get("orders") or []:
+    broker_quantities = {
+        _broker_position_symbol(raw): _broker_position_quantity(raw)
+        for raw in (snapshot.get("positions") or [])
+        if isinstance(raw, dict) and _broker_position_symbol(raw)
+    }
+    snapshot_orders = [raw for raw in (snapshot.get("orders") or []) if isinstance(raw, dict)]
+    snapshot_orders.sort(
+        key=lambda raw: _parse_dt(raw.get("last_transaction_at") or raw.get("created_at"))
+        or datetime.max.replace(tzinfo=timezone.utc)
+    )
+    processed_filled_broker_ids: set[str] = set()
+    for raw in snapshot_orders:
         if not isinstance(raw, dict):
             continue
         broker_order_id = str(raw.get("id") or "")
@@ -2047,14 +2992,28 @@ def sync_orders_to_artha(
             continue
         status = _execution_status_from_order(raw)
         current_status = str(row.get("status") or "")
-        if status == "filled" and current_status != "filled":
+        symbol = str(raw.get("symbol") or row.get("ticker") or "").upper().strip()
+        side = str(raw.get("side") or row.get("side") or "").lower().strip()
+        needs_portfolio_repair = (
+            status == "filled"
+            and current_status == "filled"
+            and side == "sell"
+            and _portfolio_sell_fill_needs_repair(row, raw, portfolio_path=portfolio_path)
+        )
+        if status == "filled" and (current_status != "filled" or needs_portfolio_repair):
             fill_result = record_order_fill(
                 order_intent_id=str(row.get("order_intent_id") or ""),
                 fill_payload=raw,
                 journal=journal,
                 portfolio_path=portfolio_path,
+                broker_snapshot_position_quantity=(
+                    broker_quantities.get(symbol)
+                    if side == "sell" and symbol
+                    else None
+                ),
             )
             filled.append({"broker_order_id": broker_order_id, "symbol": raw.get("symbol"), "fill": fill_result})
+            processed_filled_broker_ids.add(broker_order_id)
         elif status != current_status:
             updates = {
                 "status": status,
@@ -2064,7 +3023,45 @@ def sync_orders_to_artha(
             if status == "cancelled":
                 updates["canceled_at"] = str(raw.get("last_transaction_at") or _utcnow_iso())
             journal.update_execution_order(str(row.get("order_intent_id") or ""), updates)
+            linked_action = journal.get_trade_action_by_intent_id(
+                str(row.get("order_intent_id") or "")
+            )
+            if linked_action:
+                journal.update_trade_action(
+                    str(linked_action.get("action_id") or ""),
+                    {
+                        "status": status,
+                        "result_json": {"broker_order_id": broker_order_id, "order": raw},
+                        "notes": f"Robinhood order watcher synchronized state={raw.get('state')}.",
+                    },
+                )
             updated.append({"broker_order_id": broker_order_id, "symbol": raw.get("symbol"), "status": status})
+
+    # Current Robinhood order history can omit earlier same-day fills after
+    # Artha has already linked them. If a fresh position snapshot confirms the
+    # ticker is gone but a stale portfolio save reintroduced it, repair from the
+    # broker-matched execution row instead of waiting for an external-sell path.
+    for row in rows:
+        broker_order_id = str(row.get("broker_order_id") or "")
+        if not broker_order_id or broker_order_id in processed_filled_broker_ids:
+            continue
+        ticker = str(row.get("ticker") or "").upper().strip()
+        if not ticker or broker_quantities.get(ticker, 0.0) > 0:
+            continue
+        raw = _filled_sell_payload_from_execution_row(row)
+        if not raw:
+            continue
+        if not _portfolio_sell_fill_needs_repair(row, raw, portfolio_path=portfolio_path):
+            continue
+        fill_result = record_order_fill(
+            order_intent_id=str(row.get("order_intent_id") or ""),
+            fill_payload=raw,
+            journal=journal,
+            portfolio_path=portfolio_path,
+            broker_snapshot_position_quantity=0.0,
+        )
+        filled.append({"broker_order_id": broker_order_id, "symbol": ticker, "fill": fill_result})
+        processed_filled_broker_ids.add(broker_order_id)
     return {
         "status": "WARN" if unmatched_agentic else "PASS",
         "updated": updated,
@@ -2146,12 +3143,154 @@ def _append_portfolio_buy_transaction(
     return True
 
 
+def _portfolio_sell_fill_needs_repair(
+    row: dict[str, Any],
+    raw_order: dict[str, Any],
+    *,
+    portfolio_path: str | Path,
+) -> bool:
+    """Return True when a filled sell order is missing from portfolio state."""
+    ticker = str(raw_order.get("symbol") or row.get("ticker") or "").upper().strip()
+    broker_order_id = str(raw_order.get("id") or row.get("broker_order_id") or "")
+    quantity = _as_float(raw_order.get("cumulative_quantity") or raw_order.get("quantity") or row.get("quantity"))
+    if not ticker or not broker_order_id or not quantity or quantity <= 0:
+        return False
+    portfolio = Portfolio.load(Path(portfolio_path))
+    recorded = _portfolio_recorded_fill_quantity(
+        portfolio,
+        broker_order_id=broker_order_id,
+        ticker=ticker,
+        side="sell",
+    )
+    if recorded >= quantity - 0.000001:
+        return False
+    return portfolio.get_position(ticker) is not None
+
+
+def _filled_sell_payload_from_execution_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a filled sell payload from a broker-matched execution row."""
+    if str(row.get("side") or "").lower() != "sell":
+        return None
+    if str(row.get("status") or "").lower() != "filled":
+        return None
+    response = _response_json(row)
+    order = response.get("order") if isinstance(response.get("order"), dict) else {}
+    broker_order_id = str(order.get("id") or response.get("artha_fill_broker_order_id") or row.get("broker_order_id") or "")
+    ticker = str(order.get("symbol") or row.get("ticker") or "").upper().strip()
+    quantity = _as_float(
+        order.get("cumulative_quantity")
+        or order.get("quantity")
+        or response.get("artha_fill_quantity")
+        or row.get("quantity")
+    )
+    avg_price = _as_float(
+        order.get("average_price")
+        or order.get("price")
+        or response.get("artha_fill_average_price")
+        or row.get("estimated_price")
+    )
+    if not broker_order_id or not ticker or not quantity or quantity <= 0 or not avg_price or avg_price <= 0:
+        return None
+    return {
+        **order,
+        "id": broker_order_id,
+        "symbol": ticker,
+        "side": "sell",
+        "state": "filled",
+        "cumulative_quantity": str(quantity),
+        "average_price": str(avg_price),
+        "last_transaction_at": order.get("last_transaction_at") or row.get("filled_at") or row.get("updated_at"),
+    }
+
+
+def _repair_already_applied_sell_fill(
+    *,
+    row: dict[str, Any],
+    journal: DecisionJournal,
+    portfolio_path: str | Path,
+    ticker: str,
+    quantity: float,
+    avg_price: float,
+    broker_order_id: str,
+    broker_snapshot_position_quantity: float | None = None,
+) -> bool:
+    """Repair a lost portfolio mutation for a sell fill already marked applied."""
+    portfolio = Portfolio.load(Path(portfolio_path))
+    recorded_quantity = _portfolio_recorded_fill_quantity(
+        portfolio,
+        broker_order_id=broker_order_id,
+        ticker=ticker,
+        side="sell",
+    )
+    missing_quantity = quantity - recorded_quantity
+    if missing_quantity <= 0.000001:
+        return False
+
+    pos = portfolio.get_position(ticker)
+    if not pos:
+        return False
+
+    local_shares = float(pos.shares or 0.0)
+    if local_shares <= 0:
+        return False
+
+    broker_remaining = _as_float(broker_snapshot_position_quantity)
+    if broker_remaining is not None and broker_remaining > 0:
+        required_reduction = max(0.0, local_shares - broker_remaining)
+        if required_reduction <= 0.000001:
+            return False
+        quantity_to_repair = min(missing_quantity, required_reduction, local_shares)
+    else:
+        quantity_to_repair = min(missing_quantity, local_shares)
+
+    if quantity_to_repair <= 0.000001:
+        return False
+
+    portfolio.sell_position(
+        ticker,
+        quantity_to_repair,
+        avg_price,
+        notes=f"Robinhood order fill {broker_order_id}",
+    )
+
+    tracker = ThesisTracker(journal)
+    thesis_id = str(row.get("thesis_id") or "")
+    tracked = tracker.get(thesis_id) if thesis_id else tracker.get_active(ticker)
+    pos_after = portfolio.get_position(ticker)
+    evidence = _as_json(row.get("evidence_json"))
+    council_evidence = evidence.get("sell_council") if isinstance(evidence.get("sell_council"), dict) else {}
+    council_action = str(council_evidence.get("action") or "").upper()
+    if tracked and getattr(tracked, "status", "") != "archived" and not pos_after:
+        tracker.archive_thesis(
+            tracked.thesis_id,
+            exit_price=avg_price,
+            exit_reason="Robinhood sell order filled.",
+        )
+    elif tracked and getattr(tracked, "status", "") != "archived" and pos_after and council_action == "TRIM":
+        tracker.update_thesis_fields(
+            tracked.thesis_id,
+            status="active",
+            sell_cooldown_until=_add_days(Config.SELL_COOLDOWN_AFTER_TRIM),
+            next_review_date=_add_days(Config.SELL_COOLDOWN_AFTER_TRIM),
+        )
+
+    portfolio.save(Path(portfolio_path))
+    logger.warning(
+        "[robinhood_bridge] repaired missing portfolio sell fill broker_order_id=%s ticker=%s quantity=%.6f",
+        broker_order_id,
+        ticker,
+        quantity_to_repair,
+    )
+    return True
+
+
 def record_order_fill(
     *,
     order_intent_id: str,
     fill_payload: dict[str, Any],
     journal: DecisionJournal | None = None,
     portfolio_path: str | Path = PORTFOLIO_FILE,
+    broker_snapshot_position_quantity: float | None = None,
 ) -> dict[str, Any]:
     """Record a Robinhood filled order and activate/close Artha monitoring."""
     journal = journal or DecisionJournal()
@@ -2180,6 +3319,7 @@ def record_order_fill(
             ticker,
             side,
         )
+        portfolio_repaired = False
         if side == "buy":
             portfolio = Portfolio.load(Path(portfolio_path))
             if _append_portfolio_buy_transaction(
@@ -2191,6 +3331,35 @@ def record_order_fill(
                 timestamp=str(order.get("last_transaction_at") or order.get("created_at") or _utcnow_iso()),
             ):
                 portfolio.save(Path(portfolio_path))
+                portfolio_repaired = True
+        elif side == "sell":
+            portfolio_repaired = _repair_already_applied_sell_fill(
+                row=row,
+                journal=journal,
+                portfolio_path=portfolio_path,
+                ticker=ticker,
+                quantity=quantity,
+                avg_price=avg_price,
+                broker_order_id=broker_order_id,
+                broker_snapshot_position_quantity=broker_snapshot_position_quantity,
+            )
+        linked_action = journal.get_trade_action_by_intent_id(order_intent_id)
+        if linked_action:
+            journal.update_trade_action(
+                str(linked_action.get("action_id") or ""),
+                {
+                    "status": "filled" if state == "filled" else "partially_filled",
+                    "result_json": {
+                        "broker_order_id": broker_order_id,
+                        "quantity": quantity,
+                        "average_price": avg_price,
+                        "state": state,
+                        "already_recorded": True,
+                        "portfolio_repaired": portfolio_repaired,
+                    },
+                    "notes": "Broker fill was already applied; linked trade action reconciled.",
+                },
+            )
         return {
             "status": "PASS",
             "ticker": ticker,
@@ -2199,6 +3368,7 @@ def record_order_fill(
             "avg_price": avg_price,
             "broker_order_id": broker_order_id,
             "already_recorded": True,
+            "portfolio_repaired": portfolio_repaired,
         }
     if already_applied and applied_quantity > 0 and quantity > applied_quantity:
         quantity_to_apply = quantity - applied_quantity
@@ -2220,7 +3390,15 @@ def record_order_fill(
     if side == "buy":
         thesis = tracker.get_active(ticker) or tracker.get_pending_for_ticker(ticker)
         pos = portfolio.get_position(ticker)
-        if thesis and getattr(thesis, "status", "") != "pending" and _position_already_reflects_fill(pos, thesis, row, quantity, avg_price):
+        if thesis and getattr(thesis, "status", "") != "pending" and _position_already_reflects_fill(
+            pos,
+            thesis,
+            row,
+            quantity,
+            avg_price,
+            portfolio_updated_at=portfolio.last_updated,
+            fill_time=order.get("last_transaction_at") or order.get("created_at"),
+        ):
             before_sell_fields = _sell_field_tuple(pos)
             _attach_sell_fields(pos, thesis, avg_price)
             if _sell_field_tuple(pos) != before_sell_fields:
@@ -2248,6 +3426,22 @@ def record_order_fill(
                     "notes": "Robinhood fill matched existing broker-synced portfolio position; no duplicate share mutation applied.",
                 },
             )
+            linked_action = journal.get_trade_action_by_intent_id(order_intent_id)
+            if linked_action:
+                journal.update_trade_action(
+                    str(linked_action.get("action_id") or ""),
+                    {
+                        "status": "filled" if state == "filled" else "partially_filled",
+                        "result_json": {
+                            "broker_order_id": broker_order_id,
+                            "quantity": quantity,
+                            "average_price": avg_price,
+                            "state": state,
+                            "already_recorded": True,
+                        },
+                        "notes": "Broker-synced fill reconciled into linked trade action.",
+                    },
+                )
             logger.info(
                 "[robinhood_bridge] fill already reflected by broker snapshot broker_order_id=%s ticker=%s quantity=%.6f",
                 broker_order_id,
@@ -2299,11 +3493,103 @@ def record_order_fill(
             timestamp=str(order.get("last_transaction_at") or order.get("created_at") or _utcnow_iso()),
         )
     elif side == "sell":
+        pos = portfolio.get_position(ticker)
+        thesis_id = str(row.get("thesis_id") or "")
+        tracked = tracker.get(thesis_id) if thesis_id else tracker.get_active(ticker)
+        evidence = _as_json(row.get("evidence_json"))
+        council_evidence = evidence.get("sell_council") if isinstance(evidence.get("sell_council"), dict) else {}
+        council_action = str(council_evidence.get("action") or "").upper()
+        broker_remaining = _as_float(broker_snapshot_position_quantity)
+        if broker_remaining is not None and broker_remaining > 0:
+            local_remaining = float(pos.shares or 0.0) if pos else 0.0
+            if local_remaining <= broker_remaining + 0.000001:
+                position_changed = False
+                if tracked:
+                    tracker.update_thesis_fields(
+                        tracked.thesis_id,
+                        status="active",
+                        sell_cooldown_until=_add_days(Config.SELL_COOLDOWN_AFTER_TRIM),
+                        next_review_date=_add_days(Config.SELL_COOLDOWN_AFTER_TRIM),
+                        exit_date=None,
+                        exit_price=None,
+                        exit_reason=None,
+                    )
+                    if pos:
+                        before_sell_fields = _sell_field_tuple(pos)
+                        _attach_sell_fields(pos, tracker.get(tracked.thesis_id) or tracked, float(pos.avg_cost or avg_price))
+                        position_changed = _sell_field_tuple(pos) != before_sell_fields
+                if pos and abs(float(pos.shares or 0) - broker_remaining) > 0.000001:
+                    pos.shares = broker_remaining
+                    pos.current_price = avg_price
+                    pos.market_value = round(broker_remaining * avg_price, 4)
+                    position_changed = True
+                if position_changed:
+                    portfolio.last_updated = _utcnow_iso()
+                    portfolio.save(Path(portfolio_path))
+                response_payload = {
+                    "artha_fill_applied": True,
+                    "artha_fill_broker_order_id": broker_order_id,
+                    "artha_fill_quantity": quantity,
+                    "artha_fill_average_price": avg_price,
+                    "artha_fill_source": "broker_snapshot_already_reflected",
+                    "broker_snapshot_position_quantity": broker_remaining,
+                    "order": order,
+                    "raw_fill_payload": fill_payload,
+                }
+                journal.update_execution_order(
+                    order_intent_id,
+                    {
+                        "status": "filled" if state == "filled" else "partially_filled",
+                        "broker_order_id": broker_order_id,
+                        "filled_at": _utcnow_iso(),
+                        "quantity": quantity,
+                        "notional": round(quantity * avg_price, 6),
+                        "estimated_price": avg_price,
+                        "response_json": response_payload,
+                        "notes": "Robinhood sell fill matched broker-synced remaining position; no duplicate share mutation applied.",
+                    },
+                )
+                linked_action = journal.get_trade_action_by_intent_id(order_intent_id)
+                if linked_action:
+                    journal.update_trade_action(
+                        str(linked_action.get("action_id") or ""),
+                        {
+                            "status": "filled" if state == "filled" else "partially_filled",
+                            "result_json": {
+                                "broker_order_id": broker_order_id,
+                                "quantity": quantity,
+                                "average_price": avg_price,
+                                "state": state,
+                                "already_recorded": True,
+                            },
+                            "notes": "Broker-synced sell fill reconciled into linked trade action.",
+                        },
+                    )
+                return {
+                    "status": "PASS",
+                    "ticker": ticker,
+                    "side": side,
+                    "quantity": quantity,
+                    "avg_price": avg_price,
+                    "broker_order_id": broker_order_id,
+                    "already_recorded": True,
+                    "source": "broker_snapshot_already_reflected",
+                }
         portfolio.sell_position(ticker, quantity_to_apply, price_to_apply, notes=f"Robinhood order fill {broker_order_id}")
         pos = portfolio.get_position(ticker)
-        active = tracker.get_active(ticker)
-        if active and not pos:
-            tracker.archive_thesis(active.thesis_id, exit_price=avg_price, exit_reason="Robinhood sell order filled.")
+        if tracked and not pos:
+            tracker.archive_thesis(
+                tracked.thesis_id,
+                exit_price=avg_price,
+                exit_reason="Robinhood sell order filled.",
+            )
+        elif tracked and pos and council_action == "TRIM":
+            tracker.update_thesis_fields(
+                tracked.thesis_id,
+                status="active",
+                sell_cooldown_until=_add_days(Config.SELL_COOLDOWN_AFTER_TRIM),
+                next_review_date=_add_days(Config.SELL_COOLDOWN_AFTER_TRIM),
+            )
     else:
         return {"status": "FAIL", "message": f"Unsupported fill side: {side}"}
 
@@ -2330,6 +3616,21 @@ def record_order_fill(
             "notes": "Robinhood fill recorded; Artha portfolio/thesis state updated.",
         },
     )
+    linked_action = journal.get_trade_action_by_intent_id(order_intent_id)
+    if linked_action:
+        journal.update_trade_action(
+            str(linked_action.get("action_id") or ""),
+            {
+                "status": "filled" if state == "filled" else "partially_filled",
+                "result_json": {
+                    "broker_order_id": broker_order_id,
+                    "quantity": quantity,
+                    "average_price": avg_price,
+                    "state": state,
+                },
+                "notes": "Broker fill reconciled into Artha portfolio and thesis state.",
+            },
+        )
     return {
         "status": "PASS",
         "ticker": ticker,
@@ -2354,11 +3655,18 @@ def format_control_center(journal: DecisionJournal | None = None) -> str:
     snapshot = load_robinhood_snapshot()
     cash = _cash_from_snapshot(snapshot)
     positions = []
-    for raw in snapshot.get("positions") or []:
+    positions_raw = [raw for raw in (snapshot.get("positions") or []) if isinstance(raw, dict)]
+    quote_needed = [
+        _broker_position_symbol(raw)
+        for raw in positions_raw
+        if _broker_position_symbol(raw) and _broker_position_live_price(raw) is None
+    ]
+    quote_prices, _quote_warnings = _fetch_mark_to_market_prices(quote_needed)
+    for raw in positions_raw:
         if isinstance(raw, dict):
             ticker = _broker_position_symbol(raw)
             qty = _broker_position_quantity(raw)
-            price = _broker_position_price(raw, _broker_position_avg_cost(raw))
+            price = _broker_position_live_price(raw) or quote_prices.get(ticker) or _broker_position_avg_cost(raw)
             if ticker and qty > 0:
                 positions.append(f"{ticker} {qty:.6f} @ USD {float(price or 0):.2f}")
     orders = [
@@ -2408,5 +3716,5 @@ def format_control_center(journal: DecisionJournal | None = None) -> str:
     if warnings:
         lines.extend(["", "Warnings:"])
         lines.extend(f"- {warning}" for warning in warnings[:5])
-        lines.append("- On-demand refresh available: python run.py robinhood-snapshot-refresh-operation")
+        lines.append("- On-demand refresh available: python run.py robinhood-snapshot-sync-direct")
     return "\n".join(lines)

@@ -1,97 +1,131 @@
 # Architecture
 
-Artha is organized as a staged decision system. Each stage has a narrow job and writes enough evidence for later audit.
+Artha is a staged decision and portfolio-management system. Each stage has a
+narrow responsibility and passes structured evidence forward.
 
-## 1. Universe And Promotion Funnel
+## 1. Universe and Promotion Funnel
 
-The funnel starts with a broad US equity universe from market data providers. It filters out names that are too small, too illiquid, or unsuitable for the configured strategy. It then ranks candidates using momentum, quality, valuation, regime fit, earnings context, liquidity, and repeat/cooldown rules.
-
-Typical shape:
+The universe layer starts with active US equities and removes unsupported asset
+types and names below configured market-cap, price, and liquidity floors. It then
+computes multi-horizon momentum, quality, valuation, pullback, revision, catalyst,
+regime-fit, and repeat/cooldown features.
 
 ```text
-1000+ active stocks
-  -> top ranked universe
-  -> enriched finalists
-  -> broker/data feasible shortlist
-  -> council candidates
+1000+ active equities
+  -> ranked universe
+  -> enriched shortlist
+  -> finalist cards
 ```
 
-The funnel should find interesting ideas, but it should not make final buy decisions.
+Provider failures and missing fields remain explicit. Missing data is not silently
+converted into a positive signal.
 
-## 2. Broker-Aware Router
+## 2. Investment Sanity and Broker-Aware Routing
 
-The router is not a fundamental analyst. Its job is execution and data feasibility:
+The sanity layer penalizes unsupported valuation, stale targets, excessive
+extension, and regime-inappropriate risk. The broker-aware router then handles
+execution feasibility only:
 
-- Is the quote present and fresh enough?
-- Are bid/ask values sane?
-- Is the spread too wide for an auto-buy?
-- Is the security tradeable and fractional-capable where needed?
-- Is the candidate blocked by duplicate order or account constraints?
-- Are data providers in severe conflict?
+- quote presence and freshness
+- bid/ask sanity and spread
+- average and live liquidity
+- tradability and fractional support
+- duplicate/open-order constraints
+- severe provider conflicts
+- active watch-zone and cooldown state
 
-Clean buy-now candidates can consume council slots. Interesting but non-executable candidates move to research/watch instead of being thrown away.
+The router uses three outcomes:
+
+- `execution_ready`: eligible for a buy-now Council slot
+- `research_watch`: interesting, but not executable now or awaiting a trigger
+- `hard_reject`: unusable identity/data or unsupported instrument
+
+The router does not decide whether the company is fundamentally attractive.
 
 ## 3. Opportunity Scout
 
-The opportunity scout is a pre-council agent. It receives the enriched candidates and can inspect additional context before ranking which names deserve the scarce council slots.
+The scout ranks the bounded finalist set before scarce Council slots are consumed.
+It receives structured candidate cards, may collect bounded additional evidence,
+and must cite the reasons for its ordering. Deterministic scores remain visible so
+the agent cannot silently replace the funnel.
 
-It is meant to improve slot quality, not replace the council. It can favor names with better evidence, cleaner valuation, better regime alignment, or better execution readiness.
+## 4. Buy Council and CIO Synthesis
 
-## 4. Council
+Independent roles evaluate the same evidence packet:
 
-The council uses multiple analyst roles:
+- fundamental quality and valuation
+- technical timing and trend
+- risk, crowding, and contrary evidence
 
-- Fundamental analyst
-- Technical analyst
-- Risk/contrarian analyst
-
-Each role evaluates the same evidence packet from a different perspective. The synthesis layer then audits score, valuation anchors, data gaps, source conflicts, invalidation conditions, and final action label.
-
-Common labels:
-
-- `BUY`
-- `STARTER`
-- `TACTICAL_BUY`
-- `DEFER`
-- `WATCH`
-- `AVOID`
-
-Only buy-side labels can advance toward order placement.
+The CIO synthesis cross-checks their claims against source IDs, filing periods,
+valuation anchors, data gaps, and score rules. Buy-side verdicts can advance;
+`DEFER`, `WATCH`, and `AVOID` do not create an order.
 
 ## 5. Execution Officer
 
-The execution officer turns a buy-side council decision into an execution verdict. It checks whether the proposed order is still reasonable at the broker's live quote.
+Execution is a separate two-stage decision:
 
-Examples:
+- Stage A converts the Council verdict into immutable order intent: side, symbol,
+  quantity/notional, order type, reference price, no-chase cap, and expiry.
+- Stage B receives compact, decisive broker evidence for that exact intent and
+  decides whether placement remains permitted.
 
-- Council says `STARTER`, live quote is clean, spread is tight, buying power is enough: queue auto-buy.
-- Council says `STARTER`, but ask has moved above the no-chase cap: no order, create watch.
-- Council says `DEFER` or `AVOID`: no broker attempt.
+The final decision requires visible proof of quote, tradability, exact-order
+review, account capacity, snapshot freshness, and deterministic guardrails.
 
-## 6. Robinhood/OpenClaw Bridge
+## 6. Broker Bridge and Reconciliation
 
-Artha does not assume broker state is fresh. The bridge contract requires:
+The bridge produces bounded operations for the external broker tool owner. It
+does not treat model prose as proof. The placement path is:
 
-- read-only broker snapshot refresh
-- account identity check
-- positions/orders reconciliation
-- quote/tradability review
-- Robinhood order preview
-- final clearance
-- place only with exact approved arguments
-- post-fill reconciliation
+```text
+fresh read-only snapshot
+  -> account/position/order reconciliation
+  -> live quote and tradability
+  -> exact-order broker review
+  -> Stage B execution clearance
+  -> deterministic final clearance
+  -> exact-argument placement
+  -> submission/fill reconciliation
+```
 
-This lets the system be agentic while still being constrained by deterministic safety rules.
+Any unknown decisive check blocks the order.
 
-## 7. Journal, Dossiers, And Supervisor
+## 7. Capacity and Buy Stand-Down
 
-Artha records:
+`broker_capacity.py` derives buy capacity from reconciled broker state. Portfolio,
+daily-trade, daily-dollar, and invested-percentage limits can pause new buys.
+`stand_down.py` records a buy-only pause and its next-session reset.
 
-- decision dossiers
-- agentic traces
-- execution intents
-- trade actions
-- fill reconciliation
-- supervisor health checks
+Sell monitoring, reconciliation, and health supervision are never paused merely
+because buy capacity is exhausted.
 
-Those runtime artifacts are private and are intentionally excluded from this public repository.
+## 8. Position Monitoring and Sell Council
+
+Every reconciled holding should have an active thesis containing invalidation,
+review, stop, and target state. The monitor checks price, thesis age, trailing
+stops, adverse evidence, news, earnings, and portfolio constraints.
+
+Deterministic emergency rules can create an immediate exit intent when configured.
+Judgment triggers receive a fresh sell-Council review. The sell Council can return
+hold, trim, or exit; an actionable sell still passes through exact broker review,
+execution clearance, placement, and fill reconciliation.
+
+## 9. Journals, Dossiers, Calibration, and Supervisor
+
+Runtime deployments record evidence packets, Council decisions, action intents,
+broker reviews, submissions, fills, thesis transitions, and health checks.
+Calibration and shadow rules can observe outcomes, but they cannot silently alter
+live investing rules.
+
+Runtime artifacts are private state and are excluded from this repository.
+
+## Trust Boundaries
+
+- Structured market and filing providers: evidence inputs, not execution truth.
+- LLM analysts and scouts: bounded reasoning, never direct broker authority.
+- Broker outputs: source of truth for live quote, tradability, review, and fills.
+- Deterministic code: limits, state transitions, exact-order identity, and final
+  permission gates.
+- Operator configuration: credentials, account identity, risk limits, and whether
+  any live capability is enabled.

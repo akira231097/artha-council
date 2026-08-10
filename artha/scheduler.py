@@ -9,6 +9,7 @@ import signal
 import shlex
 import sqlite3
 import subprocess
+import threading
 from pathlib import Path
 from uuid import uuid4
 from dataclasses import dataclass
@@ -190,15 +191,30 @@ class ArthaScheduler:
         self.accuracy = AccuracyTracker()
         self.reviewer = NightlyReview()
         self.stop_event = asyncio.Event()
-        self._last_run: dict[str, datetime] = {}
+        # Thread-visible mirror of stop_event: the sync scan workers run in
+        # plain threads and cannot await the asyncio event, so they poll this
+        # flag to abort cooperatively on SIGTERM/SIGINT (no new councils, no
+        # new auto_buy queue rows after a stop is requested).
+        self._stop_flag = threading.Event()
+        self._last_run: dict[str, datetime] = self._load_run_slots()
         self.et_tz = ZoneInfo("America/New_York")
         self.ct_tz = ZoneInfo("America/Chicago")
         # FIX 5: Sell engine wired into the 30-min price check cycle
         self.sell_engine = SellEngine(journal=DecisionJournal(), collector=self.collector)
-        # FIX 12: Pending EXIT confirmation tracking {thesis_id: first_seen_utc}
-        self._pending_exit_signals: dict[str, datetime] = {}
+        # FIX 12 (Wave 2): pending EXIT confirmations persist in sqlite
+        # (pending_exit_confirmations) so a restart never resets the clock.
         self._broker_warning_state: dict[str, datetime] = {}
         self._broker_snapshot_was_stale = False
+        # Wave 2: the full council scan runs in a worker thread so the event
+        # loop keeps servicing stop checks; the lock stops overlapping scans
+        # (11:30 full scan vs 14:15 afternoon pass).
+        self._council_scan_lock = asyncio.Lock()
+        # Long scans are detached from the tick gather so run_forever keeps
+        # ticking every 20s while a scan is in flight (strong refs held here).
+        self._background_tasks: set[asyncio.Task] = set()
+        # Guards the few cross-thread shared writers (pre-brief JSON file,
+        # accuracy tracker) between the scan worker thread and the event loop.
+        self._shared_state_lock = threading.Lock()
 
     async def _safe_task(self, task_name: str, coro):
         try:
@@ -209,15 +225,288 @@ class ArthaScheduler:
     def _record_pre_brief_event(self, ticker: str, event_type: str, severity: str, summary: str, source: str) -> None:
         try:
             from .pre_brief import PreBrief
-            PreBrief().record_event(
-                ticker=ticker,
-                event_type=event_type,
-                severity=severity,
-                summary=summary[:200],
-                source=source,
-            )
+            with self._shared_state_lock:
+                PreBrief().record_event(
+                    ticker=ticker,
+                    event_type=event_type,
+                    severity=severity,
+                    summary=summary[:200],
+                    source=source,
+                )
         except Exception as pb_e:
             logger.debug("[pre_brief] Record failed for %s/%s: %s", ticker, event_type, pb_e)
+
+    # ------------------------------------------------------------------
+    # Mechanical regime gate helpers (Wave 2)
+    # ------------------------------------------------------------------
+
+    def _current_regime_state(self) -> str:
+        """Read the mechanical regime gate state for sell/entry comparisons.
+
+        Prefers the cached data/regime_gate.json; falls back to a fresh
+        compute (which also persists data/regime_state.json for the sell
+        engine). Never raises.
+        """
+        try:
+            from .regime_gate import compute_regime, load_cached_regime
+
+            cached = load_cached_regime()
+            if cached and cached.get("state"):
+                return str(cached["state"])
+            return str(compute_regime().get("state") or "RISK_ON")
+        except Exception as exc:
+            logger.warning("[regime_gate] Could not resolve regime state: %s", exc)
+            return "unknown"
+
+    def _ensure_regime_state_files(self) -> None:
+        """Guarantee data/regime_gate.json + data/regime_state.json exist and
+        are current after a scan. compute_regime() is date-cached, so this is
+        cheap when the gate already ran today; regime_gate persists both files
+        itself, so there is no double-write."""
+        try:
+            from .regime_gate import REGIME_STATE_PATH, compute_regime
+
+            compute_regime()
+            if not REGIME_STATE_PATH.exists():
+                compute_regime(force_refresh=True)
+        except Exception as exc:
+            logger.warning("[regime_gate] Could not ensure regime state files: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Pending EXIT confirmation (restart-safe, trading-day counted)
+    # ------------------------------------------------------------------
+
+    def _et_trading_date(self) -> str:
+        return _utcnow().astimezone(self.et_tz).date().isoformat()
+
+    def _count_pending_exit_signal(
+        self,
+        journal: DecisionJournal,
+        thesis: Any,
+        score: float | None,
+    ) -> dict[str, Any]:
+        """Count one trading day toward EXIT confirmation for a thesis.
+
+        Persists to sqlite so restarts never reset the clock. At most one
+        counting event per trading day, so the 10:30/14:00/close reviews
+        cannot triple-count a single session.
+        """
+        today = self._et_trading_date()
+        row = journal.get_pending_exit_confirmation(str(thesis.thesis_id))
+        if not row:
+            journal.upsert_pending_exit_confirmation(
+                {
+                    "thesis_id": str(thesis.thesis_id),
+                    "ticker": str(getattr(thesis, "ticker", "") or ""),
+                    "first_signal_at": _utcnow().isoformat(),
+                    "last_score": score,
+                    "days_confirmed": 1,
+                    "last_counted_date": today,
+                    "notes": "EXIT confirmation day 1.",
+                }
+            )
+            days = 1
+            counted = True
+        else:
+            days = max(0, int(row.get("days_confirmed") or 0))
+            counted = str(row.get("last_counted_date") or "") != today
+            if counted:
+                days += 1
+            journal.upsert_pending_exit_confirmation(
+                {
+                    "thesis_id": str(thesis.thesis_id),
+                    "ticker": str(getattr(thesis, "ticker", "") or row.get("ticker") or ""),
+                    "first_signal_at": row.get("first_signal_at") or _utcnow().isoformat(),
+                    "last_score": score,
+                    "days_confirmed": days,
+                    "last_counted_date": today,
+                    "notes": f"EXIT confirmation day {days}.",
+                }
+            )
+        confirmed = days >= int(Config.SELL_CONFIRMATION_DAYS)
+        if confirmed:
+            journal.delete_pending_exit_confirmation(str(thesis.thesis_id))
+        return {"days_confirmed": days, "counted_today": counted, "confirmed": confirmed}
+
+    def _decay_pending_exit_signal(
+        self,
+        journal: DecisionJournal,
+        thesis_id: str,
+        action: str,
+    ) -> None:
+        """Score hysteresis: one below-threshold day decrements instead of discarding."""
+        row = journal.get_pending_exit_confirmation(str(thesis_id))
+        if not row:
+            return
+        today = self._et_trading_date()
+        if str(row.get("last_counted_date") or "") == today:
+            # Already counted (up or down) this session; keep the state stable.
+            return
+        days = max(0, int(row.get("days_confirmed") or 0)) - 1
+        if days <= 0:
+            journal.delete_pending_exit_confirmation(str(thesis_id))
+            logger.info(
+                "[periodic_review] EXIT confirmation for thesis %s decayed to 0 (action=%s); row dropped",
+                thesis_id,
+                action,
+            )
+            return
+        journal.upsert_pending_exit_confirmation(
+            {
+                "thesis_id": str(thesis_id),
+                "ticker": str(row.get("ticker") or ""),
+                "first_signal_at": row.get("first_signal_at") or _utcnow().isoformat(),
+                "last_score": row.get("last_score"),
+                "days_confirmed": days,
+                "last_counted_date": today,
+                "notes": f"Below-threshold day ({action}); decremented to {days}.",
+            }
+        )
+        logger.info(
+            "[periodic_review] EXIT confirmation for thesis %s decremented to %d (action=%s)",
+            thesis_id,
+            days,
+            action,
+        )
+
+    # Trade-action statuses that mean a queued sell can never be drained
+    # (nothing in the runner or drain path ever resets them).
+    _DEAD_TRADE_ACTION_STATUSES = frozenset({"blocked", "review_blocked", "expired", "skipped"})
+    # Statuses that mean an order reached (or may be reaching) the broker —
+    # never auto-retry these.
+    _SETTLED_TRADE_ACTION_STATUSES = frozenset({"filled", "place_requested"})
+
+    @staticmethod
+    def _trade_action_is_confirmed_exit(row: dict[str, Any]) -> bool:
+        try:
+            payload = row.get("payload_json")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            evidence = ((payload or {}).get("intent") or {}).get("evidence") or {}
+            return bool(evidence.get("confirmed_exit"))
+        except Exception:
+            return False
+
+    async def _run_pending_exit_watchdog(self) -> None:
+        """Recover exits whose queued auto-sell died AFTER queueing.
+
+        A pending_exit thesis drops out of get_due_reviews, and blocked /
+        review_blocked / expired / skipped auto_sell actions are terminal —
+        so a drift-blocked or token-expired unattended sell silently orphans
+        a decided exit with real money still deployed. Revert such theses to
+        active (immediately due for review), re-seed the EXIT confirmation
+        row for council-confirmed exits so the next review slot re-confirms
+        without restarting the clock, and alert the operator.
+        """
+        try:
+            journal = self.sell_engine.journal
+            tracker = self.sell_engine.tracker
+            pending = [t for t in tracker.get_all_monitored() if t.status == "pending_exit"]
+            if not pending:
+                return
+            from .robinhood_bridge import _snapshot_held_quantity_for_ticker, _trade_action_expired
+
+            actions = journal.get_trade_actions(limit=300)
+            snapshot = self._load_robinhood_position_snapshot()
+            for thesis in pending:
+                if snapshot.get("fresh"):
+                    held = _snapshot_held_quantity_for_ticker(snapshot, thesis.ticker)
+                    if held <= 0.000001:
+                        tracker.archive_thesis(
+                            thesis.thesis_id,
+                            exit_reason="Broker snapshot confirms the pending exit is fully closed.",
+                        )
+                        continue
+                thesis_actions = [
+                    a for a in actions
+                    if str(a.get("thesis_id") or "") == str(thesis.thesis_id)
+                    and str(a.get("action_type") or "").lower() == "auto_sell"
+                ]
+                if not thesis_actions:
+                    revived = tracker.reactivate_for_retry(
+                        thesis.thesis_id,
+                        notes="Pending exit had no unattended auto-sell action; reactivated for fresh Sell Council review.",
+                    )
+                    if revived:
+                        logger.warning("[exit_watchdog] %s had no auto-sell action; reactivated", thesis.ticker)
+                    continue
+                dead: list[dict[str, Any]] = []
+                has_live = False
+                for row in thesis_actions:
+                    status = str(row.get("status") or "").lower()
+                    if status in {
+                        "review_ready", "review_clear", "review_requested",
+                        "auto_review_requested", "reviewed", "place_requested",
+                        "submitted", "partially_filled",
+                    } and not _trade_action_expired(row):
+                        has_live = True
+                        break
+                    if status == "superseded":
+                        continue
+                    if status in self._DEAD_TRADE_ACTION_STATUSES or _trade_action_expired(row):
+                        dead.append(row)
+                        continue
+                    dead.append(row)
+                if has_live:
+                    continue
+
+                latest_dead = dead[0] if dead else thesis_actions[0]
+                revived = tracker.reactivate_for_retry(
+                    thesis.thesis_id,
+                    notes=(
+                        f"Queued auto-sell died without placing "
+                        f"(action {latest_dead.get('action_id')} status="
+                        f"{latest_dead.get('status')}); reactivated so the exit is retried."
+                    ),
+                )
+                if not revived:
+                    continue
+                if any(self._trade_action_is_confirmed_exit(row) for row in dead):
+                    # Council-confirmed exit: re-seed the confirmation row so
+                    # the next review slot re-confirms immediately instead of
+                    # restarting the multi-day clock. (Stop-triggered exits
+                    # re-fire on their own at every 30-min price check.)
+                    journal.upsert_pending_exit_confirmation(
+                        {
+                            "thesis_id": str(thesis.thesis_id),
+                            "ticker": str(thesis.ticker or ""),
+                            "first_signal_at": _utcnow().isoformat(),
+                            "last_score": None,
+                            "days_confirmed": int(Config.SELL_CONFIRMATION_DAYS),
+                            "last_counted_date": self._et_trading_date(),
+                            "notes": "Re-seeded by pending-exit watchdog after dead auto-sell action.",
+                        }
+                    )
+                logger.warning(
+                    "[exit_watchdog] Orphaned exit recovered: %s thesis=%s dead auto-sell "
+                    "action=%s status=%s — thesis reactivated for retry",
+                    thesis.ticker,
+                    str(thesis.thesis_id)[:8],
+                    latest_dead.get("action_id"),
+                    latest_dead.get("status"),
+                )
+                if self.telegram.enabled:
+                    self.telegram.send_alert(
+                        f"⚠️ ORPHANED EXIT RECOVERED — {thesis.ticker}\n\n"
+                        f"The queued unattended sell died without placing "
+                        f"(status: {latest_dead.get('status')}). The thesis was "
+                        "reactivated and the exit will be re-queued at the next "
+                        "review cycle. Consider selling manually if urgent."
+                    )
+        except Exception as e:
+            logger.exception("[exit_watchdog] Unexpected error: %s", e)
+
+    def _should_run_pending_exit_watchdog(self, now_utc: datetime) -> bool:
+        """Sweep for orphaned pending_exit theses once per 30-min bucket."""
+        now_utc = _ensure_utc(now_utc)
+        ct = now_utc.astimezone(self.ct_tz)
+        minute_bucket = (ct.minute // 30) * 30
+        slot = ct.replace(minute=minute_bucket, second=0, microsecond=0).astimezone(timezone.utc)
+        last = self._last_run.get("pending_exit_watchdog")
+        if last and last == slot:
+            return False
+        self._mark_run_slot("pending_exit_watchdog", slot)
+        return True
 
     @staticmethod
     def _as_float(value: Any) -> float | None:
@@ -322,6 +611,191 @@ class ArthaScheduler:
             return max(0.0, (_utcnow() - dt.astimezone(timezone.utc)).total_seconds() / 3600)
         except Exception:
             return None
+
+    _RUN_SLOTS_FILE = Path(__file__).resolve().parent.parent / "data" / "scheduler_run_slots.json"
+    _BUY_SCAN_CAPACITY_STATE_FILE = (
+        Path(__file__).resolve().parent.parent / "data" / "robinhood" / "buy_scan_capacity_state.json"
+    )
+
+    def _load_run_slots(self) -> dict[str, datetime]:
+        """Reload schedule slots so a mid-window daemon restart cannot re-run
+        an already-completed scheduled action (scan, movers pass, nightly
+        review) and queue duplicate councils/auto-buys."""
+        slots: dict[str, datetime] = {}
+        try:
+            payload = json.loads(self._RUN_SLOTS_FILE.read_text(encoding="utf-8"))
+            for key, value in (payload or {}).items():
+                try:
+                    parsed = datetime.fromisoformat(str(value))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    slots[str(key)] = parsed
+                except Exception:
+                    continue
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("[scheduler] could not load run slots: %s", exc)
+        return slots
+
+    def _mark_run_slot(self, key: str, slot: datetime) -> None:
+        self._last_run[key] = slot
+        try:
+            payload = {k: v.isoformat() for k, v in self._last_run.items()}
+            self._RUN_SLOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._RUN_SLOTS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
+            tmp.replace(self._RUN_SLOTS_FILE)
+        except Exception as exc:
+            logger.warning("[scheduler] could not persist run slots: %s", exc)
+
+    def _load_buy_scan_capacity_state(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self._BUY_SCAN_CAPACITY_STATE_FILE.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.warning("[buy_scan_capacity] could not load state: %s", exc)
+            return {}
+
+    def _save_buy_scan_capacity_state(self, payload: dict[str, Any]) -> None:
+        try:
+            path = self._BUY_SCAN_CAPACITY_STATE_FILE
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.warning("[buy_scan_capacity] could not persist state: %s", exc)
+
+    def _broker_buy_scan_capacity(self, now: datetime | None = None) -> dict[str, Any]:
+        from .broker_capacity import load_broker_capacity
+
+        return load_broker_capacity(now=now or _utcnow())
+
+    def _pause_scheduled_buy_scan_for_capacity(
+        self,
+        capacity: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        moment = _ensure_utc(now or _utcnow())
+        scan_date = moment.astimezone(self.ct_tz).date().isoformat()
+        previous = self._load_buy_scan_capacity_state()
+        payload = {
+            "status": "paused",
+            "scan_date_ct": scan_date,
+            "catchup_pending": True,
+            "updated_at": moment.isoformat(),
+            "total_account_value": capacity.get("total_account_value"),
+            "invested_value": capacity.get("invested_value"),
+            "invested_pct": capacity.get("invested_pct"),
+            "buying_power": capacity.get("buying_power"),
+            "exposure_headroom": capacity.get("exposure_headroom"),
+            "deployable_amount": capacity.get("deployable_amount"),
+            "reasons": capacity.get("reasons") or [],
+        }
+        self._save_buy_scan_capacity_state(payload)
+        if previous.get("status") == "paused" and previous.get("scan_date_ct") == scan_date:
+            return
+        reasons = "; ".join(str(reason) for reason in capacity.get("reasons") or [])
+        invested_pct = capacity.get("invested_pct")
+        invested_text = f"{float(invested_pct):.1%}" if invested_pct is not None else "unavailable"
+        message = (
+            "ARTHA BUY SCAN PAUSED\n"
+            "---------------------\n"
+            f"Invested exposure: {invested_text} (limit {Config.MAX_INVESTED_PCT:.0%})\n"
+            f"Buy capacity now: ${float(capacity.get('deployable_amount') or 0.0):.2f}; "
+            f"minimum useful amount: ${Config.SCAN_MIN_DEPLOYABLE_FOR_BUY_COUNCIL:.2f}\n"
+            + (f"Broker reason: {reasons}\n" if reasons else "")
+            + "The expensive buy funnel/Council scan is paused. Held-position monitoring, Sell Council, "
+            "and automatic sells remain active. If a sale reopens capacity during today's catch-up window, "
+            "Artha will start one buy scan automatically."
+        )
+        if self.telegram.enabled:
+            self.telegram.send_health_check(message)
+
+    def _mark_buy_scan_capacity_ready(
+        self,
+        capacity: dict[str, Any],
+        *,
+        status: str,
+        now: datetime | None = None,
+    ) -> None:
+        moment = _ensure_utc(now or _utcnow())
+        self._save_buy_scan_capacity_state(
+            {
+                "status": status,
+                "scan_date_ct": moment.astimezone(self.ct_tz).date().isoformat(),
+                "catchup_pending": False,
+                "updated_at": moment.isoformat(),
+                "total_account_value": capacity.get("total_account_value"),
+                "invested_value": capacity.get("invested_value"),
+                "invested_pct": capacity.get("invested_pct"),
+                "buying_power": capacity.get("buying_power"),
+                "exposure_headroom": capacity.get("exposure_headroom"),
+                "deployable_amount": capacity.get("deployable_amount"),
+                "reasons": capacity.get("reasons") or [],
+            }
+        )
+
+    def _should_run_buy_capacity_catchup(self, now_utc: datetime) -> bool:
+        """Claim one same-day scan after a sell reopens usable buy capacity."""
+        now_utc = _ensure_utc(now_utc)
+        ct = now_utc.astimezone(self.ct_tz)
+        if not self.market_hours._is_trading_day(ct.date()) or not self.market_hours.is_market_open(now_utc):
+            return False
+        target = ct.replace(
+            hour=int(Config.SCHEDULED_SCAN_HOUR_CT),
+            minute=int(Config.SCHEDULED_SCAN_MINUTE_CT),
+            second=0,
+            microsecond=0,
+        )
+        catchup_end = target + timedelta(minutes=max(5, int(Config.SCHEDULED_SCAN_CATCHUP_MINUTES)))
+        if not (target < ct < catchup_end):
+            return False
+        state = self._load_buy_scan_capacity_state()
+        if state.get("scan_date_ct") != ct.date().isoformat() or not state.get("catchup_pending"):
+            return False
+        capacity = self._broker_buy_scan_capacity(now_utc)
+        if not capacity.get("scan_buy_enabled"):
+            return False
+        self._mark_buy_scan_capacity_ready(capacity, status="catchup_claimed", now=now_utc)
+        if self.telegram.enabled:
+            self.telegram.send_health_check(
+                "ARTHA BUY CAPACITY REOPENED\n"
+                "---------------------------\n"
+                f"A fresh Robinhood snapshot shows ${float(capacity.get('deployable_amount') or 0.0):.2f} "
+                "available under the 90% exposure ceiling. Artha is starting today's one-time catch-up "
+                "buy scan now. Sell monitoring remains active."
+            )
+        return True
+
+    @staticmethod
+    def _utc_date_from_iso(value: Any) -> date | None:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).date()
+        except Exception:
+            return None
+
+    def _same_day_executed_buy_for_ticker(self, journal: DecisionJournal, ticker: str) -> dict[str, Any] | None:
+        """Return a same-day real buy so DEFER/WATCH does not queue duplicate adds."""
+        today = _utcnow().date()
+        for row in journal.get_execution_orders(ticker=ticker, limit=50):
+            if str(row.get("side") or "").lower() != "buy":
+                continue
+            if str(row.get("status") or "").lower() not in {"submitted", "filled", "partially_filled"}:
+                continue
+            for key in ("filled_at", "submitted_at", "updated_at", "created_at"):
+                if self._utc_date_from_iso(row.get(key)) == today:
+                    return row
+        return None
 
     def _configured_robinhood_account_record(self) -> dict[str, Any]:
         """Build the allowlisted Agentic account record used for review-only audits."""
@@ -446,11 +920,41 @@ class ArthaScheduler:
         verdict = str(getattr(decision, "final_verdict", "") or "").upper().strip()
         return verdict in set(Config.DEFER_AUTO_REVIEW_BUY_VERDICTS)
 
+    def _limit_price_from_cio_decision(
+        self,
+        decision: Any,
+        current_price: float | None,
+    ) -> float | None:
+        """Limit price from the CIO's machine-readable decision block.
+
+        cio_decision.entry_zone = {low, high, valid_until_iso} | null. When a
+        zone exists, buy at the better of live price and zone top; a null
+        zone with a buy verdict means buy at market (live price).
+        """
+        cio = getattr(decision, "cio_decision", None)
+        if not isinstance(cio, dict) or not cio:
+            return None
+        zone = cio.get("entry_zone")
+        if isinstance(zone, dict):
+            low = self._as_float(zone.get("low"))
+            high = self._as_float(zone.get("high"))
+            if low is not None and high is not None and low > 0 and high > 0:
+                low, high = sorted((low, high))
+                if current_price and current_price > 0:
+                    return round(min(float(current_price), high), 2)
+                return round(high, 2)
+        if current_price and current_price > 0:
+            return round(float(current_price), 2)
+        return None
+
     def _extract_scan_limit_price(
         self,
         decision: Any,
         current_price: float | None,
     ) -> float | None:
+        structured = self._limit_price_from_cio_decision(decision, current_price)
+        if structured is not None:
+            return structured
         text = "\n".join(
             part
             for part in (
@@ -464,12 +968,29 @@ class ArthaScheduler:
             r"limit\s+order[^$\n]{0,160}\$([0-9][0-9,]*(?:\.[0-9]+)?)",
             r"\bat\s*~?\$([0-9][0-9,]*(?:\.[0-9]+)?)",
         )
+        max_deviation = float(Config.SCAN_LIMIT_PRICE_MAX_DEVIATION_PCT)
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 value = self._as_float(match.group(1))
-                if value is not None and value > 0:
-                    return round(value, 2)
+                if value is None or value <= 0:
+                    continue
+                # Bound-check regex scrapes against the live quote: a value
+                # more than 20% away is a target/notional misread (the MLI
+                # class of bug), not an entry limit — reject to entry-watch.
+                if current_price and current_price > 0:
+                    deviation = abs(value - float(current_price)) / float(current_price)
+                    if deviation > max_deviation:
+                        logger.warning(
+                            "[scan] rejected scraped limit $%.2f for %s: %.1f%% from live $%.2f (max %.0f%%)",
+                            value,
+                            str(getattr(decision, "ticker", "") or "?"),
+                            deviation * 100,
+                            float(current_price),
+                            max_deviation * 100,
+                        )
+                        return None
+                return round(value, 2)
         return round(float(current_price), 2) if current_price and current_price > 0 else None
 
     def _fractional_buy_entry_watch_reasons(
@@ -620,6 +1141,75 @@ class ArthaScheduler:
         notional = nav_value * alloc_pct / 100.0
         return round(min(notional, Config.ROBINHOOD_MAX_POSITION_DOLLARS), 2) if notional > 0 else None
 
+    def _attach_buy_trade_action(
+        self,
+        result: dict[str, Any],
+        *,
+        execution_plan: Any | None,
+        journal: DecisionJournal,
+        message: str,
+    ) -> dict[str, Any]:
+        """Queue a buy without exposing approval buttons in live auto-buy mode.
+
+        Auto-buy is fail-closed: an active action exists only when the Execution
+        Officer explicitly passed the automated authorization gates. Review-only
+        buttons remain available solely when auto-buy is intentionally disabled
+        by configuration.
+        """
+        if execution_plan and bool(getattr(execution_plan, "auto_buy_eligible", False)):
+            from .robinhood_bridge import queue_trade_action_from_order_payload
+
+            action = queue_trade_action_from_order_payload(
+                result,
+                action_type="auto_buy",
+                journal=journal,
+                message=message,
+            )
+            result["trade_action"] = action
+            return action
+
+        if not Config.ROBINHOOD_AUTO_BUY_ENABLED:
+            from .robinhood_bridge import queue_trade_action_from_order_payload
+
+            action = queue_trade_action_from_order_payload(
+                result,
+                action_type="buy",
+                journal=journal,
+                message=message,
+            )
+            result["trade_action"] = action
+            return action
+
+        checks = getattr(execution_plan, "checks", {}) if execution_plan else {}
+        failed = []
+        if execution_plan is None:
+            failed.append("Execution Officer plan is unavailable.")
+        else:
+            if not checks.get("auto_buy_verdict_allowed"):
+                failed.append("Council verdict is not authorized for unattended buying.")
+            if not checks.get("auto_buy_score_allowed"):
+                failed.append(
+                    f"Score is below the auto-buy minimum of {Config.ROBINHOOD_AUTO_BUY_MIN_SCORE}."
+                )
+            if not checks.get("auto_buy_confidence_allowed"):
+                failed.append(
+                    "Confidence is below the auto-buy minimum of "
+                    f"{Config.ROBINHOOD_AUTO_BUY_MIN_CONFIDENCE}/10."
+                )
+            if getattr(execution_plan, "execution_verdict", "") != "BUY_READY":
+                failed.append("Execution Officer did not return BUY_READY.")
+        reason = " ".join(failed) or "Execution Officer did not authorize unattended buying."
+        action = {
+            "action_type": "auto_buy",
+            "status": "not_queued",
+            "auto_buy_eligible": False,
+            "reason": reason,
+            "reply_markup": None,
+            "callback_data": {},
+        }
+        result["trade_action"] = action
+        return action
+
     def _prepare_scan_buy_robinhood_review(
         self,
         ticker: str,
@@ -630,6 +1220,11 @@ class ArthaScheduler:
         recommendation_id: int | None = None,
     ) -> dict[str, Any] | None:
         """Prepare an audited Robinhood review request for a same-scan buy-side verdict."""
+        if self._stop_flag.is_set():
+            # Shutdown requested: never queue a NEW real-money buy action that
+            # an external cron would drain after this process is gone.
+            logger.warning("[scan] Stop requested; skipping buy review prep for %s", ticker)
+            return None
         if not Config.SCAN_PREPARE_ROBINHOOD_REVIEW_FOR_BUYS:
             return None
         if not self._is_buy_side_decision(decision):
@@ -645,6 +1240,35 @@ class ArthaScheduler:
         )
         limit_price = self._extract_scan_limit_price(decision, current_price)
         notional = self._scan_buy_notional(decision, nav)
+        if not limit_price and current_price and current_price > 0:
+            # Scraped limit rejected (out of bounds vs live quote): record an
+            # entry watch instead of preparing an order at a bogus price.
+            reasons = [
+                "Scraped limit price failed the live-quote bound check; "
+                "buy idea parked as an entry watch instead of an order."
+            ]
+            watch = self._record_fractional_buy_entry_watch(
+                ticker=ticker,
+                decision=decision,
+                current_price=current_price,
+                journal=journal,
+                reasons=reasons,
+            )
+            logger.info(
+                "[scan] limit_price_rejected_to_entry_watch ticker=%s watch=%s",
+                ticker,
+                (watch or {}).get("watch_id"),
+            )
+            return self._scan_entry_watch_payload(
+                ticker=ticker,
+                decision=decision,
+                notional=notional or 0.0,
+                quantity=0.0,
+                limit_price=current_price,
+                current_price=current_price,
+                reasons=reasons,
+                watch=watch,
+            )
         if not limit_price or notional is None or notional <= 0:
             logger.info(
                 "[scan] robinhood_review_not_prepared ticker=%s reason=missing_limit_or_notional limit=%s notional=%s",
@@ -657,6 +1281,7 @@ class ArthaScheduler:
         quantity = max(notional / limit_price, 0.0)
         market_data = self._defer_auto_review_market_data(quote, stock_data, current_price or limit_price)
         execution_plan = None
+        execution_plan_error = ""
         if Config.EXECUTION_OFFICER_ENABLED:
             try:
                 from .execution_officer import BUY_READY, WHOLE_SHARE_LIMIT, build_execution_officer_plan
@@ -674,8 +1299,9 @@ class ArthaScheduler:
                     quantity = float(execution_plan.quantity or quantity)
                     limit_price = float(execution_plan.limit_price or limit_price)
             except Exception as exc:
-                logger.warning("[scan] execution officer failed for %s; falling back to fractional guardrails: %s", ticker, exc)
+                logger.warning("[scan] execution officer failed for %s; auto-buy will fail closed: %s", ticker, exc)
                 execution_plan = None
+                execution_plan_error = f"Execution Officer failed: {type(exc).__name__}: {exc}"
 
         entry_watch_reasons: list[str] = []
         if execution_plan and getattr(execution_plan, "execution_verdict", "") != "BUY_READY":
@@ -690,6 +1316,10 @@ class ArthaScheduler:
                 for reason in legacy_reasons:
                     if reason not in entry_watch_reasons:
                         entry_watch_reasons.append(reason)
+        elif Config.ROBINHOOD_AUTO_BUY_ENABLED and Config.EXECUTION_OFFICER_ENABLED and not execution_plan:
+            entry_watch_reasons = [
+                execution_plan_error or "Execution Officer plan is unavailable; unattended buy was not authorized."
+            ]
         elif not execution_plan or getattr(execution_plan, "strategy", "") != "WHOLE_SHARE_LIMIT":
             entry_watch_reasons = self._fractional_buy_entry_watch_reasons(
                 quantity=quantity,
@@ -735,7 +1365,7 @@ class ArthaScheduler:
                     f"Same-day scheduled scan buy-side verdict: {getattr(decision, 'final_verdict', '')}. "
                     f"Execution Officer selected {execution_plan.strategy}."
                 ),
-                dry_run=True,
+                dry_run=Config.ROBINHOOD_DRY_RUN_ONLY,
             )
             if intent is None:
                 return None
@@ -749,7 +1379,7 @@ class ArthaScheduler:
                 estimated_price=current_price or limit_price,
                 decision_dossier_path=str(getattr(decision, "dossier_path", "") or ""),
                 rationale=f"Same-day scheduled scan buy-side verdict: {getattr(decision, 'final_verdict', '')}.",
-                dry_run=True,
+                dry_run=Config.ROBINHOOD_DRY_RUN_ONLY,
             )
         intent.recommendation_id = recommendation_id
         intent.evidence = {
@@ -774,11 +1404,9 @@ class ArthaScheduler:
             broker_snapshot=self._load_robinhood_position_snapshot(),
         )
         try:
-            from .robinhood_bridge import queue_trade_action_from_order_payload
-
-            result["trade_action"] = queue_trade_action_from_order_payload(
+            self._attach_buy_trade_action(
                 result,
-                action_type="auto_buy" if execution_plan and execution_plan.auto_buy_eligible else "buy",
+                execution_plan=execution_plan,
                 journal=journal,
                 message=(
                     f"Scheduled scan buy review for {ticker}. "
@@ -812,6 +1440,8 @@ class ArthaScheduler:
             return "", None
         has_auto_buy = any(
             str(((row.get("trade_action") or {}).get("action_type") or "")).lower() == "auto_buy"
+            and str(((row.get("trade_action") or {}).get("status") or "")).lower()
+            in {"review_ready", "review_requested", "auto_review_requested", "review_clear", "reviewed"}
             for row in rows
         )
         if has_auto_buy:
@@ -853,8 +1483,10 @@ class ArthaScheduler:
                 )
             action = row.get("trade_action") or {}
             action_type = str(action.get("action_type") or "").lower()
-            if action_type == "auto_buy":
+            if action_type == "auto_buy" and str(action.get("status") or "").lower() != "not_queued":
                 lines.append("  Auto-buy: no user action required; OpenClaw will place only if every gate stays clean.")
+            elif str(action.get("status") or "").lower() == "not_queued":
+                lines.append(f"  No order queued: {action.get('reason') or 'automated authorization did not pass.'}")
             callbacks = action.get("callback_data") or {}
             if (
                 callbacks
@@ -870,8 +1502,10 @@ class ArthaScheduler:
             lines.append(
                 "No manual buy permission is needed for auto-buy rows. OpenClaw must repeat Robinhood quote, tradability, review, agentic clearance, and final clearance before any real order."
             )
-        else:
+        elif buttons:
             lines.append("No real Robinhood order was placed. Review must run first; a Place button is only generated after a clean Robinhood preview.")
+        else:
+            lines.append("No real order was queued. No user action is required; Artha will wait for a fully authorized automated setup.")
         return "\n".join(lines), ({"inline_keyboard": buttons[:6]} if buttons else None)
 
     def _format_execution_officer_scan_update(
@@ -921,6 +1555,7 @@ class ArthaScheduler:
         watch = review_result.get("entry_watch") or {}
         status = str(broker.get("status") or guardrails.get("status") or "unknown")
         action_type = str(action.get("action_type") or "").lower()
+        action_status = str(action.get("status") or "").lower()
         order_type = str(intent.get("order_type") or "unknown")
         notional = self._as_float(intent.get("notional"))
         quantity = self._as_float(intent.get("quantity"))
@@ -933,7 +1568,11 @@ class ArthaScheduler:
         ]
 
         status_lower = status.lower()
-        if action_type == "auto_buy" and status_lower in {"review_ready", "price_gate_passed", "review_clear", "reviewed"}:
+        if (
+            action_type == "auto_buy"
+            and action_status != "not_queued"
+            and status_lower in {"review_ready", "price_gate_passed", "review_clear", "reviewed"}
+        ):
             execution_verdict = "AUTO-BUY QUEUED"
             robinhood_action = "OpenClaw auto-buy runner will repeat Robinhood quote, tradability, review, final clearance, then place only if still clean."
             next_line = "Next: Watch for an auto-buy success/failure Telegram update."
@@ -942,13 +1581,23 @@ class ArthaScheduler:
             robinhood_action = "Entry watch created; no Robinhood order was placed."
             next_line = "Next: Artha will re-review when the entry/watch conditions are met."
         elif status_lower in {"blocked", "review_blocked"} or str(guardrails.get("status") or "").upper() == "BLOCKED":
-            execution_verdict = "BLOCKED / NO BUY"
-            robinhood_action = "Robinhood review/place was blocked; no real order was placed."
-            next_line = "Next: Wait for a fresh quote/re-review that clears every execution gate."
+            if any("Buy-side paused" in reason for reason in reasons):
+                execution_verdict = "PAUSED FOR TODAY / NO BUY"
+                robinhood_action = "Buys are paused for the rest of today (see Reason below); no real order was placed. Sells and stop-losses remain active."
+                next_line = "Next: Buys auto-resume next trading day; this candidate can re-qualify at tomorrow's scan."
+            else:
+                execution_verdict = "BLOCKED / NO BUY"
+                robinhood_action = "Robinhood review/place was blocked; no real order was placed."
+                next_line = "Next: Wait for a fresh quote/re-review that clears every execution gate."
         elif status_lower in {"review_ready", "price_gate_passed"}:
-            execution_verdict = "REVIEW READY"
-            robinhood_action = "Robinhood review is ready, but no real order has been placed by this message."
-            next_line = "Next: Use the Telegram review/place flow unless auto-buy is explicitly queued."
+            if action_status == "not_queued":
+                execution_verdict = "NOT AUTO-AUTHORIZED / NO BUY"
+                robinhood_action = "The audit preview is clean, but no automated action was authorized and no manual button was created."
+                next_line = "Next: Wait for a fresh setup that passes every automated authorization gate."
+            else:
+                execution_verdict = "REVIEW READY"
+                robinhood_action = "Robinhood review is ready, but no real order has been placed by this message."
+                next_line = "Next: Auto-buy is intentionally disabled; use the configured review-only workflow."
         else:
             execution_verdict = "NO ORDER"
             robinhood_action = "No real Robinhood order was placed."
@@ -971,6 +1620,8 @@ class ArthaScheduler:
             size_bits.append(f"reference ${estimated_price:.2f}")
         if size_bits:
             lines.append("Proposed order: " + " | ".join(size_bits))
+        if not reasons and action_status == "not_queued" and action.get("reason"):
+            reasons = [str(action.get("reason"))]
         if reasons:
             lines.append("Reason: " + "; ".join(reasons[:4]))
         elif action_type == "auto_buy":
@@ -1059,7 +1710,8 @@ class ArthaScheduler:
         price_gate: dict[str, Any],
     ) -> dict[str, Any] | None:
         """Prepare an auditable review row using the prior Artha amount/limit."""
-        from .execution import build_order_intent, prepare_and_record_robinhood_review
+        from .execution import prepare_and_record_robinhood_review
+        from .execution_officer import BUY_READY, build_execution_officer_plan
 
         ticker = str(row.get("ticker") or "").upper().strip()
         notional = self._as_float(row.get("notional"))
@@ -1071,21 +1723,61 @@ class ArthaScheduler:
         quote = stock_data.get("quote") if isinstance(stock_data, dict) else {}
         quote = quote if isinstance(quote, dict) else {}
         market_data = self._defer_auto_review_market_data(quote, stock_data, price or limit_price)
-        intent = build_order_intent(
+        execution_plan = build_execution_officer_plan(
             ticker=ticker,
-            side="buy",
-            notional=notional,
-            quantity=quantity,
-            limit_price=limit_price,
-            estimated_price=price or limit_price,
+            decision=decision,
+            recommended_notional=notional,
+            reference_price=limit_price,
+            current_price=price or limit_price,
+            market_data=market_data,
+        )
+        if execution_plan.execution_verdict != BUY_READY or not execution_plan.auto_buy_eligible:
+            reasons = list(execution_plan.reasons or [])
+            reasons.append("Execution Officer did not authorize unattended buying; no manual action was created.")
+            return {
+                "row_id": None,
+                "intent": {
+                    "ticker": ticker,
+                    "side": "buy",
+                    "notional": notional,
+                    "quantity": quantity,
+                    "limit_price": limit_price,
+                    "estimated_price": price or limit_price,
+                },
+                "guardrails": {"passed": False, "status": "BLOCKED", "reasons": reasons},
+                "broker_result": {
+                    "status": "blocked",
+                    "broker": "robinhood",
+                    "dry_run": True,
+                    "response": {"blocked_reasons": reasons},
+                },
+                "trade_action": {
+                    "action_type": "auto_buy",
+                    "status": "not_queued",
+                    "auto_buy_eligible": False,
+                    "reason": " ".join(reasons[:4]),
+                    "reply_markup": None,
+                    "callback_data": {},
+                },
+            }
+
+        # The old recheck's maximum price remains a hard ceiling even when the
+        # Execution Officer's generic no-chase formula would allow more.
+        if execution_plan.limit_price is not None:
+            execution_plan.limit_price = min(float(execution_plan.limit_price), float(limit_price))
+        if execution_plan.no_chase_cap is not None:
+            execution_plan.no_chase_cap = min(float(execution_plan.no_chase_cap), float(limit_price))
+        intent = execution_plan.build_order_intent(
             decision_dossier_path=str(getattr(decision, "dossier_path", "") or row.get("original_dossier_path") or ""),
             rationale=(
                 f"Market-open recheck {row.get('recheck_id')}; "
                 f"fresh council verdict {getattr(decision, 'final_verdict', '')}; "
                 f"prior Artha price gate ${limit_price:.2f}."
             ),
-            dry_run=True,
+            dry_run=Config.ROBINHOOD_DRY_RUN_ONLY,
         )
+        if intent is None:
+            raise RuntimeError("Execution Officer returned BUY_READY without a valid order intent.")
         intent.evidence = {
             "source": "market_open_recheck",
             "recheck_id": row.get("recheck_id"),
@@ -1096,6 +1788,7 @@ class ArthaScheduler:
                 "Artha audits a limit-style intent here. Robinhood MCP fractional "
                 "orders still require live regular-hours market-dollar review before placement."
             ),
+            "execution_officer": execution_plan.to_dict(),
         }
         result = prepare_and_record_robinhood_review(
             intent,
@@ -1107,13 +1800,11 @@ class ArthaScheduler:
             now=_utcnow(),
         )
         try:
-            from .robinhood_bridge import queue_trade_action_from_order_payload
-
-            result["trade_action"] = queue_trade_action_from_order_payload(
+            self._attach_buy_trade_action(
                 result,
-                action_type="buy",
+                execution_plan=execution_plan,
                 journal=journal,
-                message=f"Market-open recheck buy review for {ticker}.",
+                message=f"Market-open recheck auto-buy review for {ticker}.",
             )
         except Exception as exc:
             logger.warning("[market_open_recheck] trade action queue failed for %s: %s", ticker, exc)
@@ -1148,8 +1839,12 @@ class ArthaScheduler:
                 lines.append(f"  Reason: {result['reason']}")
             action = result.get("trade_action") or {}
             callbacks = action.get("callback_data") or {}
+            action_type = str(action.get("action_type") or "").lower()
+            if action_type == "auto_buy" and str(action.get("status") or "").lower() != "not_queued":
+                lines.append("  Auto-buy queued; no user action is required.")
             if (
                 callbacks
+                and action_type != "auto_buy"
                 and status in {"review_ready", "price_gate_passed"}
                 and str(action.get("status") or "").lower() not in {"blocked", "expired", "skipped"}
             ):
@@ -1159,7 +1854,10 @@ class ArthaScheduler:
                 ])
         lines.append("")
         lines.append("No real Robinhood order was placed by this Telegram message.")
-        lines.append("Buttons are human approval tokens for OpenClaw/Ammu. Review must complete cleanly before any Place button appears.")
+        if buttons:
+            lines.append("Auto-buy is intentionally disabled; review-only buttons are shown for the configured manual workflow.")
+        else:
+            lines.append("No manual permission is required. Queued auto-buys are handled by the unattended execution runner.")
         reply_markup = {"inline_keyboard": buttons[:6]} if buttons else None
         return "\n".join(lines), reply_markup
 
@@ -1289,24 +1987,114 @@ class ArthaScheduler:
         watch_id = str(watch.get("watch_id") or payload.get("watch_id") or "")
         trigger_message = str(payload.get("message") or "")
         severity = str(payload.get("severity") or "INFO")
-        start_note = (
-            f"Auto-review started after trigger at ${price_float:.2f}. "
-            "Collecting fresh stock, macro, market, filings/news-backed council context."
+
+        same_day_buy = self._same_day_executed_buy_for_ticker(journal, ticker)
+        if same_day_buy:
+            note = (
+                f"Auto-review stood down: {ticker} already has same-day buy "
+                f"order row {same_day_buy.get('id')} status={same_day_buy.get('status')}; "
+                "no duplicate/incremental Robinhood review prepared."
+            )
+            journal.update_defer_watch_status(
+                watch_id,
+                "reviewed_no_buy",
+                notes=note,
+                trigger_price=price_float,
+                set_triggered_at=True,
+            )
+            msg = self._defer_auto_review_message(
+                ticker=ticker,
+                verdict="SKIPPED",
+                status="No buy review prepared; Artha already recorded a same-day buy for this ticker.",
+                trigger_message=trigger_message,
+                blocked_reasons=[note],
+            )
+            self._record_pre_brief_event(
+                ticker=ticker,
+                event_type="defer_watch_auto_review_same_day_buy_skipped",
+                severity="INFO",
+                summary=msg,
+                source="defer_watchlist",
+            )
+            logger.info(
+                "[defer_watchlist] auto_review_same_day_buy_skipped ticker=%s watch_id=%s execution_order_row=%s",
+                ticker,
+                watch_id,
+                same_day_buy.get("id"),
+            )
+            if self.telegram.enabled:
+                self.telegram.send_alert(msg)
+            return Alert(
+                ticker=ticker,
+                alert_type="defer_watch_auto_review",
+                severity="INFO",
+                message=msg,
+                metadata={"watch_id": watch_id, "existing_execution_order_row": same_day_buy.get("id")},
+            )
+
+        # SANITY GATE (Wave 2, MLI incident): a live price >30% outside the
+        # saved zone means the zone is structurally stale (split, huge gap).
+        # Mark the watch stale_zone and run a decide-NOW council at market
+        # price instead of a zone-anchored buy review.
+        zone_low = self._as_float(watch.get("zone_low"))
+        zone_high = self._as_float(watch.get("zone_high"))
+        stale_zone = False
+        stale_fraction = max(0.0, float(Config.DEFER_WATCH_STALE_ZONE_PCT)) / 100.0
+        if zone_low and zone_high and zone_low > 0 and zone_high > 0 and price_float > 0:
+            low, high = sorted((zone_low, zone_high))
+            stale_zone = price_float < low * (1 - stale_fraction) or price_float > high * (1 + stale_fraction)
+
+        defer_context = (
+            "PREVIOUSLY-DEFERRED IDEA RE-REVIEW: This is a previously-deferred "
+            "idea whose awaited condition fired. Deferring again requires NEW "
+            "risk evidence, not price anchoring."
         )
-        journal.update_defer_watch_status(
-            watch_id,
-            "triggered_reviewing",
-            notes=start_note,
-            trigger_price=price_float,
-            set_triggered_at=True,
-        )
+        if stale_zone:
+            defer_context += (
+                f"\nSTALE ZONE ALERT: the saved entry zone "
+                f"${min(zone_low, zone_high):,.2f}-${max(zone_low, zone_high):,.2f} is more than "
+                f"{Config.DEFER_WATCH_STALE_ZONE_PCT:.0f}% away from the live price ${price_float:,.2f} "
+                "(likely a split or structural repricing). Zone unreachable — decide NOW at market "
+                "price. The old zone numbers are void; do not treat them as an entry or a discount."
+            )
+            journal.update_defer_watch_status(
+                watch_id,
+                "stale_zone",
+                notes=(
+                    f"Zone ${zone_low}-${zone_high} is >{Config.DEFER_WATCH_STALE_ZONE_PCT:.0f}% from "
+                    f"live ${price_float:.2f}; marked stale and escalated to a decide-now council."
+                ),
+                trigger_price=price_float,
+                set_triggered_at=True,
+            )
+            logger.warning(
+                "[defer_watchlist] stale_zone ticker=%s watch_id=%s price=%.2f zone=%s-%s",
+                ticker,
+                watch_id,
+                price_float,
+                watch.get("zone_low"),
+                watch.get("zone_high"),
+            )
+        else:
+            start_note = (
+                f"Auto-review started after trigger at ${price_float:.2f}. "
+                "Collecting fresh stock, macro, market, filings/news-backed council context."
+            )
+            journal.update_defer_watch_status(
+                watch_id,
+                "triggered_reviewing",
+                notes=start_note,
+                trigger_price=price_float,
+                set_triggered_at=True,
+            )
         logger.info(
-            "[defer_watchlist] auto_review_start ticker=%s watch_id=%s price=%.2f zone=%s-%s",
+            "[defer_watchlist] auto_review_start ticker=%s watch_id=%s price=%.2f zone=%s-%s stale_zone=%s",
             ticker,
             watch_id,
             price_float,
             watch.get("zone_low"),
             watch.get("zone_high"),
+            stale_zone,
         )
 
         try:
@@ -1323,7 +2111,7 @@ class ArthaScheduler:
             logger.info("[defer_watchlist] auto_review_stock_collected ticker=%s keys=%d", ticker, len(stock_data))
         except Exception as data_err:
             note = f"Auto-review failed during fresh stock collection: {type(data_err).__name__}: {data_err}"
-            journal.update_defer_watch_status(watch_id, "review_failed", notes=note)
+            journal.mark_defer_watch_review_failed(watch_id, note)
             logger.exception("[defer_watchlist] auto_review_stock_failed ticker=%s watch_id=%s", ticker, watch_id)
             msg = self._defer_auto_review_message(
                 ticker=ticker,
@@ -1351,10 +2139,15 @@ class ArthaScheduler:
             logger.warning("[defer_watchlist] auto_review_market_failed ticker=%s: %s", ticker, market_err)
 
         try:
-            decision = self.council.analyze_stock(stock_data, macro_data, market_snapshot)
+            decision = self.council.analyze_stock(
+                stock_data,
+                macro_data,
+                market_snapshot,
+                regime_context=defer_context,
+            )
         except Exception as council_err:
             note = f"Auto-review failed during council analysis: {type(council_err).__name__}: {council_err}"
-            journal.update_defer_watch_status(watch_id, "review_failed", notes=note)
+            journal.mark_defer_watch_review_failed(watch_id, note)
             logger.exception("[defer_watchlist] auto_review_council_failed ticker=%s watch_id=%s", ticker, watch_id)
             msg = self._defer_auto_review_message(
                 ticker=ticker,
@@ -1369,7 +2162,7 @@ class ArthaScheduler:
 
         if decision is None:
             note = "Auto-review failed because council returned no decision."
-            journal.update_defer_watch_status(watch_id, "review_failed", notes=note)
+            journal.mark_defer_watch_review_failed(watch_id, note)
             logger.warning("[defer_watchlist] auto_review_no_decision ticker=%s watch_id=%s", ticker, watch_id)
             msg = self._defer_auto_review_message(
                 ticker=ticker,
@@ -1432,7 +2225,8 @@ class ArthaScheduler:
             return Alert(ticker=ticker, alert_type="defer_watch_auto_review", severity="INFO", message=msg, metadata={"watch_id": watch_id})
 
         try:
-            from .execution import build_order_intent, prepare_and_record_robinhood_review
+            from .execution import prepare_and_record_robinhood_review
+            from .execution_officer import BUY_READY, build_execution_officer_plan
 
             limit_price = round(price_float, 2)
             notional = self._scan_buy_notional(decision, Config.MONTHLY_BUDGET) or min(
@@ -1441,22 +2235,63 @@ class ArthaScheduler:
             )
             quantity = max(notional / limit_price, 0.0)
             market_data = self._defer_auto_review_market_data(quote, stock_data, price_float)
-            intent = build_order_intent(
+            execution_plan = build_execution_officer_plan(
                 ticker=ticker,
-                side="buy",
-                notional=notional,
-                quantity=quantity,
-                limit_price=limit_price,
-                estimated_price=price_float,
+                decision=decision,
+                recommended_notional=notional,
+                reference_price=limit_price,
+                current_price=price_float,
+                market_data=market_data,
+            )
+            if execution_plan.execution_verdict != BUY_READY or not execution_plan.auto_buy_eligible:
+                plan_reasons = list(execution_plan.reasons or [])
+                checks = execution_plan.checks or {}
+                if not execution_plan.auto_buy_eligible:
+                    if not checks.get("auto_buy_score_allowed"):
+                        plan_reasons.append(
+                            f"Score is below the auto-buy minimum of {Config.ROBINHOOD_AUTO_BUY_MIN_SCORE}."
+                        )
+                    if not checks.get("auto_buy_confidence_allowed"):
+                        plan_reasons.append(
+                            "Confidence is below the auto-buy minimum of "
+                            f"{Config.ROBINHOOD_AUTO_BUY_MIN_CONFIDENCE}/10."
+                        )
+                    if not checks.get("auto_buy_verdict_allowed"):
+                        plan_reasons.append("Council verdict is not authorized for unattended buying.")
+                plan_reasons = list(dict.fromkeys(reason for reason in plan_reasons if reason))
+                note = completion_note + "; Execution Officer did not authorize auto-buy: " + " | ".join(plan_reasons[:5])
+                journal.update_defer_watch_status(watch_id, "review_blocked", notes=note)
+                msg = self._defer_auto_review_message(
+                    ticker=ticker,
+                    verdict=verdict,
+                    status="Execution Officer did not authorize an automatic buy; no manual review button was created.",
+                    trigger_message=trigger_message,
+                    decision=decision,
+                    blocked_reasons=plan_reasons,
+                )
+                if self.telegram.enabled:
+                    self.telegram.send_alert(msg)
+                return Alert(
+                    ticker=ticker,
+                    alert_type="defer_watch_auto_review",
+                    severity="INFO",
+                    message=msg,
+                    metadata={"watch_id": watch_id, "execution_officer": execution_plan.to_dict()},
+                )
+
+            intent = execution_plan.build_order_intent(
                 decision_dossier_path=dossier_path,
                 rationale=f"Triggered DEFER watch {watch_id}; fresh council verdict {verdict}.",
-                dry_run=True,
+                dry_run=Config.ROBINHOOD_DRY_RUN_ONLY,
             )
+            if intent is None:
+                raise RuntimeError("Execution Officer returned BUY_READY without a valid order intent.")
             intent.evidence = {
                 "defer_watch_id": watch_id,
                 "trigger_payload": payload,
                 "fresh_verdict": verdict,
                 "dossier_path": dossier_path,
+                "execution_officer": execution_plan.to_dict(),
             }
             order_result = prepare_and_record_robinhood_review(
                 intent,
@@ -1468,13 +2303,11 @@ class ArthaScheduler:
                 now=_utcnow(),
             )
             try:
-                from .robinhood_bridge import queue_trade_action_from_order_payload
-
-                order_result["trade_action"] = queue_trade_action_from_order_payload(
+                self._attach_buy_trade_action(
                     order_result,
-                    action_type="buy",
+                    execution_plan=execution_plan,
                     journal=journal,
-                    message=f"Triggered DEFER watch buy review for {ticker}.",
+                    message=f"Triggered DEFER watch auto-buy review for {ticker}.",
                 )
             except Exception as action_err:
                 logger.warning("[defer_watchlist] trade action queue failed for %s: %s", ticker, action_err)
@@ -1482,7 +2315,7 @@ class ArthaScheduler:
             guardrails = order_result.get("guardrails") or {}
             blocked_reasons = list((broker.get("response") or {}).get("blocked_reasons") or guardrails.get("reasons") or [])
             broker_status = str(broker.get("status") or "")
-            watch_status = "review_ready" if broker_status == "review_ready" else "review_blocked"
+            watch_status = "auto_buy_queued" if broker_status == "review_ready" else "review_blocked"
             order_note = (
                 f"{completion_note}; Robinhood review status={broker_status}; "
                 f"guardrails={guardrails.get('status')}; execution_order_row={order_result.get('row_id')}"
@@ -1494,8 +2327,8 @@ class ArthaScheduler:
                 ticker=ticker,
                 verdict=verdict,
                 status=(
-                    "Robinhood review request prepared; no order placed."
-                    if watch_status == "review_ready"
+                    "Automatic buy queued; no user review or buy button is required."
+                    if watch_status == "auto_buy_queued"
                     else "Buy-side verdict, but Robinhood review was blocked by guardrails."
                 ),
                 trigger_message=trigger_message,
@@ -1506,7 +2339,7 @@ class ArthaScheduler:
             self._record_pre_brief_event(
                 ticker=ticker,
                 event_type=f"defer_watch_auto_review_{watch_status}",
-                severity="INFO" if watch_status == "review_ready" else "WARNING",
+                severity="INFO" if watch_status == "auto_buy_queued" else "WARNING",
                 summary=msg,
                 source="defer_watchlist",
             )
@@ -1527,13 +2360,13 @@ class ArthaScheduler:
             return Alert(
                 ticker=ticker,
                 alert_type="defer_watch_auto_review",
-                severity="INFO" if watch_status == "review_ready" else "WARNING",
+                severity="INFO" if watch_status == "auto_buy_queued" else "WARNING",
                 message=msg,
                 metadata={"watch_id": watch_id, "execution_order_row": order_result.get("row_id")},
             )
         except Exception as review_err:
             note = f"Auto-review failed during Robinhood review preparation: {type(review_err).__name__}: {review_err}"
-            journal.update_defer_watch_status(watch_id, "review_failed", notes=completion_note + "; " + note)
+            journal.mark_defer_watch_review_failed(watch_id, completion_note + "; " + note)
             logger.exception("[defer_watchlist] auto_review_robinhood_failed ticker=%s watch_id=%s", ticker, watch_id)
             msg = self._defer_auto_review_message(
                 ticker=ticker,
@@ -1587,6 +2420,15 @@ class ArthaScheduler:
         lines.append("These were batched to keep Telegram quiet. Urgent exit alerts still come immediately.")
         return "\n".join(lines)
 
+    # Stop-driven sell triggers that qualify for the unattended auto_sell queue.
+    _AUTO_SELL_TRIGGER_TYPES = {
+        "trailing_stop",
+        "hard_stop",
+        "time_stop",
+        "dead_money_time_stop",
+        "urgent_exit",
+    }
+
     def _prepare_robinhood_sell_review(
         self,
         thesis: Any,
@@ -1597,12 +2439,29 @@ class ArthaScheduler:
         trim_pct: float | None = None,
         signal_id: str | None = None,
         reason: str = "",
+        confirmed_exit: bool = False,
+        sell_decision: Any | None = None,
     ) -> dict[str, Any] | None:
-        """Prepare an audited Robinhood review-only sell order for EXIT/TRIM actions."""
+        """Queue a Sell-Council-approved order for unattended broker clearance."""
         if not Config.SELL_PREPARE_ROBINHOOD_REVIEW:
             return None
         ticker = str(getattr(thesis, "ticker", "") or "").upper().strip()
         thesis_id = str(getattr(thesis, "thesis_id", "") or "")
+        decision_action = str(getattr(sell_decision, "action", "") or "").upper().strip()
+        decision_session_id = str(getattr(sell_decision, "session_id", "") or "")
+        decision_dossier = str(getattr(sell_decision, "dossier_path", "") or "")
+        if (
+            sell_decision is None
+            or decision_action not in {"TRIM", "EXIT", "URGENT_EXIT"}
+            or decision_action != str(action or "").upper().strip()
+            or not decision_session_id
+            or not decision_dossier
+        ):
+            logger.warning(
+                "[sell_review] refusing %s sell queue without a matching persisted Sell Council decision",
+                ticker or "?",
+            )
+            return None
         if not ticker or current_price <= 0:
             return None
         try:
@@ -1621,6 +2480,34 @@ class ArthaScheduler:
             if quantity <= 0:
                 return None
 
+            # Queue-time dedupe: one in-flight sell per ticker. Stop signals
+            # re-emit every 30-min tick; without this a breached position
+            # queues a duplicate full-quantity auto_sell each tick and starves
+            # other exits from the runner's bounded per-turn budget.
+            from .robinhood_bridge import _trade_action_expired
+
+            in_flight_statuses = {
+                "review_ready", "review_requested", "auto_review_requested",
+                "review_clear", "reviewed", "place_requested", "submitted",
+                "partially_filled",
+            }
+            try:
+                for row in journal.get_trade_actions(limit=100):
+                    if (
+                        str(row.get("side") or "").lower() == "sell"
+                        and str(row.get("ticker") or "").upper() == ticker
+                        and str(row.get("status") or "").lower() in in_flight_statuses
+                        and not _trade_action_expired(row)
+                    ):
+                        logger.info(
+                            "[sell_review] in-flight sell already queued for %s "
+                            "(action %s, status %s); skipping duplicate",
+                            ticker, row.get("action_id"), row.get("status"),
+                        )
+                        return None
+            except Exception as dedupe_exc:
+                logger.warning("[sell_review] sell dedupe check failed: %s", dedupe_exc)
+
             from .execution import build_order_intent, prepare_and_record_robinhood_review
 
             limit_price = round(float(current_price), 2)
@@ -1631,18 +2518,31 @@ class ArthaScheduler:
                 notional=round(quantity * limit_price, 2),
                 limit_price=limit_price,
                 estimated_price=limit_price,
-                decision_dossier_path=str(getattr(thesis, "council_session_id", "") or ""),
+                decision_dossier_path=decision_dossier,
                 rationale=f"{trigger_type} sell-side {action_norm}: {reason[:500]}",
-                dry_run=True,
+                dry_run=Config.ROBINHOOD_DRY_RUN_ONLY,
             )
+            trigger_norm = str(trigger_type or "").lower().strip()
+            unattended = bool(Config.ROBINHOOD_AUTO_SELL_ENABLED)
             intent.thesis_id = thesis_id
             intent.evidence = {
                 "source": "sell_monitor",
-                "trigger_type": trigger_type,
+                "trigger_type": trigger_norm,
                 "action": action_norm,
                 "thesis_id": thesis_id,
                 "signal_id": signal_id,
+                "confirmed_exit": bool(confirmed_exit),
                 "reason": reason[:1200],
+                "dossier_path": decision_dossier,
+                "sell_council": {
+                    "confirmed": True,
+                    "action": decision_action,
+                    "sell_score": float(getattr(sell_decision, "sell_score", 0) or 0),
+                    "confidence": int(getattr(sell_decision, "confidence", 0) or 0),
+                    "session_id": decision_session_id,
+                    "dossier_path": decision_dossier,
+                    "trigger_type": str(getattr(sell_decision, "trigger_type", trigger_norm) or trigger_norm),
+                },
             }
             market_data = {
                 "price": limit_price,
@@ -1650,6 +2550,10 @@ class ArthaScheduler:
                 "volume": None,
                 "dollar_volume": None,
             }
+            # Only pass a FRESH snapshot: sell reviews must still queue when the
+            # snapshot is momentarily stale (the drain-time auto-sell gate
+            # re-validates against the refreshed snapshot before any place).
+            broker_snapshot = self._load_robinhood_position_snapshot()
             result = prepare_and_record_robinhood_review(
                 intent,
                 self._configured_robinhood_account_record(),
@@ -1658,24 +2562,32 @@ class ArthaScheduler:
                 send_telegram=False,
                 sender=self.telegram,
                 now=_utcnow(),
+                broker_snapshot=broker_snapshot if broker_snapshot.get("fresh") else None,
             )
             try:
                 from .robinhood_bridge import queue_trade_action_from_order_payload
 
+                action_type = "auto_sell" if unattended else "sell"
                 result["trade_action"] = queue_trade_action_from_order_payload(
                     result,
-                    action_type="trim" if action_norm == "TRIM" else "sell",
+                    action_type=action_type,
                     journal=journal,
-                    message=f"Sell-side {action_norm} review for {ticker}.",
+                    message=(
+                        f"Unattended {trigger_norm or action_norm} auto-sell queued for {ticker}."
+                        if action_type == "auto_sell"
+                        else f"Sell-side {action_norm} review for {ticker}."
+                    ),
                 )
             except Exception as action_err:
                 logger.warning("[sell_review] trade action queue failed for %s: %s", ticker, action_err)
             broker = result.get("broker_result") or {}
             guardrails = result.get("guardrails") or {}
             logger.info(
-                "[sell_review] robinhood_sell_review ticker=%s action=%s status=%s guardrails=%s row=%s qty=%.6f limit=%.2f",
+                "[sell_review] robinhood_sell_review ticker=%s action=%s trigger=%s unattended=%s status=%s guardrails=%s row=%s qty=%.6f limit=%.2f",
                 ticker,
                 action_norm,
+                trigger_norm,
+                unattended,
                 broker.get("status"),
                 guardrails.get("status"),
                 result.get("row_id"),
@@ -1705,6 +2617,78 @@ class ArthaScheduler:
             line += " | blocked: " + "; ".join(str(r) for r in blocked[:3])
         line += "\nNo real Robinhood order was placed."
         return line
+
+    def _apply_sell_council_decision(
+        self,
+        *,
+        sell_council: Any,
+        decision: Any,
+        thesis: Any,
+        stock_data: dict[str, Any],
+        trigger_type: str,
+        signal_id: str | None = None,
+        trigger_reason: str = "",
+        fallback_trim_pct: float | None = None,
+    ) -> dict[str, Any]:
+        """Apply one Sell Council verdict through the common execution path."""
+        action = str(getattr(decision, "action", "HOLD") or "HOLD").upper()
+        current_price = (
+            self._as_float((stock_data.get("quote") or {}).get("price"))
+            or self._as_float((stock_data.get("yf_quote") or {}).get("price"))
+            or float(getattr(thesis, "entry_price", 0) or 0)
+        )
+        trim_pct = self._as_float(getattr(decision, "trim_pct", None))
+        if action == "TRIM" and (trim_pct is None or trim_pct <= 0):
+            trim_pct = self._as_float(fallback_trim_pct) or 0.25
+        review_result = None
+        if action in {"TRIM", "EXIT", "URGENT_EXIT"}:
+            review_result = self._prepare_robinhood_sell_review(
+                thesis=thesis,
+                action=action,
+                current_price=current_price,
+                journal=self.sell_engine.journal,
+                trigger_type=trigger_type,
+                trim_pct=trim_pct,
+                signal_id=signal_id,
+                reason=trigger_reason or f"Sell Council issued {action}.",
+                confirmed_exit=True,
+                sell_decision=decision,
+            )
+
+        message = sell_council.format_sell_telegram(decision, thesis)
+        notice = self._sell_review_notice(review_result)
+        if notice:
+            message = f"{message}\n\n{notice}"
+        delivered = True
+        if message and self.telegram.enabled:
+            delivered = bool(self.telegram.send_message(message[:4000], parse_mode=None))
+
+        trade_action = (review_result or {}).get("trade_action") or {}
+        queue_status = str(trade_action.get("status") or "").lower()
+        queued = (
+            str(trade_action.get("action_type") or "").lower() == "auto_sell"
+            and queue_status in {"review_ready", "review_clear", "review_requested", "auto_review_requested"}
+        )
+        tracker = self.sell_engine.tracker
+        if action in {"EXIT", "URGENT_EXIT"} and queued:
+            tracker.mark_waiting_for_sell(
+                thesis.thesis_id,
+                reason=action,
+                notes=f"Sell Council {getattr(decision, 'session_id', '')} approved unattended {action}.",
+            )
+        else:
+            retry_date = getattr(decision, "next_review_date", None)
+            tracker.update_review_date(thesis.thesis_id, retry_date)
+        if getattr(decision, "health_score", None) is not None:
+            tracker.update_health(thesis.thesis_id, int(decision.health_score))
+        return {
+            "action": action,
+            "review_result": review_result,
+            "trade_action": trade_action,
+            "queued": queued,
+            "telegram_delivered": delivered,
+            "message": message,
+        }
 
     def _rotation_scan_results(self, decisions: list[Any]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -1886,7 +2870,10 @@ class ArthaScheduler:
             portfolio = Portfolio.load(PORTFOLIO_FILE)
             snapshot_problem = snapshot.get("status") in {"MISSING", "WARN"} or not snapshot.get("fresh", False)
             if snapshot_problem and portfolio.positions:
-                logger.warning(
+                should_alert_stale = self._should_alert_on_stale_robinhood_snapshot()
+                # Outside market hours the sync is intentionally paused, so an
+                # aging snapshot is by design — INFO, not a warning marker.
+                (logger.warning if should_alert_stale else logger.info)(
                     "[broker_reconcile] snapshot_not_fresh status=%s warnings=%s positions_in_artha=%d",
                     snapshot.get("status"),
                     snapshot.get("warnings"),
@@ -1894,7 +2881,6 @@ class ArthaScheduler:
                 )
                 warning_key = f"snapshot_not_fresh:{snapshot.get('status')}:{len(portfolio.positions)}"
                 stale_min_minutes = max(1, int(Config.ROBINHOOD_STALE_SNAPSHOT_TELEGRAM_MIN_MINUTES or 30))
-                should_alert_stale = self._should_alert_on_stale_robinhood_snapshot()
                 if self.telegram.enabled and should_alert_stale and self._should_send_broker_warning(warning_key, min_minutes=stale_min_minutes):
                     self.telegram.send_alert(self._snapshot_missing_or_stale_message(snapshot)[:4000])
                 elif not should_alert_stale:
@@ -2288,86 +3274,228 @@ class ArthaScheduler:
             quotes: dict[str, dict] = {}
             for ticker in tickers:
                 try:
-                    q = self.monitor.collector.yf.quote(ticker)
+                    q = await asyncio.to_thread(self.monitor.collector.yf.quote, ticker)
                     if q:
                         quotes[ticker] = q
                 except Exception as q_e:
                     logger.debug("[sell_engine_check] Quote fetch failed for %s: %s", ticker, q_e)
 
-            if not quotes:
+            # Rule 4.7 material-news hook: once-per-day (per ticker, persisted)
+            # Finnhub+LLM news sentiment check for held tickers. Emits
+            # REVIEW_EXIT flags only — it never sells directly. Runs off-loop:
+            # a degraded Gemini/Finnhub call must not stall stop monitoring.
+            news_signals = await asyncio.to_thread(
+                self._run_news_sentiment_review_check, portfolio
+            )
+
+            if not quotes and not news_signals:
                 return
 
-            signals = self.sell_engine.run_price_check_sell_tasks(portfolio, quotes)
+            price_signals = await asyncio.to_thread(
+                self.sell_engine.run_price_check_sell_tasks,
+                portfolio,
+                quotes,
+            ) if quotes else []
+            signals = list(price_signals) + news_signals
             if signals:
-                for signal in signals:
-                    logger.info(
-                        "[sell_engine] Signal type=%s ticker=%s severity=%s",
-                        signal.signal_type, signal.ticker, signal.severity,
-                    )
-                    review_result = None
-                    if signal.severity in {"URGENT", "HIGH"} and (signal.action_recommended or "").upper() in {"EXIT", "SELL", "URGENT_EXIT", "TRIM"}:
-                        thesis = self.sell_engine.tracker.get(signal.thesis_id) if signal.thesis_id else None
-                        quote_price = self._as_float((quotes.get(signal.ticker) or {}).get("price"))
-                        if thesis and quote_price:
-                            review_result = self._prepare_robinhood_sell_review(
-                                thesis=thesis,
-                                action=signal.action_recommended or "EXIT",
-                                current_price=quote_price,
-                                journal=self.sell_engine.journal,
-                                trigger_type=signal.signal_type,
-                                signal_id=signal.signal_id,
-                                reason=signal.message,
-                            )
-                            notice = self._sell_review_notice(review_result)
-                            if notice:
-                                signal.message = f"{signal.message}\n\n{notice}"
+                from .sell_council import SellCouncil
 
-                    cooldown_hours = 12 if signal.severity in {"URGENT", "HIGH"} else 24
+                severity_rank = {"URGENT": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+                grouped: dict[str, list[Any]] = {}
+                for signal in signals:
+                    grouped.setdefault(str(signal.ticker or "").upper(), []).append(signal)
+                sell_council = SellCouncil(journal=self.sell_engine.journal)
+                for ticker, ticker_signals in grouped.items():
+                    ticker_signals.sort(key=lambda s: severity_rank.get(str(s.severity), 9))
+                    primary = ticker_signals[0]
+                    cooldown_hours = {
+                        "URGENT": 0.45,
+                        "HIGH": 4,
+                        "MEDIUM": 12,
+                        "LOW": 24,
+                    }.get(str(primary.severity or "").upper(), 12)
                     alert = Alert(
-                        ticker=signal.ticker,
-                        alert_type=f"sell_engine_{signal.signal_type}",
-                        severity="CRITICAL" if signal.severity == "URGENT" else signal.severity,
-                        message=signal.message[:4000],
+                        ticker=ticker,
+                        alert_type=f"sell_council_trigger_{primary.signal_type}",
+                        severity="CRITICAL" if primary.severity == "URGENT" else primary.severity,
+                        message=primary.message[:4000],
                         metadata={
-                            "signal_id": signal.signal_id,
-                            "thesis_id": signal.thesis_id or "",
-                            "source": signal.source,
-                            "action_recommended": signal.action_recommended or "",
+                            "signal_id": primary.signal_id,
+                            "thesis_id": primary.thesis_id or "",
+                            "source": primary.source,
+                            "action_recommended": primary.action_recommended or "",
                         },
                     )
                     fresh = self.monitor.alert_manager.claim_new_alerts([alert], within_hours=cooldown_hours)
-                    if fresh:
-                        if signal.severity in {"URGENT", "HIGH"}:
-                            if self.telegram.enabled:
-                                self.telegram.send_alert(alert.message)
-                            self.sell_engine.aggregator.mark_actioned(signal.signal_id)
-                            if signal.thesis_id and (signal.action_recommended or "").upper() in {"EXIT", "SELL", "URGENT_EXIT"}:
-                                self.sell_engine.tracker.mark_waiting_for_sell(
-                                    signal.thesis_id,
-                                    reason=signal.action_recommended or "EXIT",
-                                    notes=f"Sell engine issued {signal.signal_type} / {signal.severity} alert.",
-                                )
-                        else:
-                            self._record_pre_brief_event(
-                                ticker=signal.ticker,
-                                event_type=f"sell_engine_{signal.signal_type}",
-                                severity=signal.severity,
-                                summary=signal.message,
-                                source="sell_engine",
+                    if not fresh:
+                        for signal in ticker_signals:
+                            self.sell_engine.aggregator.suppress(
+                                signal.signal_id,
+                                reason=f"Sell Council trigger cooldown active ({cooldown_hours}h)",
                             )
-                            logger.info(
-                                "[sell_engine] Batched non-urgent signal for digest ticker=%s type=%s severity=%s",
-                                signal.ticker,
-                                signal.signal_type,
-                                signal.severity,
-                            )
-                    else:
-                        self.sell_engine.aggregator.suppress(
-                            signal.signal_id,
-                            reason=f"notification cooldown active ({cooldown_hours}h)",
+                        continue
+
+                    thesis = self.sell_engine.tracker.get(primary.thesis_id) if primary.thesis_id else None
+                    if not thesis:
+                        self.monitor.alert_manager.release_alerts([alert])
+                        logger.error("[sell_monitor] No thesis found for %s trigger; review not actioned", ticker)
+                        continue
+                    try:
+                        stock_data = await asyncio.to_thread(self.collector.collect_stock, ticker)
+                        quote_price = self._as_float((quotes.get(ticker) or {}).get("price"))
+                        if quote_price:
+                            quote = dict(stock_data.get("quote") or {})
+                            quote["price"] = quote_price
+                            stock_data["quote"] = quote
+                        stock_data["_sell_trigger"] = {
+                            "primary_type": primary.signal_type,
+                            "severity": primary.severity,
+                            "current_price": quote_price,
+                            "signals": [
+                                {
+                                    "signal_id": signal.signal_id,
+                                    "type": signal.signal_type,
+                                    "severity": signal.severity,
+                                    "recommended_action": signal.action_recommended,
+                                    "trim_pct": signal.trim_pct,
+                                    "message": signal.message,
+                                }
+                                for signal in ticker_signals
+                            ],
+                        }
+                        macro_data = await asyncio.to_thread(self.collector.collect_macro)
+                        decision = await asyncio.to_thread(
+                            sell_council.run_sell_review,
+                            thesis,
+                            stock_data,
+                            macro_data,
+                            primary.signal_type,
+                            self._current_regime_state(),
                         )
+                    except Exception as council_exc:
+                        decision = None
+                        logger.exception("[sell_monitor] Sell Council failed for %s: %s", ticker, council_exc)
+                    if not decision:
+                        self.monitor.alert_manager.release_alerts([alert])
+                        continue
+
+                    try:
+                        applied = self._apply_sell_council_decision(
+                            sell_council=sell_council,
+                            decision=decision,
+                            thesis=thesis,
+                            stock_data=stock_data,
+                            trigger_type=primary.signal_type,
+                            signal_id=primary.signal_id,
+                            trigger_reason=" | ".join(s.message for s in ticker_signals)[:1600],
+                            fallback_trim_pct=primary.trim_pct,
+                        )
+                    except Exception as apply_exc:
+                        self.monitor.alert_manager.release_alerts([alert])
+                        logger.exception(
+                            "[sell_monitor] Failed to apply Sell Council decision for %s: %s",
+                            ticker,
+                            apply_exc,
+                        )
+                        continue
+                    if not applied["telegram_delivered"] and not applied["queued"]:
+                        self.monitor.alert_manager.release_alerts([alert])
+                        continue
+                    for signal in ticker_signals:
+                        self.sell_engine.aggregator.mark_actioned(signal.signal_id)
         except Exception as e:
             logger.error("[sell_engine_check] Failed: %s", e)
+
+    def _run_news_sentiment_review_check(self, portfolio) -> list:
+        """Rule 4.7 news hook: flag strongly negative material-news days.
+
+        For each HELD ticker, once per UTC day (deduped via a persisted marker
+        in the daily news-sentiment cache, so it survives restarts), compute
+        the Finnhub+LLM daily sentiment (Lopez-Lira & Tang, SSRN 4412788). When
+        the day is measurably negative (score <= NEWS_SENTIMENT_NEG_EXIT_SCORE
+        with >= NEWS_SENTIMENT_NEG_EXIT_MIN_SCORED scored headlines), emit the
+        SellEngine.flag_material_news_review REVIEW_EXIT signal. This NEVER
+        sells directly — it only queues an immediate sell review.
+
+        Unavailable sentiment (fetch/classify failure) triggers nothing and is
+        retried on the next 30-min cycle.
+        """
+        signals: list = []
+        if not Config.NEWS_SENTIMENT_ENABLED:
+            return signals
+        try:
+            from .news_sentiment import (
+                get_daily_sentiment,
+                mark_review_flagged,
+                was_review_flagged,
+            )
+        except Exception as imp_e:
+            logger.warning("[news_sentiment] Import failed: %s", imp_e)
+            return signals
+
+        # Failure backoff: stop retrying a ticker after a few failed
+        # fetch/classify attempts in one UTC day (a Gemini/Finnhub outage
+        # otherwise re-runs on every 30-min cycle all day).
+        from datetime import datetime as _dt, timezone as _tz
+
+        today_key = _dt.now(_tz.utc).date().isoformat()
+        attempts: dict = getattr(self, "_news_sentiment_attempts", {})
+        if attempts.get("_day") != today_key:
+            attempts = {"_day": today_key}
+        self._news_sentiment_attempts = attempts
+
+        for position in getattr(portfolio, "positions", None) or []:
+            ticker = str(getattr(position, "ticker", "") or "").upper()
+            if not ticker:
+                continue
+            try:
+                if was_review_flagged(ticker):
+                    continue  # already flagged today (persisted dedupe)
+                if attempts.get(ticker, 0) >= 3:
+                    continue  # backed off for the rest of the day
+                company_name = None
+                try:
+                    profile = self.collector.fmp.company_profile(ticker) or {}
+                    company_name = profile.get("companyName")
+                except Exception:
+                    pass  # symbol-only prompt is a degraded but valid fallback
+                row = get_daily_sentiment(ticker, company_name=company_name)
+                if not (isinstance(row, dict) and row.get("available")):
+                    attempts[ticker] = attempts.get(ticker, 0) + 1
+                    continue  # unavailable data is never treated as a signal
+                n_scored = int(row.get("n_good") or 0) + int(row.get("n_bad") or 0)
+                score = row.get("score")
+                if (
+                    score is None
+                    or n_scored < Config.NEWS_SENTIMENT_NEG_EXIT_MIN_SCORED
+                    or float(score) > Config.NEWS_SENTIMENT_NEG_EXIT_SCORE
+                ):
+                    continue
+                top_bad_headline = next(
+                    (
+                        str(item.get("headline") or "")
+                        for item in (row.get("labeled") or [])
+                        if str(item.get("label") or "").upper() == "BAD" and item.get("headline")
+                    ),
+                    f"news sentiment {float(score):+.2f} across {n_scored} scored headlines",
+                )
+                signal = self.sell_engine.flag_material_news_review(
+                    ticker, top_bad_headline, source="news_sentiment"
+                )
+                # Mark even when no active thesis exists (signal=None) so we
+                # don't re-evaluate the same negative day every 30 minutes.
+                mark_review_flagged(ticker)
+                if signal:
+                    signals.append(signal)
+                    logger.info(
+                        "[news_sentiment] REVIEW_EXIT flagged for %s (score %.2f, %d scored)",
+                        ticker,
+                        float(score),
+                        n_scored,
+                    )
+            except Exception as t_e:
+                logger.warning("[news_sentiment] Check failed for %s: %s", ticker, t_e)
+        return signals
 
     async def _run_defer_watchlist_check(self) -> None:
         """Check active DEFER/WATCH entry conditions against live prices."""
@@ -2386,6 +3514,15 @@ class ArthaScheduler:
             )
             if requeued:
                 logger.warning("[defer_watchlist] Requeued %d stale in-flight auto-review watch(es)", requeued)
+            failed_requeued = journal.requeue_failed_defer_auto_reviews(
+                retry_delay_minutes=Config.DEFER_AUTO_REVIEW_FAILED_RETRY_MINUTES,
+                max_failures=Config.DEFER_AUTO_REVIEW_MAX_FAILURES,
+            )
+            if failed_requeued:
+                logger.warning(
+                    "[defer_watchlist] Requeued %d bounded failed auto-review watch(es)",
+                    failed_requeued,
+                )
 
             watches = journal.get_active_defer_watches()
             if not watches and not Config.DEFER_AUTO_REVIEW_ENABLED:
@@ -2578,7 +3715,8 @@ class ArthaScheduler:
         except Exception as e:
             logger.exception(f"[monitor] Unexpected error: {e}")
         finally:
-            YFinanceCollector.cleanup_caches()
+            with self._shared_state_lock:
+                YFinanceCollector.cleanup_caches()
 
     async def _check_price_anomalies(self):
         """Check for significant price moves that warrant news research.
@@ -2709,9 +3847,73 @@ class ArthaScheduler:
         except Exception as e:
             logger.error(f"[price_anomaly] Check failed: {e}")
 
+    async def _run_in_daemon_thread(self, name: str, fn) -> None:
+        """Run a long sync scan in a DAEMON thread instead of asyncio.to_thread.
+
+        asyncio.to_thread uses the default ThreadPoolExecutor, whose workers
+        are non-daemon: on shutdown, Runner.close() and the concurrent.futures
+        atexit hook join them WITHOUT timeout, so a 30-90 min scan blocks
+        process exit long after run_forever returns — a zombie daemon with no
+        stop-loss ticks that keeps queueing real auto_buy orders. A daemon
+        thread (plus the cooperative self._stop_flag checks in the scan loops)
+        lets the process exit promptly on SIGTERM/SIGINT.
+        """
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future = loop.create_future()
+
+        def _worker() -> None:
+            exc: BaseException | None = None
+            try:
+                fn()
+            except BaseException as e:  # noqa: BLE001 — propagated via the future
+                exc = e
+
+            def _resolve() -> None:
+                if done.done():
+                    return
+                if exc is not None:
+                    done.set_exception(exc)
+                else:
+                    done.set_result(None)
+
+            try:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(_resolve)
+            except RuntimeError:
+                pass  # loop closed mid-shutdown; nothing awaits the result
+
+        thread = threading.Thread(target=_worker, name=f"artha-{name}", daemon=True)
+        thread.start()
+        await done
+
     async def _run_full_scan_and_council(self):
+        """Run the full council scan in a worker thread (Wave 2).
+
+        The scan body is synchronous LLM/council work that can take 30-90
+        minutes; running it inline froze ALL stop checks mid-session daily.
+        The daemon worker thread keeps the monitor/sell ticks servicing while
+        the scan runs; the lock prevents overlapping council scans (11:30 full
+        scan vs 14:15 afternoon pass). Cross-thread shared writers
+        (pre-brief file, accuracy tracker, yfinance cache cleanup) are
+        guarded by self._shared_state_lock.
+        """
+        async with self._council_scan_lock:
+            await self._run_in_daemon_thread("weekly_scan", self._run_full_scan_and_council_sync)
+
+    def _run_full_scan_and_council_sync(self):
         try:
             logger.info("[scan] Starting scheduled full market scan + council analysis")
+            capacity = self._broker_buy_scan_capacity()
+            if not capacity.get("scan_buy_enabled"):
+                logger.info(
+                    "[scan] Buy scan paused before funnel: status=%s deployable=%.2f reasons=%s",
+                    capacity.get("status"),
+                    float(capacity.get("deployable_amount") or 0.0),
+                    capacity.get("reasons") or [],
+                )
+                self._pause_scheduled_buy_scan_for_capacity(capacity)
+                return
+            self._mark_buy_scan_capacity_ready(capacity, status="scan_started")
             journal = DecisionJournal()
             state_engine = PortfolioStateEngine()
             session_id = f"weekly-scan-{_utcnow().strftime('%Y%m%d_%H%M%S')}-{uuid4().hex[:8]}"
@@ -2735,6 +3937,19 @@ class ArthaScheduler:
                 logger.warning(f"[scan] Failed to save startup portfolio snapshot: {snap_e}")
 
             macro_data = self.collector.collect_macro()
+
+            # Wave 2: deterministic crisis assessment feeds the council's
+            # advisory pre-checks (QualityFilter/ValueTrapDetector context).
+            crisis_context: dict[str, Any] | None = None
+            try:
+                from .crisis import run_full_crisis_check
+
+                crisis_context = run_full_crisis_check(
+                    self.collector.collect_crisis_signals(),
+                    portfolio_value=portfolio_nav,
+                )
+            except Exception as crisis_e:
+                logger.warning("[scan] Crisis check failed; council runs without crisis context: %s", crisis_e)
 
             # Phase 1: Equity market sentiment. Crypto Fear & Greed is kept
             # separate and must not drive stock deployment or stock scan labels.
@@ -2788,11 +4003,30 @@ class ArthaScheduler:
                     regime_packet = run_regime_council(macro_data)
                 except Exception as regime_e:
                     logger.warning(f"[scan] MROL failed, using default regime: {regime_e}")
+                # Wave 2: the mechanical gate owns data/regime_state.json (the
+                # file the sell engine compares entry_regime against). Ensure
+                # it exists/refreshes after every regime council run.
+                self._ensure_regime_state_files()
 
-                stock_candidates = self.scanner.get_funnel_candidates(
-                    regime_packet=regime_packet,
-                    max_candidates=scan_candidate_pool,
-                )
+                # Scan-level gate: under HARD_RISK_OFF every buy verdict would
+                # be capped to WATCH anyway, so skip buy councils entirely and
+                # save the LLM spend. Exits/monitoring are never gated.
+                if self._current_regime_state() == "HARD_RISK_OFF":
+                    logger.warning("[scan] HARD_RISK_OFF regime gate: skipping buy-council candidates this scan")
+                    if self.telegram.enabled:
+                        self.telegram.send_health_check(
+                            "ARTHA SCAN REGIME GATE\n"
+                            "----------------------\n"
+                            "Mechanical regime gate is HARD_RISK_OFF (SPY below its 200d SMA with negative "
+                            "12-month excess return). New-buy councils are skipped this scan to save spend; "
+                            "sell monitoring and exits continue unchanged."
+                        )
+                    stock_candidates = []
+                else:
+                    stock_candidates = self.scanner.get_funnel_candidates(
+                        regime_packet=regime_packet,
+                        max_candidates=scan_candidate_pool,
+                    )
                 logger.info(f"[scan] Funnel returned {len(stock_candidates)} dynamic candidates")
             except Exception as funnel_e:
                 logger.warning(f"[scan] Funnel failed, falling back to legacy scan: {funnel_e}")
@@ -2890,6 +4124,12 @@ class ArthaScheduler:
                     tickers = [str((c or {}).get("symbol") or "").upper() for c in batch_candidates if c]
                     self._send_scan_batch_update(batch_index, total_batch_count, 0, tickers)
                 for candidate in batch_candidates:
+                    if self._stop_flag.is_set():
+                        logger.warning(
+                            "[scan] Stop requested; aborting scan before next candidate "
+                            "(no further councils or order queueing)"
+                        )
+                        return
                     if len(decisions) >= council_decision_cap:
                         break
                     ticker = candidate.get("symbol", "")
@@ -2917,6 +4157,7 @@ class ArthaScheduler:
                             stock_data,
                             macro_data,
                             market_snapshot,
+                            crisis_context=crisis_context,
                             fear_greed=int(fg.get("value", 50) or 50),
                         )
                         if not decision:
@@ -3017,7 +4258,8 @@ class ArthaScheduler:
                                 contrarian_verdict=cont.verdict if cont else "",
                                 contrarian_confidence=cont.confidence if cont else 0,
                             )
-                            self.accuracy.record_recommendation(rec)
+                            with self._shared_state_lock:
+                                self.accuracy.record_recommendation(rec)
                         except Exception as track_e:
                             logger.warning(f"[scan] Failed to record accuracy: {track_e}")
                     except Exception as inner_e:
@@ -3096,7 +4338,8 @@ class ArthaScheduler:
                 logger.warning("[scan] No-buy self-evaluation failed: %s", drift_e)
 
             logger.info("[scan] Scheduled full scan completed")
-            YFinanceCollector.cleanup_caches()
+            with self._shared_state_lock:
+                YFinanceCollector.cleanup_caches()
         except Exception as e:
             logger.exception(f"[scan] Unexpected error: {e}")
             self._send_scan_failure(e)
@@ -3121,14 +4364,12 @@ class ArthaScheduler:
                     len(alerts),
                     len(sell_digest_rows),
                 )
-                self._mark_sell_signals_actioned([r["signal_id"] for r in sell_digest_rows if r.get("signal_id")])
-                for row in sell_digest_rows:
-                    if row.get("thesis_id") and (row.get("action_recommended") or "").upper() in {"EXIT", "SELL", "URGENT_EXIT"}:
-                        self.sell_engine.tracker.mark_waiting_for_sell(
-                            row["thesis_id"],
-                            reason=row.get("action_recommended") or "EXIT",
-                            notes="Non-urgent sell signal delivered via daily digest.",
-                        )
+                if sell_digest_rows:
+                    logger.info(
+                        "[health] Digest is notification-only; %d sell signal(s) remain active "
+                        "until Sell Council reviews them.",
+                        len(sell_digest_rows),
+                    )
         except Exception as e:
             logger.exception(f"[health] Unexpected error: {e}")
 
@@ -3142,7 +4383,7 @@ class ArthaScheduler:
         last = self._last_run.get("market_30m")
         if last and last == slot.astimezone(timezone.utc):
             return False
-        self._last_run["market_30m"] = slot.astimezone(timezone.utc)
+        self._mark_run_slot("market_30m", slot.astimezone(timezone.utc))
         return True
 
     def _should_run_weekly_scan(self, now_utc: datetime) -> bool:
@@ -3162,7 +4403,7 @@ class ArthaScheduler:
         last = self._last_run.get("weekly_scan")
         if last and last == slot:
             return False
-        self._last_run["weekly_scan"] = slot
+        self._mark_run_slot("weekly_scan", slot)
         return True
 
     def _should_run_daily_health(self, now_utc: datetime) -> bool:
@@ -3179,7 +4420,7 @@ class ArthaScheduler:
         last = self._last_run.get("daily_health")
         if last and last == slot:
             return False
-        self._last_run["daily_health"] = slot
+        self._mark_run_slot("daily_health", slot)
         return True
 
     async def _run_nightly_review(self):
@@ -3282,7 +4523,7 @@ class ArthaScheduler:
         last = self._last_run.get("nightly_review")
         if last and last == slot:
             return False
-        self._last_run["nightly_review"] = slot
+        self._mark_run_slot("nightly_review", slot)
         return True
 
     def _should_run_sentinel_held(self, now_utc: datetime) -> bool:
@@ -3314,34 +4555,65 @@ class ArthaScheduler:
             # Overnight: 9 PM - 5 AM CT → every 2 hours
             interval_minutes = 120
 
+        # Bucket by minutes-since-midnight so >60-min cadences (overnight 120,
+        # weekend 240) form real multi-hour slots. The old minute-only bucket
+        # collapsed them to hourly because minute // 240 is always 0.
+        minutes_since_midnight = ct.hour * 60 + ct.minute
+        bucket = (minutes_since_midnight // interval_minutes) * interval_minutes
         slot = ct.replace(
-            minute=(ct.minute // interval_minutes) * interval_minutes,
+            hour=bucket // 60,
+            minute=bucket % 60,
             second=0,
             microsecond=0,
         ).astimezone(timezone.utc)
         last = self._last_run.get("sentinel_held")
         if last and last >= slot:
             return False
-        self._last_run["sentinel_held"] = slot
+        self._mark_run_slot("sentinel_held", slot)
         return True
 
+    def _periodic_review_slots_local(self, et: datetime) -> list[datetime]:
+        """Sell-review slots for one trading day.
+
+        Market-hour slots (default 10:30 and 14:00 CT) produce placeable
+        auto-sell reviews while the market is open; the legacy close+30 slot
+        remains for the end-of-day digest.
+        """
+        slots: list[datetime] = []
+        ct_date = et.astimezone(self.ct_tz).date()
+        for raw in Config.SELL_REVIEW_MARKET_SLOTS_CT:
+            try:
+                hour_text, minute_text = str(raw).split(":", 1)
+                slot_ct = datetime.combine(
+                    ct_date,
+                    time(int(hour_text), int(minute_text)),
+                    tzinfo=self.ct_tz,
+                )
+                slots.append(slot_ct.astimezone(self.et_tz))
+            except Exception:
+                logger.warning("[periodic_review] Ignoring malformed sell review slot: %r", raw)
+        close_time = self.market_hours._market_close_time(et.date())
+        slots.append(datetime.combine(et.date(), close_time, tzinfo=self.et_tz) + timedelta(minutes=30))
+        return slots
+
     def _should_run_periodic_review_check(self, now_utc: datetime) -> bool:
-        """Daily check: any active theses with next_review_date <= now? Fires daily at close+30m."""
+        """Sell reviews at 10:30 CT, 14:00 CT, and close+30m on trading days."""
         now_utc = _ensure_utc(now_utc)
         et = now_utc.astimezone(self.et_tz)
         if not self.market_hours._is_trading_day(et.date()):
             return False
-        close_time = self.market_hours._market_close_time(et.date())
-        target_local = datetime.combine(et.date(), close_time, tzinfo=self.et_tz) + timedelta(minutes=30)
-        window_end = target_local + timedelta(minutes=5)
-        if not (target_local <= et < window_end):
-            return False
-        slot = target_local.astimezone(timezone.utc)
-        last = self._last_run.get("periodic_review")
-        if last and last == slot:
-            return False
-        self._last_run["periodic_review"] = slot
-        return True
+        # Catch up the latest elapsed slot instead of relying on a brittle
+        # five-minute polling window. Persisted slot marks keep this once-only.
+        for target_local in reversed(sorted(self._periodic_review_slots_local(et))):
+            if et < target_local:
+                continue
+            slot = target_local.astimezone(timezone.utc)
+            last = self._last_run.get("periodic_review")
+            if last and last == slot:
+                continue
+            self._mark_run_slot("periodic_review", slot)
+            return True
+        return False
 
     def _should_run_broker_reconciliation_check(self, now_utc: datetime) -> bool:
         if not Config.ROBINHOOD_RECONCILIATION_ENABLED:
@@ -3356,7 +4628,7 @@ class ArthaScheduler:
         last = self._last_run.get("broker_reconciliation")
         if last and last == slot:
             return False
-        self._last_run["broker_reconciliation"] = slot
+        self._mark_run_slot("broker_reconciliation", slot)
         return True
 
     def _get_held_tickers(self) -> list[str]:
@@ -3669,8 +4941,7 @@ class ArthaScheduler:
     async def _run_periodic_review_check(self) -> None:
         """Check active theses for due reviews and fire sell council if needed."""
         try:
-            from .thesis_tracker import ThesisTracker
-            tracker = ThesisTracker()
+            tracker = self.sell_engine.tracker
             due = tracker.get_due_reviews()
             if not due:
                 logger.info("[periodic_review] No theses due for review")
@@ -3681,144 +4952,61 @@ class ArthaScheduler:
             # Import lazily to avoid circular imports
             try:
                 from .sell_council import SellCouncil
-                sell_council = SellCouncil()
+                sell_council = SellCouncil(journal=self.sell_engine.journal)
             except Exception as import_e:
                 logger.warning("[periodic_review] SellCouncil not yet available: %s", import_e)
-                # Still update review dates to prevent hammering
                 for thesis in due:
-                    tracker.update_review_date(thesis.thesis_id)
+                    tracker.update_review_date(
+                        thesis.thesis_id,
+                        (_utcnow() + timedelta(hours=2)).isoformat(),
+                    )
                 return
 
+            current_regime = self._current_regime_state()
             for thesis in due:
                 try:
                     logger.info("[periodic_review] Running sell review for %s", thesis.ticker)
-                    stock_data = self.collector.collect_stock(thesis.ticker)
-                    macro_data = self.collector.collect_macro()
+                    stock_data = await asyncio.to_thread(self.collector.collect_stock, thesis.ticker)
+                    macro_data = await asyncio.to_thread(self.collector.collect_macro)
+                    stock_data["_sell_trigger"] = {
+                        "primary_type": "periodic_review",
+                        "severity": "MEDIUM",
+                        "message": "Scheduled lifecycle review became due.",
+                    }
 
-                    decision = sell_council.run_sell_review(
-                        thesis=thesis,
-                        stock_data=stock_data,
-                        macro_data=macro_data,
-                        trigger_type="periodic_review",
+                    decision = await asyncio.to_thread(
+                        sell_council.run_sell_review,
+                        thesis,
+                        stock_data,
+                        macro_data,
+                        "periodic_review",
+                        current_regime,
                     )
 
-                    if decision:
-                        action = decision.action
-                        now = _utcnow()
-
-                        # FIX 12: Non-urgent EXIT requires SELL_CONFIRMATION_DAYS confirmation
-                        if action == "EXIT" and not decision.is_urgent:
-                            key = thesis.thesis_id
-                            if key not in self._pending_exit_signals:
-                                # First time seeing EXIT for this thesis — start timer
-                                self._pending_exit_signals[key] = now
-                                days_needed = Config.SELL_CONFIRMATION_DAYS
-                                logger.info(
-                                    "[periodic_review] EXIT pending confirmation for %s "
-                                    "(%d days needed)",
-                                    thesis.ticker, days_needed,
-                                )
-                                if self.telegram.enabled:
-                                    self.telegram.send_alert(
-                                        f"⏳ EXIT SIGNAL PENDING CONFIRMATION — "
-                                        f"{thesis.ticker}\n\n"
-                                        f"Sell score: {decision.sell_score:.0f}/100 — "
-                                        f"awaiting {days_needed}-day confirmation.\n"
-                                        f"Will confirm or discard on next review cycle."
-                                    )
-                                # Don't advance review date — keep thesis due for re-check
-                            elif (now - self._pending_exit_signals[key]).days >= Config.SELL_CONFIRMATION_DAYS:
-                                # Confirmed after required days — send the full alert
-                                logger.info(
-                                    "[periodic_review] EXIT confirmed for %s after %d days",
-                                    thesis.ticker, Config.SELL_CONFIRMATION_DAYS,
-                                )
-                                del self._pending_exit_signals[key]
-                                review_result = self._prepare_robinhood_sell_review(
-                                    thesis=thesis,
-                                    action=decision.action,
-                                    current_price=self._as_float(stock_data.get("quote", {}).get("price"))
-                                    or self._as_float(stock_data.get("yf_quote", {}).get("price"))
-                                    or float(thesis.entry_price or 0),
-                                    journal=self.sell_engine.journal,
-                                    trigger_type=decision.trigger_type,
-                                    trim_pct=decision.trim_pct,
-                                    reason="Periodic sell review confirmed EXIT.",
-                                )
-                                msg = sell_council.format_sell_telegram(decision, thesis)
-                                notice = self._sell_review_notice(review_result)
-                                if notice:
-                                    msg = f"{msg}\n\n{notice}"
-                                if msg and self.telegram.enabled:
-                                    reply_markup = ((review_result or {}).get("trade_action") or {}).get("reply_markup")
-                                    self.telegram.send_message(msg[:4000], parse_mode=None, reply_markup=reply_markup)
-                                tracker.mark_waiting_for_sell(
-                                    thesis.thesis_id,
-                                    reason=decision.action,
-                                    notes=f"Periodic sell review confirmed EXIT after {Config.SELL_CONFIRMATION_DAYS}-day confirmation.",
-                                )
-                                tracker.update_review_date(thesis.thesis_id, decision.next_review_date)
-                                if decision.health_score is not None:
-                                    tracker.update_health(thesis.thesis_id, decision.health_score)
-                            else:
-                                # Still within confirmation window — wait
-                                days_waiting = (now - self._pending_exit_signals[key]).days
-                                logger.info(
-                                    "[periodic_review] EXIT for %s awaiting confirmation "
-                                    "(%d/%d days)",
-                                    thesis.ticker, days_waiting, Config.SELL_CONFIRMATION_DAYS,
-                                )
-                                # Don't advance review date — keep re-evaluating daily
-                        else:
-                            # HOLD, TRIM, or URGENT_EXIT — send immediately
-                            if thesis.thesis_id in self._pending_exit_signals:
-                                # Previous EXIT signal changed/disappeared — discard
-                                logger.info(
-                                    "[periodic_review] Exit signal for %s changed to %s "
-                                    "— discarding pending confirmation",
-                                    thesis.ticker, action,
-                                )
-                                del self._pending_exit_signals[thesis.thesis_id]
-                            review_result = None
-                            if decision.action in ("TRIM", "EXIT", "URGENT_EXIT"):
-                                review_result = self._prepare_robinhood_sell_review(
-                                    thesis=thesis,
-                                    action=decision.action,
-                                    current_price=self._as_float(stock_data.get("quote", {}).get("price"))
-                                    or self._as_float(stock_data.get("yf_quote", {}).get("price"))
-                                    or float(thesis.entry_price or 0),
-                                    journal=self.sell_engine.journal,
-                                    trigger_type=decision.trigger_type,
-                                    trim_pct=decision.trim_pct,
-                                    reason=f"Periodic sell review issued {decision.action}.",
-                                )
-                            msg = sell_council.format_sell_telegram(decision, thesis)
-                            notice = self._sell_review_notice(review_result)
-                            if notice:
-                                msg = f"{msg}\n\n{notice}"
-                            if msg and self.telegram.enabled:
-                                reply_markup = ((review_result or {}).get("trade_action") or {}).get("reply_markup")
-                                self.telegram.send_message(msg[:4000], parse_mode=None, reply_markup=reply_markup)
-                            if decision.action in ("EXIT", "URGENT_EXIT"):
-                                tracker.mark_waiting_for_sell(
-                                    thesis.thesis_id,
-                                    reason=decision.action,
-                                    notes=f"Periodic sell review issued immediate {decision.action}.",
-                                )
-                            tracker.update_review_date(thesis.thesis_id, decision.next_review_date)
-                            if decision.health_score is not None:
-                                tracker.update_health(thesis.thesis_id, decision.health_score)
-
-                        logger.info(
-                            "[periodic_review] %s sell score=%.0f action=%s",
-                            thesis.ticker,
-                            decision.sell_score or 0,
-                            decision.action,
-                        )
+                    if not decision:
+                        raise RuntimeError("Sell Council returned no decision")
+                    applied = self._apply_sell_council_decision(
+                        sell_council=sell_council,
+                        decision=decision,
+                        thesis=thesis,
+                        stock_data=stock_data,
+                        trigger_type="periodic_review",
+                        trigger_reason="Scheduled lifecycle review became due.",
+                    )
+                    logger.info(
+                        "[periodic_review] %s sell score=%.0f action=%s queued=%s",
+                        thesis.ticker,
+                        decision.sell_score or 0,
+                        decision.action,
+                        applied["queued"],
+                    )
+                    continue
                 except Exception as review_e:
                     logger.error("[periodic_review] Review failed for %s: %s", thesis.ticker, review_e)
-                    # Still advance review date so we don't loop on failures
-                    tracker.update_review_date(thesis.thesis_id)
+                    tracker.update_review_date(
+                        thesis.thesis_id,
+                        (_utcnow() + timedelta(hours=2)).isoformat(),
+                    )
 
         except Exception as e:
             logger.error("[periodic_review] Unexpected error: %s", e)
@@ -3847,7 +5035,7 @@ class ArthaScheduler:
         last = self._last_run.get("daily_warm_scan")
         if last and last == slot:
             return False
-        self._last_run["daily_warm_scan"] = slot
+        self._mark_run_slot("daily_warm_scan", slot)
         return True
 
     async def _run_daily_warm_scan(self) -> None:
@@ -3936,6 +5124,238 @@ class ArthaScheduler:
         except Exception as e:
             logger.error("[warm_scan] Failed: %s", e)
 
+    def _should_run_afternoon_scan(self, now_utc: datetime) -> bool:
+        """Afternoon opportunity pass at 14:15 CT on trading days (Wave 2)."""
+        if not Config.AFTERNOON_SCAN_ENABLED:
+            return False
+        now_utc = _ensure_utc(now_utc)
+        ct = now_utc.astimezone(self.ct_tz)
+        if not self.market_hours._is_trading_day(ct.date()):
+            return False
+        target = ct.replace(
+            hour=int(Config.AFTERNOON_SCAN_HOUR_CT),
+            minute=int(Config.AFTERNOON_SCAN_MINUTE_CT),
+            second=0,
+            microsecond=0,
+        )
+        catchup_end = target + timedelta(minutes=max(5, int(Config.AFTERNOON_SCAN_CATCHUP_MINUTES)))
+        if not (target <= ct < catchup_end):
+            return False
+        slot = target.astimezone(timezone.utc)
+        last = self._last_run.get("afternoon_scan")
+        if last and last == slot:
+            return False
+        self._mark_run_slot("afternoon_scan", slot)
+        return True
+
+    async def _run_afternoon_opportunity_pass(self) -> None:
+        """Cheap movers-only pass, offloaded like the full scan."""
+        async with self._council_scan_lock:
+            await self._run_in_daemon_thread(
+                "afternoon_scan", self._run_afternoon_opportunity_pass_sync
+            )
+
+    def _run_afternoon_opportunity_pass_sync(self) -> None:
+        """14:15 CT opportunity pass: movers + catalyst lane, max 3 candidates.
+
+        Runs only when the mechanical regime gate is RISK_ON and deployable
+        cash clears the realistic buy minimum. No funnel universe build, no
+        router — this is a narrow catalyst catch-up lane, not a second scan.
+        """
+        try:
+            from .regime_gate import RISK_ON, compute_regime
+
+            gate = compute_regime()
+            if str(gate.get("state") or "") != RISK_ON:
+                logger.info(
+                    "[afternoon_scan] Skipped: regime gate is %s (RISK_ON required)",
+                    gate.get("state"),
+                )
+                return
+
+            journal = DecisionJournal()
+            portfolio_state: dict[str, Any] = {}
+            portfolio_nav = float(Config.MONTHLY_BUDGET or 0)
+            try:
+                bundle = PortfolioStateEngine().build_state_bundle()
+                portfolio_state = bundle.get("state") or {}
+                portfolio_nav = float(bundle["snapshot"].get("total_value") or portfolio_nav)
+            except Exception as state_e:
+                logger.warning("[afternoon_scan] Portfolio state failed: %s", state_e)
+
+            try:
+                market_snapshot = self.collector.collect_market_overview()
+            except Exception as market_e:
+                logger.warning("[afternoon_scan] Market overview failed: %s", market_e)
+                from .collector import get_equity_sentiment_index
+
+                market_snapshot = {"fear_greed": get_equity_sentiment_index()}
+            fg = market_snapshot.get("fear_greed") or {}
+            try:
+                deployment_context = get_deployment_target(int(fg.get("value", 50) or 50), portfolio_state, Config)
+            except Exception as deploy_e:
+                logger.warning("[afternoon_scan] Deployment context failed: %s", deploy_e)
+                deployment_context = {"deployable_amount": 0.0}
+            deployable = float(deployment_context.get("deployable_amount") or 0.0)
+            if deployable < Config.SCAN_MIN_DEPLOYABLE_FOR_BUY_COUNCIL:
+                logger.info(
+                    "[afternoon_scan] Skipped: deployable $%.2f below $%.2f minimum",
+                    deployable,
+                    Config.SCAN_MIN_DEPLOYABLE_FOR_BUY_COUNCIL,
+                )
+                return
+
+            candidates: list[dict[str, Any]] = []
+            seen: set[str] = set()
+
+            def add_candidate(row: dict[str, Any], source: str) -> None:
+                symbol = str(row.get("symbol") or row.get("ticker") or "").upper().strip()
+                if not symbol or symbol in seen:
+                    return
+                seen.add(symbol)
+                candidates.append({**row, "symbol": symbol, "afternoon_source": source})
+
+            try:
+                from .scanner import get_catalyst_candidates
+
+                for row in get_catalyst_candidates(collector=self.collector) or []:
+                    add_candidate(row, "catalyst_ep")
+            except Exception as catalyst_e:
+                logger.warning("[afternoon_scan] Catalyst lane failed: %s", catalyst_e)
+            try:
+                for row in self.collector.get_market_movers(kind="gainers", limit=15) or []:
+                    add_candidate(row, "market_movers")
+            except Exception as movers_e:
+                logger.warning("[afternoon_scan] Market movers failed: %s", movers_e)
+            if not candidates:
+                logger.info("[afternoon_scan] No mover/catalyst candidates today")
+                return
+
+            held = set(self._get_held_tickers())
+            active_defer_watches = self._active_defer_watch_map(journal)
+            filtered: list[dict[str, Any]] = []
+            for candidate in candidates:
+                symbol = candidate["symbol"]
+                if symbol in held or symbol in {"SPY", "QQQ", "IWM", "DIA", "VTI"}:
+                    continue
+                if self._defer_watch_skip_decision(candidate, active_defer_watches).get("skip"):
+                    continue
+                filtered.append(candidate)
+                if len(filtered) >= max(1, int(Config.AFTERNOON_SCAN_MAX_CANDIDATES)):
+                    break
+            if not filtered:
+                logger.info("[afternoon_scan] All candidates filtered (held/ETF/defer-zone)")
+                return
+
+            macro_data: dict[str, Any] = {}
+            try:
+                macro_data = self.collector.collect_macro()
+            except Exception as macro_e:
+                logger.warning("[afternoon_scan] Macro collection failed: %s", macro_e)
+            crisis_context: dict[str, Any] | None = None
+            try:
+                from .crisis import run_full_crisis_check
+
+                crisis_context = run_full_crisis_check(
+                    self.collector.collect_crisis_signals(),
+                    portfolio_value=portfolio_nav,
+                )
+            except Exception as crisis_e:
+                logger.warning("[afternoon_scan] Crisis check failed: %s", crisis_e)
+
+            session_id = f"afternoon-scan-{_utcnow().strftime('%Y%m%d_%H%M%S')}-{uuid4().hex[:8]}"
+            logger.info(
+                "[afternoon_scan] Reviewing %d candidate(s): %s",
+                len(filtered),
+                ", ".join(c["symbol"] for c in filtered),
+            )
+            for candidate in filtered:
+                if self._stop_flag.is_set():
+                    logger.warning(
+                        "[afternoon_scan] Stop requested; aborting pass before next candidate"
+                    )
+                    return
+                ticker = candidate["symbol"]
+                try:
+                    stock_data = self.collector.collect_stock(ticker)
+                    decision = self.council.analyze_stock(
+                        stock_data,
+                        macro_data,
+                        market_snapshot,
+                        crisis_context=crisis_context,
+                        fear_greed=int(fg.get("value", 50) or 50),
+                    )
+                    if not decision:
+                        logger.info("[afternoon_scan] %s: council returned no decision", ticker)
+                        continue
+                    logger.info(
+                        "[afternoon_scan] %s: %s (%s)",
+                        ticker,
+                        decision.final_verdict,
+                        decision.consensus,
+                    )
+                    recommendation_id = None
+                    try:
+                        quote = stock_data.get("quote") or {}
+                        price = quote.get("price") or (stock_data.get("yf_quote") or {}).get("price")
+                        recommendation_id = journal.save_recommendation(
+                            session_id=session_id,
+                            ticker=ticker,
+                            action=decision.final_verdict,
+                            rationale=decision.synthesis_report,
+                            confidence=int(getattr(decision, "confidence", 0) or 0),
+                            price_at_recommendation=float(price) if isinstance(price, (int, float)) else None,
+                            conditions=decision.recommended_action,
+                            status="open",
+                            outcome="unknown",
+                            outcome_notes="",
+                            timestamp=_utcnow().isoformat(),
+                        )
+                    except Exception as journal_e:
+                        logger.warning("[afternoon_scan] Journal failed for %s: %s", ticker, journal_e)
+                    review_result = None
+                    try:
+                        review_result = self._prepare_scan_buy_robinhood_review(
+                            ticker=ticker,
+                            decision=decision,
+                            stock_data=stock_data,
+                            journal=journal,
+                            nav=portfolio_nav,
+                            recommendation_id=recommendation_id,
+                        )
+                    except Exception as review_e:
+                        logger.exception("[afternoon_scan] Review prep failed for %s: %s", ticker, review_e)
+                    try:
+                        self._send_execution_officer_scan_update(ticker, decision, review_result)
+                    except Exception as msg_e:
+                        logger.warning("[afternoon_scan] Telegram update failed for %s: %s", ticker, msg_e)
+                except Exception as inner_e:
+                    logger.exception("[afternoon_scan] Candidate %s failed: %s", ticker, inner_e)
+            try:
+                journal.save_session(
+                    session_type="afternoon_scan",
+                    tickers_analyzed=",".join(str(c.get("symbol") or "") for c in filtered),
+                    report_path="telegram",
+                    timestamp=_utcnow().isoformat(),
+                )
+            except Exception as session_e:
+                logger.warning("[afternoon_scan] Failed to journal session: %s", session_e)
+            logger.info("[afternoon_scan] Afternoon opportunity pass complete")
+        except Exception as e:
+            logger.exception("[afternoon_scan] Unexpected error: %s", e)
+
+    def _spawn_background_task(self, name: str, coro) -> None:
+        """Detach a long-running task from the tick gather.
+
+        The 11:30 scan used to run inside the tick gather, so run_forever
+        could not start the next tick (and its stop checks) for 30-90 min.
+        Background tasks keep the 20s tick cadence alive; _safe_task still
+        captures exceptions and _council_scan_lock serializes scans.
+        """
+        task = asyncio.get_running_loop().create_task(self._safe_task(name, coro))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def _tick(self):
         now_utc = _utcnow()
         tasks = []
@@ -3944,14 +5364,21 @@ class ArthaScheduler:
             tasks.append(self._safe_task("market_30m_monitor", self._run_monitor_check()))
         if self.market_hours.is_market_open(now_utc):
             tasks.append(self._safe_task("market_open_order_rechecks", self._run_pending_order_rechecks()))
-        if self._should_run_weekly_scan(now_utc):
-            tasks.append(self._safe_task("weekly_scan", self._run_full_scan_and_council()))
+        weekly_scan_due = self._should_run_weekly_scan(now_utc)
+        if weekly_scan_due:
+            self._spawn_background_task("weekly_scan", self._run_full_scan_and_council())
+        elif self._should_run_buy_capacity_catchup(now_utc):
+            self._spawn_background_task("weekly_scan_capacity_catchup", self._run_full_scan_and_council())
         if self._should_run_daily_health(now_utc):
             tasks.append(self._safe_task("daily_health", self._run_quick_health_check()))
         if self._should_run_nightly_review(now_utc):
             tasks.append(self._safe_task("nightly_review", self._run_nightly_review()))
         if self._should_run_broker_reconciliation_check(now_utc):
             tasks.append(self._safe_task("broker_reconciliation", self._run_broker_reconciliation_check()))
+        # Recover pending_exit theses whose queued auto-sell died (blocked/
+        # review_blocked/expired) — otherwise the confirmed exit is orphaned.
+        if self._should_run_pending_exit_watchdog(now_utc):
+            tasks.append(self._safe_task("pending_exit_watchdog", self._run_pending_exit_watchdog()))
         # Sell-engine: proactive held-position news sentinel
         if self._should_run_sentinel_held(now_utc):
             tasks.append(self._safe_task("sentinel_held", self._run_held_sentinel()))
@@ -3961,15 +5388,23 @@ class ArthaScheduler:
         # Daily warm cache: pre-warm funnel + track momentum before the full council scan.
         if self._should_run_daily_warm_scan(now_utc):
             tasks.append(self._safe_task("daily_warm_scan", self._run_daily_warm_scan()))
+        # Wave 2: 14:15 CT movers-only opportunity pass (RISK_ON + deployable gated).
+        if self._should_run_afternoon_scan(now_utc):
+            self._spawn_background_task("afternoon_scan", self._run_afternoon_opportunity_pass())
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _request_stop(self) -> None:
+        """Stop the async loop AND signal the sync scan worker threads."""
+        self.stop_event.set()
+        self._stop_flag.set()
 
     def _install_signal_handlers(self):
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, self.stop_event.set)
+                loop.add_signal_handler(sig, self._request_stop)
             except NotImplementedError:
                 logger.warning("Signal handlers unavailable on this platform")
 

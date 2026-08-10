@@ -1,6 +1,15 @@
 """
 Claude Agent SDK Wrapper — Sync Interface for Artha
 
+WARNING (2026-07-02, verified against Anthropic docs + Feb-2026 ToS update):
+Subscription OAuth tokens (claude.ai Pro/Max, `claude setup-token`) may NOT be
+used in any other product, tool, or service — including the Agent SDK. Doing so
+violates the Consumer Terms of Service and risks account suspension (Anthropic
+enforced this Jan–Apr 2026 against third-party harnesses including OpenClaw).
+If Artha ever enables a Claude analyst, authenticate with an Anthropic Console
+API key (platform.claude.com) via the direct API instead. Keep
+ARTHA_CLAUDE_ANALYST_ENABLED=false until this wrapper is reworked accordingly.
+
 Provides a simple synchronous call_claude() function that uses the
 Claude Agent SDK with OAuth authentication.
 

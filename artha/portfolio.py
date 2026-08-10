@@ -15,6 +15,7 @@ from typing import Optional
 from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 
 from .config import Config
+from .stand_down import maybe_pause_buying_for_limit
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +238,8 @@ class Portfolio:
             self.positions = [p for p in self.positions if p.ticker != ticker]
         else:
             pos.shares = float(remaining)
+            pos.current_price = float(price_d)
+            pos.market_value = float((remaining * price_d).quantize(CENTS, ROUND_HALF_UP))
 
         sell_total = (shares_d * price_d).quantize(CENTS, ROUND_HALF_UP)
         self.transactions.append({
@@ -316,12 +319,14 @@ class Portfolio:
         monthly_spend = self._monthly_buy_total()
         budget_d = _to_decimal(Config.MONTHLY_BUDGET)
         if monthly_spend + proposed_d > budget_d:
+            reason = (
+                f"Monthly budget exceeded: ${float(monthly_spend + proposed_d):,.2f} "
+                f"> ${Config.MONTHLY_BUDGET:,.2f}"
+            )
+            maybe_pause_buying_for_limit([reason], source=f"portfolio_budget:{ticker}")
             return {
                 "allowed": False,
-                "reason": (
-                    f"Monthly budget exceeded: ${float(monthly_spend + proposed_d):,.2f} "
-                    f"> ${Config.MONTHLY_BUDGET:,.2f}"
-                ),
+                "reason": reason,
             }
 
         # Cash and concentration checks. Include available cash in the NAV
@@ -329,9 +334,11 @@ class Portfolio:
         # as 100% concentration before cash is deployed.
         cash_d = _to_decimal(self.cash_available)
         if cash_d > 0 and proposed_d > cash_d:
+            reason = f"Insufficient cash available: ${float(proposed_d):,.2f} > ${float(cash_d):,.2f}"
+            maybe_pause_buying_for_limit([reason], source=f"portfolio_cash:{ticker}")
             return {
                 "allowed": False,
-                "reason": f"Insufficient cash available: ${float(proposed_d):,.2f} > ${float(cash_d):,.2f}",
+                "reason": reason,
             }
 
         total_portfolio_value = sum(p.total_cost for p in self.positions) + max(cash_d, proposed_d)
@@ -343,10 +350,13 @@ class Portfolio:
         max_pct = Config.MAX_SINGLE_CRYPTO_PCT if asset_type == "crypto" else Config.MAX_SINGLE_STOCK_PCT
 
         if concentration > max_pct:
+            reason = (
+                f"{ticker} would be {concentration:.0%} of portfolio "
+                f"(max {max_pct:.0%} for {asset_type})"
+            )
             return {
                 "allowed": False,
-                "reason": f"{ticker} would be {concentration:.0%} of portfolio "
-                          f"(max {max_pct:.0%} for {asset_type})",
+                "reason": reason,
             }
 
         return {"allowed": True, "reason": "Within risk limits"}
@@ -483,12 +493,8 @@ class Portfolio:
             logger.error(f"Error loading portfolio: {e}")
             return cls()
 
-    def total_nav(self) -> float:
-        """Approximate NAV = total cost basis of all positions.
-
-        Since we don't store live prices in the portfolio file, cost basis is
-        used as a proxy. Updated market_value fields (if present) are preferred.
-        """
+    def invested_value(self) -> float:
+        """Approximate marked value of invested positions, excluding cash."""
         total = Decimal("0")
         for p in self.positions:
             if p.market_value is not None:
@@ -496,6 +502,10 @@ class Portfolio:
             else:
                 total += p.total_cost
         return float(total)
+
+    def total_nav(self) -> float:
+        """Approximate account NAV: invested positions plus available cash."""
+        return float(_to_decimal(self.invested_value()) + _to_decimal(self.cash_available))
 
     def summary(self) -> dict:
         """Quick portfolio summary."""

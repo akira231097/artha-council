@@ -11,13 +11,19 @@ Conviction lock prevents rotating out of healthy conviction positions:
 Post-sell shadow tracking:
   - Nightly review fetches current price for recently sold positions
   - Computes regret_score (negative = price fell → exit was correct)
-  - Records at 5/20/60-day checkpoints for accuracy grading
+  - Records at 5/20/60-day checkpoints for accuracy grading; overdue
+    checkpoints are back-filled with the HISTORICAL close for the checkpoint
+    date (not today's price)
+  - Stop-triggered exits are graded against the actual 20-day-later price
+    (a stop that whipsawed below a recovering price is NOT auto-correct)
+  - MFE give-back (max favorable excursion vs realized exit) makes
+    held-too-long measurable
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .config import Config
@@ -61,8 +67,30 @@ class PostSellTracker:
 
     CHECKPOINT_DAYS = Config.SELL_SHADOW_TRACKING_DAYS  # [5, 20, 60]
 
+    # Tolerance (days) within which today's live price is an acceptable
+    # stand-in for a checkpoint price; beyond it we fetch the historical close.
+    CHECKPOINT_TOLERANCE_DAYS = 2
+
     def __init__(self, journal: Optional[DecisionJournal] = None) -> None:
         self.journal = journal or DecisionJournal()
+        self._ensure_mfe_columns()
+
+    def _ensure_mfe_columns(self) -> None:
+        """Add MFE give-back columns to post_sell_tracking if missing."""
+        try:
+            with self.journal._connect() as conn:
+                cols = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(post_sell_tracking)").fetchall()
+                }
+                for col in ("mfe_pct", "giveback_pct"):
+                    if col not in cols:
+                        conn.execute(
+                            f"ALTER TABLE post_sell_tracking ADD COLUMN {col} REAL"
+                        )
+                conn.commit()
+        except Exception as e:
+            logger.warning("[post_sell] Failed to ensure MFE columns: %s", e)
 
     def record_sell(
         self,
@@ -89,8 +117,88 @@ class PostSellTracker:
         })
         logger.info("[post_sell] Started shadow tracking for %s @ $%.2f", ticker, sell_price)
 
+    def _historical_close_on_or_after(
+        self,
+        collector: Any,
+        ticker: str,
+        target_date: date,
+    ) -> Optional[float]:
+        """Fetch the daily close on (or first trading day after) a past date."""
+        try:
+            rows = collector.fmp.history(ticker, "1y") or []
+        except Exception as e:
+            logger.warning("[post_sell] History fetch failed for %s: %s", ticker, e)
+            rows = []
+        if not rows:
+            try:
+                rows = collector.yf.history(ticker, "1y") or []
+            except Exception:
+                rows = []
+        target_iso = target_date.isoformat()
+        for row in sorted(rows, key=lambda r: str(r.get("date") or "")):
+            row_date = str(row.get("date") or "")[:10]
+            if row_date >= target_iso:
+                try:
+                    close = float(row.get("close") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if close > 0:
+                    return close
+        return None
+
+    def _compute_mfe(
+        self,
+        collector: Any,
+        record: dict[str, Any],
+        sell_date: date,
+    ) -> Optional[tuple[float, float]]:
+        """Max favorable excursion vs realized exit → (mfe_pct, giveback_pct).
+
+        MFE is the best gain available between entry and exit; give-back is
+        how much of it the exit surrendered. Measurable "held too long".
+        """
+        thesis_id = record.get("thesis_id")
+        sell_price = float(record.get("sell_price") or 0)
+        if not thesis_id or sell_price <= 0:
+            return None
+        try:
+            thesis_row = self.journal.get_thesis(thesis_id) or {}
+        except Exception:
+            thesis_row = {}
+        entry_price = float(thesis_row.get("entry_price") or 0)
+        entry_date_str = str(thesis_row.get("entry_date") or "")[:10]
+        if entry_price <= 0 or not entry_date_str:
+            return None
+        ticker = record.get("ticker", "")
+        try:
+            rows = collector.fmp.history(ticker, "1y") or []
+        except Exception:
+            rows = []
+        highs = []
+        sell_iso = sell_date.isoformat()
+        for row in rows:
+            row_date = str(row.get("date") or "")[:10]
+            if entry_date_str <= row_date <= sell_iso:
+                try:
+                    high = float(row.get("high") or row.get("close") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if high > 0:
+                    highs.append(high)
+        if not highs:
+            return None
+        mfe_pct = (max(highs) - entry_price) / entry_price
+        realized_pct = (sell_price - entry_price) / entry_price
+        giveback_pct = mfe_pct - realized_pct
+        return (round(mfe_pct, 4), round(giveback_pct, 4))
+
     def update_shadow_prices(self, collector: Any) -> int:
-        """Update prices for active shadow tracking records. Returns count updated."""
+        """Update prices for active shadow tracking records. Returns count updated.
+
+        Checkpoints hit within CHECKPOINT_TOLERANCE_DAYS use the live quote;
+        overdue checkpoints are back-filled with the historical close for the
+        actual checkpoint date so returns are not stamped with today's price.
+        """
         pending = self.journal.get_pending_post_sell_reviews()
         if not pending:
             return 0
@@ -128,7 +236,7 @@ class PostSellTracker:
             ret = (current_price - sell_price) / sell_price if sell_price > 0 else 0
             # Negative regret_score = price fell = selling was correct
             # Positive = price rose = we left money on table
-            regret_score = ret  # same as return; naming is from Sarath's perspective
+            regret_score = ret  # same as return; naming is from the investor's perspective
 
             updates: dict[str, Any] = {}
 
@@ -136,9 +244,28 @@ class PostSellTracker:
             for checkpoint_days in self.CHECKPOINT_DAYS:
                 price_key = f"price_{checkpoint_days}d"
                 return_key = f"return_{checkpoint_days}d"
-                if days_since_sell >= checkpoint_days and record.get(price_key) is None:
-                    updates[price_key] = current_price
-                    updates[return_key] = round(ret, 4)
+                if days_since_sell < checkpoint_days or record.get(price_key) is not None:
+                    continue
+                overdue_by = days_since_sell - checkpoint_days
+                checkpoint_price: Optional[float] = None
+                if overdue_by <= self.CHECKPOINT_TOLERANCE_DAYS:
+                    checkpoint_price = current_price
+                else:
+                    # Overdue — fetch the close for the actual checkpoint date
+                    checkpoint_date = sell_date + timedelta(days=checkpoint_days)
+                    checkpoint_price = self._historical_close_on_or_after(
+                        collector, ticker, checkpoint_date
+                    )
+                    if checkpoint_price is None:
+                        logger.warning(
+                            "[post_sell] No historical close for %s %sd checkpoint — skipping",
+                            ticker, checkpoint_days,
+                        )
+                        continue
+                updates[price_key] = checkpoint_price
+                updates[return_key] = round(
+                    (checkpoint_price - sell_price) / sell_price, 4
+                )
 
             updates["regret_score"] = round(regret_score, 4)
 
@@ -146,8 +273,19 @@ class PostSellTracker:
             max_checkpoint = max(self.CHECKPOINT_DAYS)
             if days_since_sell >= max_checkpoint:
                 updates["status"] = "completed"
-                # Grade the sell decision
-                updates["grade"] = self._grade_sell(ret, record.get("sell_reason", ""))
+                return_20d = updates.get("return_20d", record.get("return_20d"))
+                # Grade the sell decision (stop exits graded vs 20d-later price)
+                updates["grade"] = self._grade_sell(
+                    ret,
+                    record.get("sell_reason", ""),
+                    return_20d=return_20d,
+                )
+                # MFE give-back — how much of the best available gain the
+                # exit surrendered (held-too-long metric)
+                if record.get("mfe_pct") is None:
+                    mfe = self._compute_mfe(collector, record, sell_date)
+                    if mfe is not None:
+                        updates["mfe_pct"], updates["giveback_pct"] = mfe
 
             if updates:
                 updates["tracking_id"] = tracking_id
@@ -159,15 +297,32 @@ class PostSellTracker:
 
         return updated
 
-    def _grade_sell(self, return_since_sell: float, reason: str) -> str:
+    def _grade_sell(
+        self,
+        return_since_sell: float,
+        reason: str,
+        return_20d: Optional[float] = None,
+    ) -> str:
         """Grade a sell decision based on subsequent performance.
 
         Negative return = price fell after sell = CORRECT exit.
         Positive return = price rose after sell = INCORRECT or EARLY exit.
+
+        Stop-triggered exits are NOT auto-graded correct: they are graded
+        against the actual price 20 days later. A stop that fired into a
+        recovery (price 5%+ higher 20d later) was a WHIPSAW_STOP.
         """
-        # Hard stop exits are graded differently
-        if "hard stop" in reason.lower() or "urgent" in reason.lower():
-            return "STOP_TRIGGERED"  # Always correct if stop was hit
+        is_stop_exit = "hard stop" in reason.lower() or "urgent" in reason.lower() or "stop" in reason.lower()
+        if is_stop_exit:
+            benchmark = return_20d if return_20d is not None else return_since_sell
+            if benchmark is None:
+                return "STOP_TRIGGERED"  # no benchmark yet — defer grading
+            if benchmark <= -0.05:
+                return "CORRECT"         # price kept falling — stop saved money
+            elif benchmark <= 0.05:
+                return "NEUTRAL"
+            else:
+                return "WHIPSAW_STOP"    # price recovered — stop was too tight
 
         if return_since_sell <= -0.05:
             return "CORRECT"           # Price fell 5%+ — good sell
@@ -179,13 +334,18 @@ class PostSellTracker:
             return "INCORRECT"         # Significant gains missed
 
     def format_report(self) -> str:
-        """Format a post-sell shadow tracking report for the nightly review."""
-        pending = self.journal.get_pending_post_sell_reviews()
-        if not pending:
+        """Format a post-sell shadow tracking report for the nightly review.
+
+        Uses ALL tracking rows: get_pending_post_sell_reviews() only returns
+        status='tracking' rows, so filtering it for 'completed' always came
+        back empty — completed reviews never appeared in the report.
+        """
+        records = self.journal.get_all_post_sell_reviews()
+        if not records:
             return ""
 
-        completed = [r for r in pending if r.get("status") == "completed"]
-        tracking = [r for r in pending if r.get("status") == "tracking"]
+        completed = [r for r in records if r.get("status") == "completed"]
+        tracking = [r for r in records if r.get("status") == "tracking"]
 
         lines = [
             "📉 POST-SELL SHADOW TRACKING",
@@ -199,14 +359,25 @@ class PostSellTracker:
             neutral = grades.count("NEUTRAL")
             early = grades.count("EARLY")
             incorrect = grades.count("INCORRECT")
+            whipsaw = grades.count("WHIPSAW_STOP")
             lines.extend([
                 f"Completed reviews: {len(completed)}",
                 f"  ✅ Correct exits: {correct}",
                 f"  ➡️ Neutral:       {neutral}",
                 f"  ⚠️ Sold early:   {early}",
                 f"  🔴 Incorrect:    {incorrect}",
-                "",
+                f"  🪤 Whipsaw stops: {whipsaw}",
             ])
+            givebacks = [
+                float(r["giveback_pct"]) for r in completed
+                if r.get("giveback_pct") is not None
+            ]
+            if givebacks:
+                lines.append(
+                    f"  📐 Avg MFE give-back: {sum(givebacks) / len(givebacks):+.1%} "
+                    "(gain surrendered vs best exit)"
+                )
+            lines.append("")
 
         # Active tracking
         if tracking:

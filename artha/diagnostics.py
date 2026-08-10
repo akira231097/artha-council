@@ -24,6 +24,24 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DIAGNOSTIC_DIR = DATA_DIR / "calibration_diagnostics"
 
 
+def _env_weight(name: str, default: float) -> float:
+    import os
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return default
+
+
+# Early-calibration tunables (Wave 2 consolidates into Config). Shadow rows
+# that have hit their 20d (or at least 5d) checkpoints contribute fractional
+# weight toward the activation stage instead of waiting for full 60d maturity.
+DIAG_EARLY_20D_WEIGHT = _env_weight("ARTHA_DIAG_EARLY_20D_WEIGHT", 0.5)
+DIAG_EARLY_5D_WEIGHT = _env_weight("ARTHA_DIAG_EARLY_5D_WEIGHT", 0.2)
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -204,9 +222,15 @@ def _bucket_diagnostics(calibration_report: dict[str, Any]) -> list[dict[str, An
 
 
 def _pattern_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Count mistake patterns over matured rows AND 20d-checkpointed rows.
+
+    Rows that are still tracking but already have a 20d excess-return
+    checkpoint carry an early signal — _classify_row falls back to 20d data —
+    so they no longer sit invisible for 60 days.
+    """
     counts: dict[str, int] = defaultdict(int)
     for row in rows:
-        if row.get("status") != "completed":
+        if row.get("status") != "completed" and row.get("excess_return_20d") is None:
             continue
         for label in _classify_row(row):
             counts[label] += 1
@@ -347,15 +371,41 @@ def build_diagnostic_payload(journal: DecisionJournal | None = None) -> dict[str
     rows = _shadow_rows(journal)
     completed_rows = [row for row in rows if row.get("status") == "completed"]
     completed_samples = int(calibration.get("completed_shadow_rows") or len(completed_rows))
-    stage = _stage_for_samples(completed_samples)
+
+    # Early calibration signal: 20d/5d checkpointed-but-not-matured rows count
+    # fractionally toward the activation stage instead of waiting for 60d.
+    early_20d_only = sum(
+        1 for row in rows
+        if row.get("status") != "completed" and row.get("excess_return_20d") is not None
+    )
+    early_5d_only = sum(
+        1 for row in rows
+        if row.get("status") != "completed"
+        and row.get("excess_return_20d") is None
+        and row.get("excess_return_5d") is not None
+    )
+    effective_samples = int(
+        completed_samples
+        + DIAG_EARLY_20D_WEIGHT * early_20d_only
+        + DIAG_EARLY_5D_WEIGHT * early_5d_only
+    )
+
+    stage = _stage_for_samples(effective_samples)
     bucket_rows = _bucket_diagnostics(calibration)
-    patterns = _pattern_counts(completed_rows)
-    fixes = _proposed_fixes(completed_rows, bucket_rows, completed_samples)
+    patterns = _pattern_counts(rows)
+    fixes = _proposed_fixes(completed_rows, bucket_rows, effective_samples)
     severity = _severity(str(stage["stage"]), fixes, patterns)
 
     payload = {
         "generated_at": _utcnow_iso(),
         "completed_samples": completed_samples,
+        "early_20d_checkpoint_samples": early_20d_only,
+        "early_5d_checkpoint_samples": early_5d_only,
+        "early_checkpoint_weights": {
+            "20d": DIAG_EARLY_20D_WEIGHT,
+            "5d": DIAG_EARLY_5D_WEIGHT,
+        },
+        "effective_samples": effective_samples,
         "total_shadow_rows": int(calibration.get("shadow_rows") or len(rows)),
         "stage": stage["stage"],
         "stage_label": stage["label"],
@@ -375,11 +425,16 @@ def build_diagnostic_payload(journal: DecisionJournal | None = None) -> dict[str
 def format_diagnostic_report(payload: dict[str, Any]) -> str:
     """Render a Telegram-friendly plain-English report."""
     completed = int(payload.get("completed_samples") or 0)
+    effective = int(payload.get("effective_samples") or completed)
+    early_20d = int(payload.get("early_20d_checkpoint_samples") or 0)
+    early_5d = int(payload.get("early_5d_checkpoint_samples") or 0)
     next_gate = int(payload.get("next_gate") or 0)
     lines = [
         "ARTHA LEARNING DIAGNOSIS",
         "========================",
         f"Completed forward samples: {completed}",
+        f"Early checkpoint samples: {early_20d} at 20d, {early_5d} at 5d "
+        f"(effective samples: {effective})",
         f"Stage: {payload.get('stage_label')} ({payload.get('stage')})",
         f"Live rule changes allowed: {payload.get('live_change_allowed')}",
         "",
@@ -387,7 +442,10 @@ def format_diagnostic_report(payload: dict[str, Any]) -> str:
         str(payload.get("plain_english_stage") or ""),
     ]
     if next_gate > 0:
-        lines.append(f"Next gate: {next_gate} completed 60-day outcomes.")
+        lines.append(
+            f"Next gate: {next_gate} effective samples "
+            "(completed 60d outcomes + weighted 20d/5d checkpoints)."
+        )
     else:
         lines.append("Next gate: manual ML/meta-ranker review.")
 

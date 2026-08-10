@@ -1,26 +1,55 @@
 # Security Policy
 
-This public release should never contain real credentials, broker snapshots, portfolio state, Telegram tokens, OAuth tokens, or live trading journals.
+Artha handles market data and can be integrated with brokerage tooling. Treat any
+money-moving deployment as security-sensitive infrastructure.
 
-## Secret Handling
+## Reporting a Vulnerability
 
-- Put local secrets in `.env`.
-- Use `.env.example` only as a template.
-- Do not commit `.env`, `.env.*`, database files, runtime reports, logs, or broker snapshots.
-- Rotate any key that may have been committed to a private or public repository history.
+Use GitHub's private vulnerability reporting feature from the repository Security
+tab. Do not place credentials, account identifiers, exploit details, or private
+broker output in a public issue.
 
-## Live Trading Safety
+Include:
 
-The public defaults are safe by design:
+- affected module and revision
+- reproducible steps using synthetic data
+- expected and observed behavior
+- possible impact
+- suggested mitigation, if known
 
-- Robinhood review-only mode is enabled.
-- Robinhood dry-run mode is enabled.
-- Agentic trading is disabled.
-- The kill switch is enabled.
-- Auto-buy is disabled.
+The maintainer will acknowledge a complete report when it is reviewed. No fixed
+response or remediation deadline is promised for this personal open-source project.
 
-Only enable live trading after reviewing the full broker bridge, execution officer, account caps, and Robinhood terms.
+## Public Data Boundary
 
-## Reporting Issues
+Never commit:
 
-If you find a security issue, open a private disclosure channel with the repository owner rather than posting secrets or exploit details in a public issue.
+- `.env` or provider credentials
+- OAuth state, access tokens, or refresh tokens
+- broker snapshots, account numbers, positions, orders, or fills
+- portfolio files, journals, databases, generated dossiers, or traces
+- Telegram tokens, chat identifiers, or callback tokens
+- local automation configuration, lock files, logs, or temporary handoffs
+
+Use invented values in examples and tests. If a real secret reaches Git history,
+revoke it immediately; deleting the current file is not sufficient.
+
+## Safe Defaults
+
+The checked-in configuration is intentionally incapable of live trading:
+
+- review-only mode enabled
+- dry-run mode enabled
+- agentic broker access disabled
+- auto-buy and auto-sell disabled
+- runtime kill switch enabled
+- fresh-snapshot and exact-review requirements enabled
+
+Do not weaken fail-closed behavior. Missing, stale, malformed, or contradictory
+broker evidence must block placement.
+
+## Dependency and Supply-Chain Controls
+
+The repository uses pinned GitHub Actions, Dependabot, dependency review, CodeQL,
+and OpenSSF Scorecard. Release reviews should also verify dependency licenses and
+inspect GitHub's SPDX-compatible software bill of materials.

@@ -162,6 +162,11 @@ class CouncilDecision:
     rule_adjustment_total: int = 0
     cio_adjustment: int = 0
     scoring_audit: dict = field(default_factory=dict)
+    # Wave 2: machine-readable CIO decision block + mechanical regime gate.
+    cio_decision: dict = field(default_factory=dict)
+    half_size: bool = False
+    regime_gate: dict = field(default_factory=dict)
+    mechanical_override: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +636,215 @@ def _extract_scoring_json(synthesis: str) -> Optional[dict]:
     return None
 
 
+# Ops and metrics the sell engine can actually evaluate (see
+# thesis_tracker._CONDITION_OPS and sell_engine._check_thesis_break's
+# observed-metrics dict — keep in sync). pct_change_* ops were dropped:
+# they had no evaluation semantics anywhere, so conditions using them
+# were stored as permanently-inert dead weight.
+_DECISION_OPS = {"lt", "lte", "gt", "gte", "eq"}
+_DECISION_METRICS = {"price", "pnl_pct", "days_held", "trading_days_held"}
+_DECISION_METRIC_ALIASES = {
+    "close_price": "price",
+    "last_price": "price",
+    "current_price": "price",
+    "days_elapsed": "days_held",
+}
+
+
+def _extract_decision_json(synthesis: str) -> Optional[dict]:
+    """Extract the CIO structured DECISION block (Wave 2).
+
+    Schema (machine-consumed by the scheduler agent; keep in sync with
+    prompts.SYNTHESIS_PROMPT "STRUCTURED DECISION BLOCK"):
+        {
+          "verdict": str,                      # one of _VALID_FINAL_VERDICTS
+          "conviction_0_10": int,
+          "entry_zone": {"low": float, "high": float,
+                         "valid_until_iso": "YYYY-MM-DD"} | null,
+          "stop_price": float | null,          # ATR-derived, cap 10% below entry
+          "target_price": float | null,
+          "invalidation_conditions": [
+            {"metric": str, "op": str, "value": number, "description": str}
+          ],
+          "half_size": bool
+        }
+
+    Identified as a fenced JSON block containing "conviction_0_10" (the
+    scoring block is identified separately by "opportunity_score"). Returns a
+    normalized dict or None — callers keep the legacy regex/scoring-block
+    fallback when this block is missing or malformed.
+    """
+    try:
+        json_blocks = re.findall(r"```json\s*(\{.*?\})\s*```", synthesis or "", re.DOTALL)
+        if not json_blocks:
+            json_blocks = re.findall(r"```\s*(\{.*?\})\s*```", synthesis or "", re.DOTALL)
+        for raw in reversed(json_blocks):
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(parsed, dict) or "conviction_0_10" not in parsed:
+                continue
+            return _normalize_decision_json(parsed)
+    except Exception as exc:
+        logger.warning("_extract_decision_json raised unexpectedly: %s", exc)
+    return None
+
+
+def _normalize_decision_json(parsed: dict) -> Optional[dict]:
+    """Validate/coerce a raw CIO decision block. Returns None if unusable."""
+    def _float_or_none(value) -> Optional[float]:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        import math as _math
+        if _math.isnan(result) or _math.isinf(result):
+            return None
+        return result
+
+    verdict = str(parsed.get("verdict") or "").upper().strip()
+    if verdict not in _VALID_FINAL_VERDICTS:
+        return None
+    try:
+        conviction = int(parsed.get("conviction_0_10"))
+    except (TypeError, ValueError):
+        return None
+    conviction = max(0, min(10, conviction))
+
+    entry_zone = parsed.get("entry_zone")
+    if isinstance(entry_zone, dict):
+        low = _float_or_none(entry_zone.get("low"))
+        high = _float_or_none(entry_zone.get("high"))
+        if low is None or high is None or low <= 0 or high < low:
+            entry_zone = None
+        else:
+            entry_zone = {
+                "low": low,
+                "high": high,
+                "valid_until_iso": str(entry_zone.get("valid_until_iso") or "")[:10],
+            }
+    else:
+        entry_zone = None
+
+    stop_price = _float_or_none(parsed.get("stop_price"))
+    if stop_price is not None and stop_price <= 0:
+        stop_price = None
+    target_price = _float_or_none(parsed.get("target_price"))
+    if target_price is not None and target_price <= 0:
+        target_price = None
+
+    conditions: list[dict] = []
+    for item in parsed.get("invalidation_conditions") or []:
+        if not isinstance(item, dict):
+            continue
+        metric = str(item.get("metric") or "").strip()
+        metric = _DECISION_METRIC_ALIASES.get(metric.lower(), metric.lower())
+        op = str(item.get("op") or "").strip().lower()
+        value = _float_or_none(item.get("value"))
+        description = str(item.get("description") or "").strip()
+        if metric not in _DECISION_METRICS or op not in _DECISION_OPS or value is None:
+            if metric or op:
+                logger.info(
+                    "Dropping unevaluable invalidation condition metric=%r op=%r "
+                    "(supported metrics=%s ops=%s)",
+                    metric, op, sorted(_DECISION_METRICS), sorted(_DECISION_OPS),
+                )
+            continue
+        conditions.append({
+            "metric": metric,
+            "op": op,
+            "value": value,
+            "description": description,
+        })
+
+    return {
+        "verdict": verdict,
+        "conviction_0_10": conviction,
+        "entry_zone": entry_zone,
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "invalidation_conditions": conditions,
+        "half_size": bool(parsed.get("half_size")),
+    }
+
+
+def _compute_atr14(price_history: list | None) -> Optional[float]:
+    """ATR(14) via Wilder smoothing from daily OHLC bars (oldest-first)."""
+    if not isinstance(price_history, list) or len(price_history) < 15:
+        return None
+    try:
+        bars = sorted(
+            (b for b in price_history if isinstance(b, dict) and b.get("date")),
+            key=lambda b: str(b.get("date")),
+        )
+        true_ranges: list[float] = []
+        prev_close: Optional[float] = None
+        for bar in bars:
+            high = float(bar.get("high") or 0)
+            low = float(bar.get("low") or 0)
+            close = float(bar.get("close") or 0)
+            if high <= 0 or low <= 0 or close <= 0:
+                prev_close = close if close > 0 else prev_close
+                continue
+            if prev_close is None:
+                tr = high - low
+            else:
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            true_ranges.append(tr)
+            prev_close = close
+        if len(true_ranges) < 14:
+            return None
+        atr = sum(true_ranges[:14]) / 14.0
+        for tr in true_ranges[14:]:
+            atr = (atr * 13 + tr) / 14.0
+        return round(atr, 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def _atr_initial_stop_pct(current_price: Optional[float], atr14: Optional[float], config) -> Optional[float]:
+    """Initial stop as a NEGATIVE fraction: 2.5x ATR14 below entry, cap 10%."""
+    try:
+        price = float(current_price or 0)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0 or not atr14 or atr14 <= 0:
+        return None
+    stop_frac = (float(getattr(config, "CIO_STOP_ATR_MULT", 2.5)) * atr14) / price
+    stop_frac = min(stop_frac, float(getattr(config, "CIO_STOP_CAP_PCT", 0.10)))
+    return -round(stop_frac, 4)
+
+
+def _mechanical_composite_strong(signal_row: dict | None, config) -> bool:
+    """True when the funnel composite is STRONG per the Wave 2 rulebook:
+    scan track momentum/breakout with z >= 1.5 AND trend template pass."""
+    if not isinstance(signal_row, dict) or not signal_row:
+        return False
+    track = str(signal_row.get("track") or "").lower()
+    if track not in ("momentum", "breakout"):
+        return False
+    if not bool(signal_row.get("trend_template")):
+        return False
+    min_z = float(getattr(config, "MECHANICAL_OVERRIDE_MIN_Z", 1.5))
+    for key in ("momentum_z", "composite_z"):
+        try:
+            if signal_row.get(key) is not None and float(signal_row[key]) >= min_z:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+# One-notch CIO upgrade ladder over the score-mapped action (mechanical
+# override; AVOID is deliberately NOT upgradeable — a sub-45 score stays out).
+_BUY_NOTCH_UPGRADE = {
+    "WATCH": "TACTICAL_BUY",
+    "TACTICAL_BUY": "STARTER",
+    "STARTER": "BUY",
+}
+
+
 def _replace_last_scoring_json(synthesis: str, scoring: dict) -> str:
     """Replace the last scoring JSON block with the validated/corrected payload."""
     try:
@@ -856,11 +1070,23 @@ def score_to_action(
     fear_greed: int | None,
     portfolio_state: dict,
     config,
+    regime_gate_state: dict | None = None,
 ) -> dict:
     """Map opportunity score to concrete action and position size.
 
-    Applies regime adjustment based on Fear & Greed, then maps
-    adjusted score to action + recommended allocation.
+    Wave 2: the fear/greed re-penalty is GONE — regime already contributes
+    15/100 inside buy scoring, and double-counting it here is what banned
+    tactical buys in uptrends (precisely backwards). Entry permission now
+    comes from the mechanical regime gate (artha/regime_gate.py):
+
+      RISK_ON        — thresholds as configured (BUY>=75/STARTER>=65/TACTICAL>=55)
+      RISK_OFF       — TACTICAL requires score >= 65; buy actions marked
+                       half_size=True (council additionally requires
+                       conviction >= 8 for momentum/breakout tracks)
+      HARD_RISK_OFF  — no new buys; buy-side maps cap at WATCH
+
+    The gate NEVER blocks exits — this mapper only shapes NEW entries.
+    ``fear_greed`` is retained for signature compatibility and reporting only.
     """
     import math as _math
 
@@ -874,37 +1100,33 @@ def score_to_action(
     if _math.isnan(score) if isinstance(score, float) else False:
         score = 0
 
-    # Guard: None/NaN fear_greed defaults to 50 (Neutral)
-    if fear_greed is None:
-        fear_greed = 50
+    # Resolve regime gate state (no network: cached file only, default RISK_ON)
+    gate = regime_gate_state
+    if not isinstance(gate, dict) or not gate.get("state"):
+        try:
+            from .regime_gate import load_cached_regime
+            gate = load_cached_regime() or {}
+        except Exception:
+            gate = {}
+    regime_state = str(gate.get("state") or "RISK_ON").upper()
+    if regime_state not in ("RISK_ON", "RISK_OFF", "HARD_RISK_OFF"):
+        regime_state = "RISK_ON"
     try:
-        fear_greed = int(fear_greed)
+        vol_multiplier = float(gate.get("vol_multiplier", 1.0) or 1.0)
     except (TypeError, ValueError):
-        fear_greed = 50
+        vol_multiplier = 1.0
+    vol_multiplier = max(0.1, min(1.0, vol_multiplier))
 
-    # Regime adjustment
-    regime_adjustment = 0
-    if fear_greed < 20:      # Extreme Fear
-        regime_adjustment = config.REGIME_FEAR_BONUS
-        regime_label = "EXTREME_FEAR"
-    elif fear_greed < 40:    # Fear
-        regime_adjustment = config.REGIME_FEAR_BONUS // 2
-        regime_label = "FEAR"
-    elif fear_greed <= 60:   # Neutral
-        regime_label = "NEUTRAL"
-    elif fear_greed <= 80:   # Greed
-        regime_adjustment = -(config.REGIME_GREED_PENALTY // 2)
-        regime_label = "GREED"
-    else:                    # Extreme Greed
-        regime_adjustment = -config.REGIME_GREED_PENALTY
-        regime_label = "EXTREME_GREED"
-
-    adjusted_score = max(0, min(100, score + regime_adjustment))
+    adjusted_score = max(0, min(100, score))
+    half_size = False
 
     # Total NAV for sizing
     total_nav = float(portfolio_state.get("total_value", 500) or 500)
 
-    # Action mapping
+    # Action mapping (thresholds as configured; gate shapes entries)
+    risk_off_tactical_floor = int(getattr(
+        config, "REGIME_GATE_RISK_OFF_MIN_TACTICAL_SCORE", config.SCORE_THRESHOLD_STARTER
+    ))
     if adjusted_score >= config.SCORE_THRESHOLD_BUY:
         action = "BUY"
         # Size: 12-18% NAV, scaled by score above threshold
@@ -916,20 +1138,33 @@ def score_to_action(
         scale = (adjusted_score - config.SCORE_THRESHOLD_STARTER) / 10
         alloc_pct = 5.0 + scale * 3.0
     elif adjusted_score >= config.SCORE_THRESHOLD_TACTICAL:
-        # TACTICAL_BUY only in favorable regime (not greed/extreme greed)
-        if regime_label in ("EXTREME_FEAR", "FEAR", "NEUTRAL"):
-            action = "TACTICAL_BUY"
-            scale = (adjusted_score - config.SCORE_THRESHOLD_TACTICAL) / 10
-            alloc_pct = 3.0 + scale * 2.0
-        else:
-            action = "WATCH"
-            alloc_pct = 0.0
+        action = "TACTICAL_BUY"
+        scale = (adjusted_score - config.SCORE_THRESHOLD_TACTICAL) / 10
+        alloc_pct = 3.0 + scale * 2.0
     elif adjusted_score >= 45:
         action = "WATCH"
         alloc_pct = 0.0
     else:
         action = "AVOID"
         alloc_pct = 0.0
+
+    _BUY_SIDE = ("BUY", "STARTER", "TACTICAL_BUY")
+    if regime_state == "HARD_RISK_OFF" and action in _BUY_SIDE:
+        # No new buys — cap at WATCH. Exits are handled elsewhere and never gated.
+        action = "WATCH"
+        alloc_pct = 0.0
+    elif regime_state == "RISK_OFF" and action in _BUY_SIDE:
+        if action == "TACTICAL_BUY" and adjusted_score < risk_off_tactical_floor:
+            action = "WATCH"
+            alloc_pct = 0.0
+        else:
+            # Mark only — callers apply the halving once to the FINAL
+            # allocation (which may come from the CIO instead of this map).
+            half_size = True
+
+    # Volatility-targeted sizing: clamp(20/VIX, 0.5, 1.0) scales size, not verdict.
+    if action in _BUY_SIDE:
+        alloc_pct *= vol_multiplier
 
     # Cap at MAX_POSITION_PCT
     alloc_pct = min(alloc_pct, config.MAX_POSITION_PCT * 100)
@@ -939,8 +1174,13 @@ def score_to_action(
         "action": action,
         "raw_score": score,
         "adjusted_score": adjusted_score,
-        "regime_label": regime_label,
-        "regime_adjustment": regime_adjustment,
+        # regime_label now carries the mechanical gate state (legacy key name
+        # kept because journals/shadow logs/thesis records already read it).
+        "regime_label": regime_state,
+        "regime_state": regime_state,
+        "regime_adjustment": 0,
+        "vol_multiplier": round(vol_multiplier, 3),
+        "half_size": half_size,
         "recommended_allocation_pct": round(alloc_pct, 1),
         "recommended_dollar_amount": round(dollar_amount, 2),
     }
@@ -1145,7 +1385,7 @@ class ArthaCouncil:
         """Render compact IPS summary for prompt injection."""
         if "_raw_yaml" in profile:
             raw = str(profile.get("_raw_yaml", ""))
-            name = _extract_yaml_scalar(raw, "name") or "Sarath"
+            name = _extract_yaml_scalar(raw, "name") or "Investor"
             age = _extract_yaml_scalar(raw, "age") or "?"
             monthly = _extract_yaml_scalar(raw, "monthly_investable") or "?"
             horizon = _extract_yaml_scalar(raw, "investment_horizon_years") or "?"
@@ -1168,7 +1408,7 @@ class ArthaCouncil:
         constraints = profile.get("constraints", []) if isinstance(profile.get("constraints"), list) else []
         goals = profile.get("goals", []) if isinstance(profile.get("goals"), list) else []
 
-        name = investor.get("name", "Sarath")
+        name = investor.get("name", "Investor")
         age = investor.get("age", "?")
         monthly = investor.get("monthly_investable", "?")
         horizon = investor.get("investment_horizon_years", "?")
@@ -1258,6 +1498,45 @@ class ArthaCouncil:
         portfolio_context = self.portfolio_state.render_prompt_summary(portfolio_data)
         recent_decisions_context = self._render_recent_decisions_context(ticker, limit=5)
 
+        # --- Mechanical funnel signals (Wave 2): inject the scan_signals row so
+        # analysts, buy scoring, and the CIO all see the same computed evidence.
+        scan_signal_row: dict = {}
+        try:
+            if not isinstance(stock_data.get("scan_signals"), dict):
+                from .buy_scoring import load_scan_signal_row
+                loaded_row = load_scan_signal_row(ticker)
+                if loaded_row:
+                    stock_data["scan_signals"] = loaded_row
+            scan_signal_row = stock_data.get("scan_signals") or {}
+            if scan_signal_row:
+                logger.info(
+                    "  🧮 Scan signals for %s: track=%s momentum_z=%s 52wH=%s trend_template=%s",
+                    ticker,
+                    scan_signal_row.get("track"),
+                    scan_signal_row.get("momentum_z"),
+                    scan_signal_row.get("high_52w_prox"),
+                    scan_signal_row.get("trend_template"),
+                )
+        except Exception as scan_err:
+            logger.warning("  [council] Scan-signal injection failed for %s: %s", ticker, scan_err)
+
+        # --- Mechanical regime gate (Wave 2, replaces fear/greed penalties) ---
+        try:
+            from .regime_gate import compute_regime
+            regime_gate_state = compute_regime()
+        except Exception as gate_err:
+            logger.warning("  [council] Regime gate compute failed (%s) — trying cache", gate_err)
+            try:
+                from .regime_gate import load_cached_regime
+                regime_gate_state = load_cached_regime() or {}
+            except Exception:
+                regime_gate_state = {}
+        if not regime_gate_state.get("state"):
+            regime_gate_state = {"state": "RISK_ON", "vol_multiplier": 1.0, "details": {"defaulted": True}}
+        regime_gate_label = str(regime_gate_state.get("state") or "RISK_ON").upper()
+        logger.info("  🚦 Regime gate: %s (vol_mult=%.2f)", regime_gate_label,
+                    float(regime_gate_state.get("vol_multiplier", 1.0) or 1.0))
+
         try:
             valuation_expectations = build_valuation_expectations(stock_data)
             stock_data["valuation_expectations"] = valuation_expectations
@@ -1280,7 +1559,10 @@ class ArthaCouncil:
             stock_data["portfolio_factor_risk"] = {}
 
         try:
-            calibration_meta_signal = build_meta_signal(self.journal)
+            # Wave 2: pass stock_data so the meta-ranker can derive an
+            # opportunity-score proxy and bucket the candidate properly
+            # (the CIO score does not exist yet at this stage).
+            calibration_meta_signal = build_meta_signal(self.journal, stock_data=stock_data)
             stock_data["calibration_meta_signal"] = calibration_meta_signal
         except Exception as meta_err:
             logger.warning("  [council] Calibration meta-signal failed for %s: %s", ticker, meta_err)
@@ -1293,15 +1575,62 @@ class ArthaCouncil:
             portfolio_context=portfolio_context,
             recent_decisions=recent_decisions_context,
         )
+        # --- Crisis-grade quality/value-trap pre-checks (advisory, Wave 2) ---
+        # QualityFilter and ValueTrapDetector are pure functions on stock_data.
+        # They are ADVISORY outside crisis mode (QualityFilter's $10B cap gate
+        # is a crisis bar, not a normal-times entry requirement) — the hard
+        # risk gate remains the only deterministic blocker here.
+        crisis_precheck_lines: list[str] = []
+        try:
+            from .crisis import QualityFilter, ValueTrapDetector
+            quality_check = QualityFilter().check(stock_data)
+            value_trap_check = ValueTrapDetector().check(stock_data)
+            stock_data["crisis_quality_filter"] = quality_check
+            stock_data["value_trap"] = value_trap_check
+            crisis_precheck_lines = [
+                f"Crisis-grade quality filter (advisory): {quality_check.get('summary', 'n/a')}",
+                f"Value trap detector (advisory): {value_trap_check.get('summary', 'n/a')}",
+            ]
+        except Exception as precheck_err:
+            logger.warning("  [council] Crisis quality/value-trap pre-checks failed (non-fatal): %s", precheck_err)
+
         deterministic_checks = (
             f"{format_valuation_expectations(valuation_expectations)}\n\n"
             f"{format_portfolio_factor_risk(portfolio_factor_risk)}\n\n"
             f"{format_meta_signal(calibration_meta_signal)}"
         )
+        if crisis_precheck_lines:
+            deterministic_checks += "\n\n" + "\n".join(crisis_precheck_lines)
         context_header = (
             f"{context_header}\n\n--- DETERMINISTIC DECISION CHECKS ---\n"
             f"{deterministic_checks}\n"
             f"--- END DETERMINISTIC DECISION CHECKS ---\n"
+        )
+
+        # --- Lessons from graded history (Wave 2): every analyst and the CIO
+        # sees the digest of its own graded mistakes before opining again.
+        lessons_digest = ""
+        try:
+            from .self_review import get_council_lessons
+            lessons_digest = get_council_lessons() or ""
+        except Exception as lessons_err:
+            logger.warning("  [council] Council lessons digest failed (non-fatal): %s", lessons_err)
+        if lessons_digest:
+            context_header = (
+                f"{context_header}\n\n--- LESSONS FROM YOUR OWN GRADED HISTORY ---\n"
+                f"{lessons_digest}\n"
+                f"--- END LESSONS ---\n"
+            )
+
+        # Regime gate context for all analysts (mechanical, not sentiment).
+        context_header = (
+            f"{context_header}\n\n--- MECHANICAL REGIME GATE ---\n"
+            f"State: {regime_gate_label} | vol_multiplier: "
+            f"{float(regime_gate_state.get('vol_multiplier', 1.0) or 1.0):.2f}\n"
+            f"RISK_ON: full buys. RISK_OFF: new momentum/breakout entries need conviction >= "
+            f"{Config.REGIME_GATE_RISK_OFF_MIN_CONVICTION} and half size. HARD_RISK_OFF: no new buys. "
+            f"Exits are NEVER blocked by this gate.\n"
+            f"--- END MECHANICAL REGIME GATE ---\n"
         )
 
         if regime_context:
@@ -1466,7 +1795,12 @@ class ArthaCouncil:
         # --- Run all 3 analysts IN PARALLEL ---
         from concurrent.futures import ThreadPoolExecutor
 
-        logger.info("  🚀 Running 3 agentic analysts in parallel (%s + Gemini + %s)...", Config.GPT_MODEL, Config.GPT_MODEL)
+        from .analysts import get_contrarian_model_label
+        contrarian_model = get_contrarian_model_label()
+        logger.info(
+            "  🚀 Running 3 agentic analysts in parallel (%s + %s + %s)...",
+            Config.GPT_MODEL, Config.GEMINI_TECHNICAL_MODEL, contrarian_model,
+        )
 
         fund_header = crisis_prefix + context_header if crisis_prefix else context_header
         cont_header = crisis_contrarian_prefix + context_header if crisis_contrarian_prefix else context_header
@@ -1505,7 +1839,7 @@ class ArthaCouncil:
         # --- Parse individual reports ---
         fundamental = AnalystReport.parse("Fundamental", Config.GPT_MODEL, fundamental_raw)
         technical = AnalystReport.parse("Technical + Sentiment", Config.GEMINI_TECHNICAL_MODEL, technical_raw)
-        contrarian = AnalystReport.parse("Contrarian / Risk", Config.GPT_MODEL, contrarian_raw)
+        contrarian = AnalystReport.parse("Contrarian / Risk", contrarian_model, contrarian_raw)
 
         logger.info(
             f"  📋 Verdicts: Fundamental={fundamental.verdict}({fundamental.confidence}), "
@@ -1630,6 +1964,8 @@ class ArthaCouncil:
             deployment_context=deployment_context_str,
             agentic_cio_brief=agentic_cio_brief,
             deterministic_score_audit=render_buy_score_audit(buy_score_audit, include_details=True),
+            lessons=lessons_digest,
+            regime_gate_state=regime_gate_state,
         )
         if not synthesis:
             logger.error(f"  ❌ Synthesis failed for {ticker}")
@@ -1665,6 +2001,68 @@ class ArthaCouncil:
         target_pct = float(scoring.get("target_pct", 0.15) or 0.15)
         cio_verdict = str(scoring.get("verdict", "AVOID" if scoring_invalid else "")).upper()
         cio_confidence = int(scoring.get("confidence", 3 if scoring_invalid else 5) or (3 if scoring_invalid else 5))
+
+        # --- Wave 2: machine-readable CIO decision block (preferred over the
+        # legacy fixed -8%/+15% and prose scraping; regex paths stay as fallback).
+        try:
+            current_price_val = float(str(
+                (stock_data.get("quote") or {}).get("price")
+                or (stock_data.get("yf_quote") or {}).get("price") or 0
+            ).replace(",", ""))
+        except (TypeError, ValueError):
+            current_price_val = 0.0
+        atr14 = _compute_atr14(stock_data.get("price_history"))
+        atr_stop_pct = _atr_initial_stop_pct(current_price_val, atr14, Config)
+
+        cio_decision: dict = {}
+        try:
+            cio_decision = _extract_decision_json(synthesis) or {}
+        except Exception as decision_err:
+            logger.warning("  ⚠️ Decision JSON extraction failed for %s (non-fatal): %s", ticker, decision_err)
+        decision_half_size = bool(cio_decision.get("half_size"))
+        cio_conviction = cio_confidence
+        if cio_decision:
+            logger.info(
+                "  🧩 CIO decision block: verdict=%s conviction=%s stop=%s target=%s half_size=%s conditions=%d",
+                cio_decision.get("verdict"),
+                cio_decision.get("conviction_0_10"),
+                cio_decision.get("stop_price"),
+                cio_decision.get("target_price"),
+                decision_half_size,
+                len(cio_decision.get("invalidation_conditions") or []),
+            )
+            if cio_decision.get("conviction_0_10") is not None:
+                cio_conviction = int(cio_decision["conviction_0_10"])
+            if not cio_verdict and cio_decision.get("verdict"):
+                cio_verdict = str(cio_decision["verdict"]).upper()
+            if cio_decision.get("invalidation_conditions"):
+                # Structured {metric, op, value, description} conditions —
+                # Wave 1 sell engine consumes these directly.
+                invalidation_conditions = cio_decision["invalidation_conditions"]
+            entry_zone = cio_decision.get("entry_zone") or {}
+            if entry_zone.get("valid_until_iso"):
+                entry_valid_until = str(entry_zone["valid_until_iso"])
+
+        # Stop: prefer the CIO's ATR-derived stop_price when its distance is
+        # sane (below entry, within the 10% cap + slack); else derive locally
+        # from 2.5x ATR14 capped at 10%; else keep the CIO scoring value.
+        stop_cap = float(getattr(Config, "CIO_STOP_CAP_PCT", 0.10))
+        cio_stop_price = cio_decision.get("stop_price") if cio_decision else None
+        if current_price_val > 0 and cio_stop_price:
+            stop_frac = (float(cio_stop_price) - current_price_val) / current_price_val
+            if -(stop_cap * 1.05) <= stop_frac < 0:
+                stop_loss_pct = round(stop_frac, 4)
+            elif atr_stop_pct is not None:
+                logger.info(
+                    "  🧮 CIO stop_price %.2f out of bounds (%.1f%%) — using ATR-derived stop %.1f%%",
+                    float(cio_stop_price), stop_frac * 100, atr_stop_pct * 100,
+                )
+                stop_loss_pct = atr_stop_pct
+        elif atr_stop_pct is not None:
+            stop_loss_pct = atr_stop_pct
+        cio_target_price = cio_decision.get("target_price") if cio_decision else None
+        if current_price_val > 0 and cio_target_price and float(cio_target_price) > current_price_val:
+            target_pct = round(float(cio_target_price) / current_price_val - 1.0, 4)
 
         scoring_audit = apply_cio_buy_adjustment(
             scoring,
@@ -1709,52 +2107,119 @@ class ArthaCouncil:
             audit_status,
         )
 
-        # --- Apply score-to-action mapping ---
-        action_result = score_to_action(raw_score, fear_greed, portfolio_data, Config)
+        # --- Apply score-to-action mapping (regime gate, no F&G penalty) ---
+        action_result = score_to_action(
+            raw_score, fear_greed, portfolio_data, Config,
+            regime_gate_state=regime_gate_state,
+        )
         adjusted_score = action_result["adjusted_score"]
         mapped_action = action_result["action"]
         mapped_alloc_pct = action_result["recommended_allocation_pct"]
+        gate_vol_multiplier = float(action_result.get("vol_multiplier", 1.0) or 1.0)
 
         analyst_buy_count = sum(
             1 for r in [fundamental, technical, contrarian]
             if str(getattr(r, "verdict", "") or "").upper() == "BUY"
         )
 
-        # Default rule: CIO can restrict, never upgrade above the score-mapped ceiling.
-        # Sarath override (2026-04-05): avoid "WATCH forever" on decent setups.
-        # If the score maps to a buy-side action, multiple analysts support BUY,
-        # and the CIO still downgrades to WATCH/DEFER, preserve a small tactical path.
-        watch_bias_override = (
-            mapped_action in ("BUY", "STARTER", "TACTICAL_BUY")
+        _BUY_SIDE_ACTIONS = ("BUY", "STARTER", "TACTICAL_BUY")
+
+        # Default rule: CIO can restrict, never upgrade above the score-mapped
+        # ceiling — EXCEPT via the Wave 2 mechanical-override path: when the
+        # funnel composite is STRONG (momentum/breakout track, z >= 1.5, trend
+        # template pass) and no analyst produced a SELL-grade falsifiable risk,
+        # the CIO may go ONE notch above the mapped action; and a CIO downgrade
+        # to WATCH/DEFER against a buy-side map with >= 2 analyst BUYs keeps a
+        # tactical path (this replaces the old fear/greed-tied anti-watch-bias
+        # override — same intent, now mechanically qualified).
+        mechanical_strong = _mechanical_composite_strong(scan_signal_row, Config)
+        gate_allows_buys = regime_gate_label != "HARD_RISK_OFF"
+        mechanical_override_reason = ""
+
+        if (
+            gate_allows_buys
+            and mechanical_strong
+            and not research_insufficient
+            and cio_verdict in _VALID_FINAL_VERDICTS
+            and _BUY_NOTCH_UPGRADE.get(mapped_action) == cio_verdict
+            and contrarian.verdict != "SELL"
+        ):
+            final_action = cio_verdict
+            final_alloc_pct = (
+                alloc_pct_from_cio * gate_vol_multiplier
+                if alloc_pct_from_cio > 0
+                else max(3.0, float(mapped_alloc_pct or 0))
+            )
+            mechanical_override_reason = (
+                f"mechanical-override: CIO upgraded {mapped_action} -> {cio_verdict} on strong "
+                f"composite (track={scan_signal_row.get('track')}, momentum_z={scan_signal_row.get('momentum_z')}, "
+                f"trend_template={scan_signal_row.get('trend_template')})"
+            )
+            logger.info("  🪜 %s for %s", mechanical_override_reason, ticker)
+        elif (
+            gate_allows_buys
+            and mechanical_strong
+            and mapped_action in _BUY_SIDE_ACTIONS
             and cio_verdict in ("WATCH", "DEFER")
             and adjusted_score >= Config.SCORE_THRESHOLD_TACTICAL
             and analyst_buy_count >= 2
-            and action_result.get("regime_label") in ("EXTREME_FEAR", "FEAR", "NEUTRAL")
             and not research_insufficient
-        )
-        if watch_bias_override:
+        ):
             final_action = "TACTICAL_BUY"
             final_alloc_pct = min(
                 max(3.0, float(mapped_alloc_pct or 0)),
                 Config.EXPLORATION_MAX_PER_POSITION_PCT * 100,
             )
-            logger.info(
-                "  🪜 Anti-watch-bias override for %s — mapped=%s CIO=%s adjusted_score=%s analysts_buy=%s => TACTICAL_BUY %.1f%%",
-                ticker,
-                mapped_action,
-                cio_verdict,
-                adjusted_score,
-                analyst_buy_count,
-                final_alloc_pct,
+            mechanical_override_reason = (
+                f"mechanical-override: anti-watch-bias — mapped={mapped_action} CIO={cio_verdict} "
+                f"adjusted_score={adjusted_score} analysts_buy={analyst_buy_count} on strong composite"
             )
+            logger.info("  🪜 %s => TACTICAL_BUY %.1f%% for %s", mechanical_override_reason, final_alloc_pct, ticker)
         else:
             if cio_verdict in _VALID_FINAL_VERDICTS:
                 final_action = _min_risk_action(mapped_action, cio_verdict)
             else:
                 final_action = mapped_action
 
-            # Allocation: use CIO-specified if plausible, else use mapped
-            final_alloc_pct = alloc_pct_from_cio if alloc_pct_from_cio > 0 else mapped_alloc_pct
+            # Allocation: use CIO-specified if plausible (vol-scaled), else mapped
+            final_alloc_pct = (
+                alloc_pct_from_cio * gate_vol_multiplier
+                if alloc_pct_from_cio > 0
+                else mapped_alloc_pct
+            )
+
+        # --- Regime gate enforcement on the FINAL action (all paths) ---
+        # HARD_RISK_OFF: no new buys, ever (exits are handled by the sell
+        # engine and are never gated). RISK_OFF: momentum/breakout entries
+        # need conviction >= 8; all new buys run half size.
+        half_size_final = bool(action_result.get("half_size")) or decision_half_size
+        _NEW_CAPITAL_ACTIONS = ("BUY", "STARTER", "TACTICAL_BUY", "ACCUMULATE", "ADD")
+        if final_action in _NEW_CAPITAL_ACTIONS and regime_gate_label == "HARD_RISK_OFF":
+            logger.info("  🚦 HARD_RISK_OFF — forcing %s → WATCH for %s (no new buys)", final_action, ticker)
+            final_action = "WATCH"
+            final_alloc_pct = 0.0
+            synthesis += (
+                "\n\nREGIME GATE NOTE: HARD_RISK_OFF (SPY below 200d SMA with negative 12-mo "
+                "excess return vs T-bills) — new buys are mechanically blocked; verdict capped at WATCH."
+            )
+        elif final_action in _BUY_SIDE_ACTIONS and regime_gate_label == "RISK_OFF":
+            signal_track = str(scan_signal_row.get("track") or "").lower()
+            min_conviction = int(Config.REGIME_GATE_RISK_OFF_MIN_CONVICTION)
+            if signal_track in ("momentum", "breakout") and cio_conviction < min_conviction:
+                logger.info(
+                    "  🚦 RISK_OFF — %s track needs conviction >= %d (got %d): %s → WATCH for %s",
+                    signal_track, min_conviction, cio_conviction, final_action, ticker,
+                )
+                final_action = "WATCH"
+                final_alloc_pct = 0.0
+                synthesis += (
+                    f"\n\nREGIME GATE NOTE: RISK_OFF — new {signal_track} entries require council "
+                    f"conviction >= {min_conviction} (got {cio_conviction}); verdict capped at WATCH."
+                )
+            else:
+                half_size_final = True
+        if half_size_final and final_action in _BUY_SIDE_ACTIONS:
+            final_alloc_pct = round(final_alloc_pct * 0.5, 2)
 
         # --- Clamp allocation against hard constraints, but preserve exploration path ---
         _total_nav_for_clamp = max(deployment.get("total_nav", 0) or 0, 1)
@@ -1764,7 +2229,7 @@ class ArthaCouncil:
         has_cash = float(deployment.get("cash", 0) or 0) > 0
         has_slots = int(deployment.get("available_slots", 0) or 0) > 0
         if has_cash and has_slots and final_action in ("BUY", "STARTER", "TACTICAL_BUY"):
-            # Sarath's directive: keep looking for the ladder in chaos. If regime math says
+            # Keep looking for the ladder in chaos. If regime math says
             # deployable=0 but cash still exists, preserve a small exploration/tactical path.
             exploration_pct = min(
                 Config.EXPLORATION_MAX_PER_POSITION_PCT * 100,
@@ -1899,6 +2364,9 @@ class ArthaCouncil:
             no_new_capital=parsed["final_verdict"] in _NO_NEW_CAPITAL,
         )
 
+        if mechanical_override_reason and "MECHANICAL OVERRIDE NOTE:" not in (synthesis or ""):
+            synthesis += f"\n\nMECHANICAL OVERRIDE NOTE: {mechanical_override_reason}"
+
         final_decision = CouncilDecision(
             ticker=ticker,
             final_verdict=parsed["final_verdict"],
@@ -1931,6 +2399,13 @@ class ArthaCouncil:
             rule_adjustment_total=int(scoring_audit.get("rule_adjustment_total") or 0),
             cio_adjustment=int(scoring_audit.get("cio_adjustment") or 0),
             scoring_audit=scoring_audit,
+            cio_decision=cio_decision,
+            half_size=bool(half_size_final and parsed["final_verdict"] in _BUY_SIDE_ACTIONS),
+            regime_gate={
+                "state": regime_gate_label,
+                "vol_multiplier": float(regime_gate_state.get("vol_multiplier", 1.0) or 1.0),
+            },
+            mechanical_override=mechanical_override_reason,
         )
 
         try:
@@ -1999,11 +2474,20 @@ class ArthaCouncil:
                         except Exception:
                             pass
 
-                    # Extract regime info
+                    # Extract regime info — prefer the mechanical gate state
+                    # (matches data/regime_state.json, which the sell engine
+                    # compares entry_regime against); fall back to the
+                    # portfolio_state keys (it emits both 'regime_label' and
+                    # 'regime').
                     regime_str = None
                     try:
                         deploy_ctx = final_decision.deployment_context or {}
-                        regime_str = deploy_ctx.get("regime") or deploy_ctx.get("fear_greed_label")
+                        regime_str = (
+                            regime_gate_label
+                            or deploy_ctx.get("regime_label")
+                            or deploy_ctx.get("regime")
+                            or deploy_ctx.get("fear_greed_label")
+                        )
                     except Exception:
                         pass
 
@@ -2031,6 +2515,7 @@ class ArthaCouncil:
                             recommended_allocation_pct=float(final_alloc_pct or 0),
                             entry_regime=regime_str,
                         )
+                        tracker.refresh_pending_expiry(existing_pending.thesis_id)
                         logger.info(
                             "[council] Updated existing pending thesis %s for %s",
                             existing_pending.thesis_id[:8], ticker,
@@ -2070,6 +2555,8 @@ class ArthaCouncil:
         deployment_context: str = "",
         agentic_cio_brief: str = "",
         deterministic_score_audit: str = "",
+        lessons: str = "",
+        regime_gate_state: dict | None = None,
     ) -> Optional[str]:
         """Run the synthesis mediator (GPT 5.5) with v2 scoring prompt."""
         dcf_data = stock_data.get("dcf") or {}
@@ -2159,6 +2646,39 @@ class ArthaCouncil:
             f"{format_meta_signal(calibration_meta_signal)}"
         )
 
+        # Wave 2 anchors: ATR(14) for the structured decision block's
+        # ATR-derived stop, the funnel's mechanical scan signals, and the
+        # mechanical regime gate state.
+        atr14 = _compute_atr14(stock_data.get("price_history"))
+        if atr14 and isinstance(current_price, (int, float)) and current_price > 0:
+            atr_mult = float(getattr(Config, "CIO_STOP_ATR_MULT", 2.5))
+            stop_cap = float(getattr(Config, "CIO_STOP_CAP_PCT", 0.10))
+            atr_stop_price = max(
+                current_price - atr_mult * atr14,
+                current_price * (1 - stop_cap),
+            )
+            valuation_anchors += (
+                f"\nATR(14): ${atr14:.2f} ({atr14 / current_price:.1%} of price). "
+                f"{atr_mult:.1f}x ATR initial stop = ${current_price - atr_mult * atr14:.2f}; "
+                f"capped at {stop_cap:.0%} below entry => use stop_price ~ ${atr_stop_price:.2f}."
+            )
+        scan_signal_row = stock_data.get("scan_signals") or {}
+        if scan_signal_row:
+            valuation_anchors += (
+                f"\nMechanical scan signals ({scan_signal_row.get('scan_date', '?')}): "
+                f"track={scan_signal_row.get('track')}, momentum_z={scan_signal_row.get('momentum_z')}, "
+                f"composite_z={scan_signal_row.get('composite_z')}, "
+                f"52wH_prox={scan_signal_row.get('high_52w_prox')}, "
+                f"trend_template={scan_signal_row.get('trend_template')}, "
+                f"ID={scan_signal_row.get('information_discreteness')}, "
+                f"volume_confirmed={scan_signal_row.get('volume_confirmed')}"
+            )
+        if regime_gate_state:
+            valuation_anchors += (
+                f"\nMechanical regime gate: {regime_gate_state.get('state')} "
+                f"(vol_multiplier {float(regime_gate_state.get('vol_multiplier', 1.0) or 1.0):.2f})"
+            )
+
         prompt = (crisis_prefix + SYNTHESIS_PROMPT).format(
             ticker=ticker,
             fundamental_report=fundamental.report,
@@ -2168,6 +2688,7 @@ class ArthaCouncil:
             deployment_context=deployment_context or "Deployment context not available.",
             agentic_cio_brief=agentic_cio_brief or "Agentic diligence trace not available.",
             deterministic_score_audit=deterministic_score_audit or "Deterministic buy score audit not available.",
+            lessons=lessons or "No graded lessons on record yet.",
         )
 
         try:

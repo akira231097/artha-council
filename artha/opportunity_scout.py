@@ -22,7 +22,14 @@ logger = logging.getLogger(__name__)
 
 BUY_NOW_LANE = "execution_ready"
 QUALITY_SLEEVES = {"entry_quality", "quality_value", "pullback_quality"}
+# Momentum-type funnel tracks: for these, valuation-anchor penalties (price
+# above analyst target, technical extension, high beta in Greed) are removed —
+# they penalize exactly what the funnel promotes (a stock near its 52w high
+# with strong 12-1 momentum is USUALLY above stale analyst targets). Value-type
+# candidates keep the anchors.
+MOMENTUM_TRACKS = {"momentum", "breakout", "catalyst_ep"}
 _FENCE = chr(96) * 3
+_TOOL_RESULT_MAX_CHARS = 60000
 
 
 def _utcnow() -> datetime:
@@ -302,6 +309,13 @@ class OpportunityScout:
         r3 = _num(candidate.get("return_3m"), 0.0) or 0.0
         r12 = _num(candidate.get("return_12m"), 0.0) or 0.0
 
+        # Track-consistent scoring: explicitly momentum-type tracks (momentum,
+        # breakout, catalyst_ep) must not be penalized for the very signals the
+        # funnel promoted them for. Untracked candidates (legacy/fallback
+        # sources) and value-type candidates keep the valuation anchors.
+        track = str(candidate.get("track") or "").lower()
+        momentum_track = track in MOMENTUM_TRACKS
+
         positives: list[str] = []
         negatives: list[str] = []
         flags: list[str] = []
@@ -312,19 +326,30 @@ class OpportunityScout:
         score += min(14.0, max(-8.0, route_score / 40.0))
 
         if consensus_upside is not None:
-            if consensus_upside >= 20:
-                score += 18
-                positives.append(f"consensus upside {consensus_upside:.1f}%")
-            elif consensus_upside >= 8:
-                score += 8
-                positives.append(f"usable consensus upside {consensus_upside:.1f}%")
-            elif consensus_upside < -10:
-                score -= 30
-                flags.append("price_above_consensus_target")
-                negatives.append(f"price is {abs(consensus_upside):.1f}% above consensus target")
-            elif consensus_upside < 3:
-                score -= 12
-                negatives.append(f"thin consensus upside {consensus_upside:.1f}%")
+            if momentum_track:
+                # Analyst targets lag momentum winners; treat them as weak,
+                # capped context only — never as a negative.
+                if consensus_upside >= 20:
+                    score += 6
+                    positives.append(f"consensus upside {consensus_upside:.1f}% (lagging indicator)")
+                elif consensus_upside >= 8:
+                    score += 3
+                elif consensus_upside < -10:
+                    flags.append("above_consensus_target_info")
+            else:
+                if consensus_upside >= 20:
+                    score += 18
+                    positives.append(f"consensus upside {consensus_upside:.1f}%")
+                elif consensus_upside >= 8:
+                    score += 8
+                    positives.append(f"usable consensus upside {consensus_upside:.1f}%")
+                elif consensus_upside < -10:
+                    score -= 30
+                    flags.append("price_above_consensus_target")
+                    negatives.append(f"price is {abs(consensus_upside):.1f}% above consensus target")
+                elif consensus_upside < 3:
+                    score -= 12
+                    negatives.append(f"thin consensus upside {consensus_upside:.1f}%")
 
         if dcf_upside is not None:
             if dcf_upside >= 20:
@@ -373,15 +398,43 @@ class OpportunityScout:
             score += min(10, entry_score / 2)
             positives.append(f"entry-quality score {entry_score:.1f}")
 
-        if fear_greed >= 60 and beta >= 2.0:
+        if fear_greed >= 60 and beta >= 2.0 and not momentum_track:
             penalty = 8 if beta < 3 else 15
             score -= penalty
             flags.append("greed_high_beta_momentum_penalty")
             negatives.append(f"high beta {beta:.2f} in Greed regime")
         if r1 > 40 or r3 > 90 or r12 > 350:
-            score -= 8
-            flags.append("technical_extension_risk")
-            negatives.append("recent move looks extended")
+            if momentum_track:
+                flags.append("technical_extension_info")
+            else:
+                score -= 8
+                flags.append("technical_extension_risk")
+                negatives.append("recent move looks extended")
+
+        # Track-consistent positives from scan-time rulebook signals
+        if momentum_track:
+            if candidate.get("trend_template"):
+                score += 6
+                positives.append("trend template pass (close>SMA50>SMA150>SMA200)")
+            prox = _num(candidate.get("high_52w_prox"), None)
+            if prox is not None and prox >= 0.95:
+                score += 8
+                positives.append(f"{prox:.0%} of 52w high (breakout zone)")
+            elif prox is not None and prox >= 0.85:
+                score += 4
+                positives.append(f"{prox:.0%} of 52w high")
+            if candidate.get("volume_confirmed"):
+                score += 4
+                positives.append("volume >= 1.4x 50d average")
+            if candidate.get("id_smooth"):
+                score += 3
+                positives.append("smooth momentum path (frog-in-the-pan)")
+            if track == "catalyst_ep":
+                gap = _num(candidate.get("gap_pct"), 0.0) or 0.0
+                score += 6
+                positives.append(
+                    f"episodic pivot: +{gap:.1f}% gap on {candidate.get('catalyst_type') or 'catalyst'}"
+                )
         if getattr(row, "spread_pct", None) is not None and float(getattr(row, "spread_pct")) <= 0.002:
             score += 4
             positives.append("very tight live spread")
@@ -396,7 +449,12 @@ class OpportunityScout:
             "industry": candidate.get("industry") or "",
             "price": round(price, 4) if price else None,
             "beta": beta,
+            "track": track or ("momentum" if momentum_track else "value"),
             "primary_alpha_sleeve": sleeve,
+            "trend_template": candidate.get("trend_template"),
+            "high_52w_prox": candidate.get("high_52w_prox"),
+            "volume_confirmed": candidate.get("volume_confirmed"),
+            "composite_percentile": candidate.get("composite_percentile"),
             "consensus_target": target,
             "consensus_upside_pct": round(consensus_upside, 2) if consensus_upside is not None else None,
             "target_low": target_low,
@@ -497,6 +555,7 @@ class OpportunityScout:
             timeout=Config.OPPORTUNITY_SCOUT_TIMEOUT_SECONDS,
         )
         scratch = ""
+        full_card_reads = 0
         for _step in range(max(2, int(Config.OPPORTUNITY_SCOUT_MAX_TOOL_STEPS))):
             raw = client.chat(prompt + scratch)
             parsed = _parse_json_object(raw)
@@ -518,6 +577,28 @@ class OpportunityScout:
 
             tool_name = str(parsed.get("tool_name") or "").strip()
             args = parsed.get("args") if isinstance(parsed.get("args"), dict) else {}
+            if tool_name == "read_candidate_cards" and bool(args.get("include_all", False)) and not args.get("tickers"):
+                full_card_reads += 1
+                if full_card_reads > 1:
+                    result = {
+                        "error": "candidate_cards_already_provided",
+                        "instruction": "Use the prior compact candidate cards and return final_ranking JSON now.",
+                    }
+                    tool_trace.append(
+                        {
+                            "tool_name": tool_name,
+                            "args": args,
+                            "status": "FAIL",
+                            "reason": str(parsed.get("reason") or "")[:500],
+                            "result": self._json_safe(result),
+                        }
+                    )
+                    scratch += (
+                        "\n\nTOOL RESULT "
+                        + json.dumps({"tool_name": tool_name, "status": "FAIL", "result": result}, ensure_ascii=True)
+                        + "\nYou already have all compact candidate cards. Return final_ranking JSON now."
+                    )
+                    continue
             result = self._run_tool(tool_name, args, cards, market_snapshot, deployment)
             status = "FAIL" if isinstance(result, dict) and result.get("error") else "PASS"
             tool_trace.append(
@@ -531,9 +612,28 @@ class OpportunityScout:
             )
             scratch += (
                 "\n\nTOOL RESULT "
-                + json.dumps({"tool_name": tool_name, "status": status, "result": result}, ensure_ascii=True)[:18000]
+                + json.dumps({"tool_name": tool_name, "status": status, "result": result}, ensure_ascii=True)[:_TOOL_RESULT_MAX_CHARS]
                 + "\nContinue. Either request another tool or return final_ranking JSON."
             )
+        if any(item.get("tool_name") == "read_candidate_cards" and item.get("status") == "PASS" for item in tool_trace):
+            ranked = self._validate_agent_ranking(
+                {
+                    "ranked_tickers": [card.ticker for card in cards],
+                    "summary": "Deterministic safety finish after the agent read candidate cards but did not emit valid final_ranking.",
+                },
+                card_by_ticker,
+            )
+            tool_trace.append(
+                {
+                    "tool_name": "deterministic_safety_finish",
+                    "status": "WARN",
+                    "result": {
+                        "ranked_tickers": [c.ticker for c in ranked],
+                        "reason": "Agent read candidate cards but exhausted tool steps without final_ranking; preserved deterministic scout order instead of failing the scan.",
+                    },
+                }
+            )
+            return ranked, tool_trace
         raise RuntimeError("Scout exhausted tool budget without a valid final_ranking")
 
     def _agent_prompt(
@@ -555,9 +655,11 @@ Operating rules:
 1. Preserve standards. Never force a buy candidate because the user wants activity.
 2. Use structured provider data as the hard anchor. Web/news is supporting context unless official and corroborated.
 3. The broker router decides execution/data feasibility only. Company risk remains for Council.
-4. Penalize names already above analyst consensus target unless there is strong, specific evidence of estimate/target revision.
-5. Penalize high-beta, technically extended momentum names more heavily in Greed regimes.
-6. Prefer scarce Council slots for candidates with viable upside, reasonable cash-flow/valuation support, clean data, and buyable execution.
+4. Rank by TRACK-CONSISTENT logic. Each card carries a "track" label:
+   - momentum / breakout / catalyst_ep tracks: rank on trend quality (trend_template, 52w-high proximity, volume confirmation, smooth momentum path, catalyst strength). Analyst price targets LAG winners — NEVER use "price above analyst target" or "thin consensus upside" as a negative for these tracks, and do not penalize technical extension or high beta; those are properties the funnel selected FOR. Deprioritize momentum names only for track-consistent reasons (breaking trend, fading volume, deteriorating estimates, binary event risk).
+   - value track (entry_quality / quality_value / pullback_quality sleeves): keep valuation discipline — penalize names above consensus target without revision evidence, weak FCF, or stretched multiples.
+5. In Greed regimes, apply extra caution to VALUE-track names being chased late; do not down-rank momentum-track names merely for beta or extension.
+6. Prefer scarce Council slots for candidates with the strongest track-consistent evidence, clean data, and buyable execution.
 7. If FMP target data appears stale or conflicts with the thesis, use tools to inspect FMP/web context before ranking.
 8. Output only JSON. No markdown.
 
@@ -579,7 +681,7 @@ Available tools:
   Args: {{"tickers":["AAPL"]}}
 
 First action:
-Call read_candidate_cards before final_ranking.
+Call read_candidate_cards once before final_ranking. The compact result is intentionally condensed for up to 40 names; do not keep asking for an untruncated version. If a required detail is missing, use fetch_fmp_snapshot, web_research, or read_broker_context for specific tickers, then return final_ranking.
 
 Final JSON schema:
 {{

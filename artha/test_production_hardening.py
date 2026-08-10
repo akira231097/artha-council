@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -1404,6 +1404,8 @@ class TestShadowRulesAndSupervisor(unittest.TestCase):
             "\n".join(
                 [
                     "12:00:00 [artha.researcher] WARNING: Failed to fetch article https://x: 403 Client Error",
+                    "12:00:01 [artha.rank_candidates] WARNING: ranking budget exhausted after 120s",
+                    "12:00:02 [artha.analyst_signals] WARNING: Short interest unavailable for TEST in scan-safe mode",
                     "12:01:00 [artha.council] WARNING: Scoring JSON failed schema validation — rejecting block",
                     "12:02:00 [artha.collector] ERROR: [finnhub] Unexpected error: reset",
                     "12:03:00 [artha.scheduler] INFO: [health] New alerts=0 (critical=0, warning=0)",
@@ -1416,19 +1418,197 @@ class TestShadowRulesAndSupervisor(unittest.TestCase):
         self.assertEqual(result["status"], "WARN")
         self.assertEqual(result["quality_issue_count"], 1)
         self.assertEqual(result["error_count"], 1)
+        self.assertEqual(result["transient_warning_count"], 3)
+
+    def test_supervisor_recent_log_check_ignores_dashboard_client_disconnects(self):
+        from artha.supervisor import _check_recent_logs
+
+        log_dir = self.tmp_dir / "logs"
+        log_dir.mkdir()
+        (log_dir / "dashboard.err.log").write_text(
+            "\n".join(
+                [
+                    "----------------------------------------",
+                    "Exception occurred during processing of request from ('192.168.1.254', 46656)",
+                    "Traceback (most recent call last):",
+                    '  File "/opt/homebrew/lib/python3.14/socketserver.py", line 697, in process_request_thread',
+                    "    self.finish_request(request, client_address)",
+                    '  File "/opt/homebrew/lib/python3.14/http/server.py", line 464, in handle_one_request',
+                    "    self.raw_requestline = self.rfile.readline(65537)",
+                    "ConnectionResetError: [Errno 54] Connection reset by peer",
+                    "----------------------------------------",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = _check_recent_logs(log_dir=log_dir, lookback_hours=48)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["fatal_count"], 0)
+        self.assertEqual(result["error_count"], 0)
         self.assertEqual(result["transient_warning_count"], 1)
+
+    def test_catalyst_lane_backfills_missing_average_volume_for_top_mover(self):
+        from artha import scanner
+
+        class FakeFMP:
+            def market_gainers(self, limit=30):
+                return [
+                    {
+                        "symbol": "ACHR",
+                        "name": "Archer Aviation",
+                        "price": 5.31,
+                        "changesPercentage": 19.59,
+                    }
+                ]
+
+            def quote(self, symbol):
+                return {
+                    "symbol": symbol,
+                    "name": "Archer Aviation",
+                    "price": 5.31,
+                    "changePercentage": 19.59,
+                    "volume": 95_000_000,
+                    "avgVolume": None,
+                    "marketCap": 4_000_000_000,
+                }
+
+            def history(self, symbol, period="3mo"):
+                return [{"volume": 37_000_000} for _ in range(45)]
+
+            def company_profile(self, symbol):
+                return {"isEtf": False, "isFund": False}
+
+            def stock_news(self, symbol, limit=3):
+                return [
+                    {
+                        "symbol": "AAPL",
+                        "publishedDate": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "title": "Apple unrelated news",
+                    }
+                ]
+
+        earnings_context = Mock(days_to_earnings=30)
+        with patch("artha.scanner.FMPCollector", return_value=FakeFMP()), \
+             patch("artha.scanner._get_news_catalysts", return_value=[]), \
+             patch("artha.earnings_calendar.get_earnings_context", return_value=earnings_context):
+            candidates = scanner.get_catalyst_candidates(max_candidates=3)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["symbol"], "ACHR")
+        self.assertEqual(candidates[0]["avg_volume_source"], "history")
+        self.assertEqual(candidates[0]["catalyst_type"], "top_mover_volume")
+        self.assertGreater(candidates[0]["volume_ratio"], 2.0)
+
+    def test_fmp_stock_news_filters_unrelated_symbol_rows(self):
+        from artha.collector import FMPCollector
+
+        fmp = FMPCollector()
+        rows = [
+            {"symbol": "AAPL", "title": "Apple unrelated news"},
+            {"symbol": "NASDAQ:ACHR", "title": "Archer relevant news"},
+            {"symbols": "TSLA, ACHR", "title": "Multi-symbol relevant news"},
+        ]
+        with patch.object(fmp, "_get", return_value=rows):
+            news = fmp.stock_news("ACHR")
+
+        self.assertEqual([row["title"] for row in news], [
+            "Archer relevant news",
+            "Multi-symbol relevant news",
+        ])
+
+    def test_missed_winner_audit_marks_low_price_policy_exclusion_non_actionable(self):
+        from artha.self_review import NightlyReview
+
+        class FakeAccuracy:
+            def _lock(self, exclusive=False):
+                return object()
+
+            def _unlock(self, lock):
+                return None
+
+            def _load(self):
+                return []
+
+        class FakeFMP:
+            def market_gainers(self, limit=50):
+                return [
+                    {
+                        "symbol": "AMC",
+                        "name": "AMC Entertainment",
+                        "price": 2.46,
+                        "changesPercentage": 26.8,
+                    }
+                ]
+
+            def quote(self, symbol):
+                return {
+                    "symbol": symbol,
+                    "price": 2.46,
+                    "changePercentage": 26.8,
+                    "marketCap": 1_500_000_000,
+                }
+
+        class FakeCursor:
+            def fetchone(self):
+                return None
+
+        class FakeConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, *args, **kwargs):
+                return FakeCursor()
+
+        class FakeJournal:
+            def _connect(self):
+                return FakeConnection()
+
+        review = NightlyReview()
+        review.accuracy = FakeAccuracy()
+        today = datetime(2026, 7, 20, tzinfo=timezone.utc).date()
+        with patch("artha.collector.FMPCollector", return_value=FakeFMP()), \
+             patch("artha.journal.DecisionJournal", return_value=FakeJournal()), \
+             patch("artha.self_review.record_lesson"):
+            learnings = review._audit_missed_winners(today)
+
+        self.assertEqual(len(learnings), 1)
+        self.assertEqual(learnings[0]["ticker"], "AMC")
+        self.assertEqual(learnings[0]["artha_disposition"], "policy_excluded_low_price")
+        self.assertFalse(learnings[0]["actionable_miss"])
+
+        improvement = review._identify_improvement({"missed_winners": learnings})
+        self.assertNotEqual(improvement["type"], "missed_winner_audit")
 
 
 class TestExecutionReadiness(unittest.TestCase):
     def setUp(self):
+        from artha.config import Config
+
         self.tmp_dir = Path(tempfile.mkdtemp())
+        self._stand_down_config = (
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT,
+            Config.ROBINHOOD_CONTROL_FILE,
+        )
+        Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = False
+        Config.ROBINHOOD_CONTROL_FILE = str(self.tmp_dir / "control.json")
 
     def tearDown(self):
         import shutil
+        from artha.config import Config
+
+        (
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT,
+            Config.ROBINHOOD_CONTROL_FILE,
+        ) = self._stand_down_config
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def _journal_with_clean_buy_decision(self):
         from artha.journal import DecisionJournal
+        from artha.thesis_tracker import ThesisTracker
 
         journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
         journal.save_supervisor_run(
@@ -1457,6 +1637,12 @@ class TestExecutionReadiness(unittest.TestCase):
                 "feature_json": json.dumps({"unit": True}),
             }
         )
+        ThesisTracker(journal).create_thesis(
+            "TEST",
+            "STARTER",
+            thesis_summary="Current unit-test Council thesis.",
+            invalidation_conditions=[{"metric": "price", "op": "lte", "value": 90.0}],
+        )
         return journal
 
     def _market_data(self):
@@ -1476,6 +1662,22 @@ class TestExecutionReadiness(unittest.TestCase):
     ) -> dict:
         from artha.execution import normalize_robinhood_position_snapshot
 
+        position_rows = positions or []
+        invested = 0.0
+        for row in position_rows:
+            quantity = float(row.get("quantity") or row.get("shares") or 0.0)
+            market_value = row.get("market_value") or row.get("equity") or row.get("value")
+            if market_value is not None:
+                invested += float(market_value)
+            else:
+                price = float(
+                    row.get("market_price")
+                    or row.get("current_price")
+                    or row.get("price")
+                    or row.get("average_buy_price")
+                    or 0.0
+                )
+                invested += quantity * price
         return normalize_robinhood_position_snapshot(
             {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1487,8 +1689,13 @@ class TestExecutionReadiness(unittest.TestCase):
                     "agentic_allowed": True,
                     "state": "active",
                 },
-                "portfolio": {"buying_power": cash},
-                "positions": positions or [],
+                "portfolio": {
+                    "buying_power": cash,
+                    "cash": cash,
+                    "total_value": cash + invested,
+                    "equity_value": invested,
+                },
+                "positions": position_rows,
                 "orders": orders or [],
             }
         )
@@ -1508,6 +1715,7 @@ class TestExecutionReadiness(unittest.TestCase):
         return path
 
     def _save_defer_watch(self, journal, watch_id: str = "watch-test") -> None:
+        valid_until = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
         journal.save_defer_watch(
             {
                 "watch_id": watch_id,
@@ -1522,7 +1730,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 "invalidation_conditions": "[]",
                 "opportunity_score": 52,
                 "confidence": 7,
-                "entry_valid_until": "2026-07-04T00:00:00+00:00",
+                "entry_valid_until": valid_until,
                 "dossier_path": str(self.tmp_dir / "old_dossier.json"),
                 "trace_path": str(self.tmp_dir / "old_trace.json"),
                 "notes": "unit watch",
@@ -1576,7 +1784,7 @@ class TestExecutionReadiness(unittest.TestCase):
             adjusted_score=61,
             opportunity_score=59,
             confidence=7,
-            entry_valid_until="2026-07-05",
+            entry_valid_until=(datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat(),
             dossier_path=str(self.tmp_dir / "NEE_dossier.json"),
             agentic_trace={"trace_path": str(self.tmp_dir / "NEE_trace.json")},
         )
@@ -1613,6 +1821,26 @@ class TestExecutionReadiness(unittest.TestCase):
         self.assertTrue(any(54 <= z.low <= 56 for z in zones))
         self.assertFalse(any(18 <= z.low <= 29 for z in zones))
 
+    def test_defer_watch_extraction_rejects_far_off_artifact_zones(self):
+        from artha.defer_watchlist import extract_entry_zones
+
+        dar_action = (
+            "DEFER — create an entry watch near $55. If budget reopens, prepare a "
+            "fractional market review for about $20-$25; do not chase."
+        )
+        ivz_action = (
+            "DEFER — re-review near $26.10; valuation context mentions P/E 10.29-10.79 "
+            "but that is not a stock entry price."
+        )
+
+        dar_zones = extract_entry_zones(dar_action, current_price=58.12, max_zones=3)
+        ivz_zones = extract_entry_zones(ivz_action, current_price=29.245, max_zones=3)
+
+        self.assertTrue(any(54 <= z.low <= 56 for z in dar_zones))
+        self.assertFalse(any(19 <= z.low <= 26 for z in dar_zones))
+        self.assertTrue(any(25 <= z.low <= 27 for z in ivz_zones))
+        self.assertFalse(any(10 <= z.low <= 11 for z in ivz_zones))
+
     def test_record_defer_watch_supersedes_old_zones_for_same_ticker(self):
         from types import SimpleNamespace
 
@@ -1630,7 +1858,7 @@ class TestExecutionReadiness(unittest.TestCase):
             adjusted_score=61,
             opportunity_score=61,
             confidence=7,
-            entry_valid_until="2026-07-08",
+            entry_valid_until=(datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat(),
             dossier_path=str(self.tmp_dir / "new.json"),
             agentic_trace={},
         )
@@ -1963,6 +2191,77 @@ class TestExecutionReadiness(unittest.TestCase):
         self.assertEqual(ranked.tool_trace[0]["tool_name"], "read_candidate_cards")
         self.assertEqual(ranked.tool_trace[-1]["tool_name"], "final_ranking")
 
+    def test_opportunity_scout_does_not_fail_when_agent_repeats_card_read(self):
+        from artha.broker_router import BrokerRouteDecision, BrokerRouterResult, LANE_EXECUTION_READY
+        from artha.config import Config
+        from artha.opportunity_scout import OpportunityScout, OpportunityScoutResult
+
+        class RepeatingClient:
+            def __init__(self, **kwargs):
+                self.calls = 0
+
+            def chat(self, prompt):
+                self.calls += 1
+                return json.dumps(
+                    {
+                        "tool_name": "read_candidate_cards",
+                        "args": {"include_all": True},
+                        "reason": "Still asking for all compact cards.",
+                    }
+                )
+
+        def row(ticker: str, rank: int) -> BrokerRouteDecision:
+            return BrokerRouteDecision(
+                candidate={
+                    "symbol": ticker,
+                    "price": 100.0,
+                    "beta": 1.0,
+                    "primary_alpha_sleeve": "quality_value",
+                    "price_target_consensus": {"targetConsensus": 135.0},
+                    "key_metrics_ttm": {"freeCashFlowYieldTTM": 0.05},
+                    "ratios_ttm": {"priceToEarningsRatioTTM": 18.0},
+                },
+                ticker=ticker,
+                candidate_rank=rank,
+                lane=LANE_EXECUTION_READY,
+                bucket="buy_now",
+                reason_code="execution_ready",
+                reason="clean quote",
+                route_score=90.0 - rank,
+                funnel_score=90.0 - rank,
+                price=100.0,
+                live_price=100.0,
+                bid=99.99,
+                ask=100.01,
+                spread_pct=0.0002,
+            )
+
+        router_result = BrokerRouterResult(
+            decisions=[row(f"T{idx:02d}", idx) for idx in range(1, 13)],
+            selected_for_council=[],
+            execution_ready=[],
+            research_watch=[],
+            hard_reject=[],
+        )
+
+        with patch.object(Config, "OPPORTUNITY_SCOUT_LLM_ENABLED", True), \
+             patch.object(Config, "OPPORTUNITY_SCOUT_MAX_TOOL_STEPS", 3), \
+             patch.object(OpportunityScoutResult, "save_artifact", return_value=""):
+            ranked = OpportunityScout(model_client_cls=RepeatingClient).rank(
+                router_result,
+                session_id="scout-repeat-read",
+                market_snapshot={"fear_greed": {"value": 50, "label": "Neutral"}},
+                deployment={"deployable_amount": 50.0},
+                batch_size=8,
+                max_batches=2,
+            )
+
+        self.assertTrue(ranked.agentic_used)
+        self.assertFalse(ranked.deterministic_fallback_reason)
+        self.assertEqual(ranked.tool_trace[-1]["tool_name"], "deterministic_safety_finish")
+        self.assertEqual(ranked.tool_trace[-1]["status"], "WARN")
+        self.assertEqual(len(ranked.selected_for_council), 8)
+
     def test_opportunity_scout_tools_expose_fmp_web_and_broker_context(self):
         from artha.broker_router import BrokerRouteDecision, LANE_EXECUTION_READY
         from artha.config import Config
@@ -2226,6 +2525,53 @@ class TestExecutionReadiness(unittest.TestCase):
         self.assertEqual(row["status"], "active")
         self.assertIn("requeued after stale triggered_reviewing state", row["notes"])
 
+    def test_failed_defer_auto_review_retries_with_backoff_and_failure_cap(self):
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        self._save_defer_watch(journal, watch_id="watch-failed-retry")
+        journal.mark_defer_watch_review_failed(
+            "watch-failed-retry",
+            "Council returned no decision.",
+        )
+        with journal._connect() as conn:
+            conn.execute(
+                "UPDATE defer_watchlist SET updated_at = datetime('now', '-2 hours') WHERE watch_id = ?",
+                ("watch-failed-retry",),
+            )
+            conn.commit()
+
+        requeued = journal.requeue_failed_defer_auto_reviews(
+            retry_delay_minutes=60,
+            max_failures=3,
+        )
+        row = journal.get_defer_watch("watch-failed-retry")
+        self.assertEqual(requeued, 1)
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(row["review_failure_count"], 1)
+
+        for attempt in range(2, 4):
+            journal.mark_defer_watch_review_failed(
+                "watch-failed-retry",
+                f"Failure {attempt}",
+            )
+            with journal._connect() as conn:
+                conn.execute(
+                    "UPDATE defer_watchlist SET updated_at = datetime('now', '-2 hours') WHERE watch_id = ?",
+                    ("watch-failed-retry",),
+                )
+                conn.commit()
+            if attempt < 3:
+                self.assertEqual(
+                    journal.requeue_failed_defer_auto_reviews(60, 3),
+                    1,
+                )
+
+        self.assertEqual(journal.requeue_failed_defer_auto_reviews(60, 3), 0)
+        final_row = journal.get_defer_watch("watch-failed-retry")
+        self.assertEqual(final_row["status"], "review_failed")
+        self.assertEqual(final_row["review_failure_count"], 3)
+
     def test_implausible_defer_watch_zone_is_invalidated(self):
         from artha.journal import DecisionJournal
 
@@ -2292,7 +2638,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 collect_market_overview=lambda: {"fear_greed": {"value": 50, "label": "neutral"}},
             )
             scheduler.council = SimpleNamespace(
-                analyze_stock=lambda stock, macro, market: SimpleNamespace(
+                analyze_stock=lambda stock, macro, market, **kwargs: SimpleNamespace(
                     ticker="TEST",
                     final_verdict="DEFER",
                     adjusted_score=51,
@@ -2364,7 +2710,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 collect_market_overview=lambda: {"fear_greed": {"value": 50, "label": "neutral"}},
             )
             scheduler.council = SimpleNamespace(
-                analyze_stock=lambda stock, macro, market: SimpleNamespace(
+                analyze_stock=lambda stock, macro, market, **kwargs: SimpleNamespace(
                     ticker="TEST",
                     final_verdict="WATCH",
                     adjusted_score=49,
@@ -2385,6 +2731,78 @@ class TestExecutionReadiness(unittest.TestCase):
                 Config.DEFER_AUTO_REVIEW_MAX_PER_CYCLE,
                 Config.DEFER_AUTO_REVIEW_LEGACY_TRIGGER_LOOKBACK_HOURS,
             ) = old_config
+
+    def test_defer_watch_auto_review_skips_same_day_executed_buy(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        from artha.journal import DecisionJournal
+        from artha.scheduler import ArthaScheduler
+
+        class FakeTelegram:
+            enabled = True
+
+            def __init__(self):
+                self.messages = []
+
+            def send_alert(self, text):
+                self.messages.append(text)
+                return True
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        self._save_defer_watch(journal, watch_id="watch-dupe")
+        now = datetime.now(timezone.utc).isoformat()
+        journal.save_execution_order(
+            {
+                "order_intent_id": "intent-existing-buy",
+                "ticker": "TEST",
+                "side": "buy",
+                "order_type": "market",
+                "status": "filled",
+                "broker_order_id": "broker-existing-buy",
+                "dry_run": False,
+                "submitted_at": now,
+                "filled_at": now,
+                "notional": 12.25,
+                "quantity": 1.0,
+                "estimated_price": 12.25,
+                "request_json": {"symbol": "TEST", "side": "buy", "type": "market"},
+                "response_json": {"order": {"id": "broker-existing-buy", "state": "filled"}},
+                "notes": "Existing same-day fill.",
+            }
+        )
+
+        scheduler = ArthaScheduler()
+        scheduler.sell_engine = SimpleNamespace(journal=journal)
+        scheduler.telegram = FakeTelegram()
+        scheduler.collector = SimpleNamespace(
+            collect_stock=lambda ticker: (_ for _ in ()).throw(AssertionError("collector should not run")),
+            collect_macro=lambda: (_ for _ in ()).throw(AssertionError("macro should not run")),
+            collect_market_overview=lambda: (_ for _ in ()).throw(AssertionError("market should not run")),
+        )
+        scheduler.council = SimpleNamespace(
+            analyze_stock=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("council should not run"))
+        )
+
+        alert = asyncio.run(
+            scheduler._run_defer_watch_auto_review(
+                watch=journal.get_defer_watch("watch-dupe"),
+                payload={"ticker": "TEST", "watch_id": "watch-dupe", "message": "TEST reached entry watch."},
+                quote={"price": 10.0, "bid": 9.99, "ask": 10.01},
+                price_float=10.0,
+                journal=journal,
+            )
+        )
+
+        watch = journal.get_defer_watch("watch-dupe")
+        orders = journal.get_execution_orders(ticker="TEST", limit=5)
+        self.assertEqual(watch["status"], "reviewed_no_buy")
+        self.assertIn("same-day buy", watch["notes"])
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["status"], "filled")
+        self.assertEqual(alert.metadata["existing_execution_order_row"], orders[0]["id"])
+        self.assertEqual(len(scheduler.telegram.messages), 1)
+        self.assertIn("already recorded a same-day buy", scheduler.telegram.messages[0])
 
     def test_defer_watch_trigger_buy_side_prepares_robinhood_review_only(self):
         import asyncio
@@ -2410,6 +2828,8 @@ class TestExecutionReadiness(unittest.TestCase):
             Config.DEFER_AUTO_REVIEW_PREPARE_ROBINHOOD_REVIEW,
             Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
             Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+            Config.EXECUTION_OFFICER_LLM_ENABLED,
+            Config.ROBINHOOD_AUTO_BUY_ENABLED,
         )
         try:
             Config.DEFER_AUTO_REVIEW_ENABLED = True
@@ -2417,6 +2837,8 @@ class TestExecutionReadiness(unittest.TestCase):
             Config.DEFER_AUTO_REVIEW_PREPARE_ROBINHOOD_REVIEW = True
             Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
             Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
+            Config.EXECUTION_OFFICER_LLM_ENABLED = False
+            Config.ROBINHOOD_AUTO_BUY_ENABLED = True
 
             dossier_path = str(self.tmp_dir / "fresh_starter_dossier.json")
             journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
@@ -2460,20 +2882,28 @@ class TestExecutionReadiness(unittest.TestCase):
                 collect_market_overview=lambda: {"fear_greed": {"value": 55, "label": "neutral"}},
             )
             scheduler.council = SimpleNamespace(
-                analyze_stock=lambda stock, macro, market: SimpleNamespace(
+                analyze_stock=lambda stock, macro, market, **kwargs: SimpleNamespace(
                     ticker="TEST",
                     final_verdict="STARTER",
-                    adjusted_score=69,
-                    opportunity_score=69,
+                    adjusted_score=72,
+                    opportunity_score=72,
+                    confidence=8,
                     recommended_action="Starter is now attractive at the triggered entry zone.",
                     dossier_path=dossier_path,
                 )
             )
 
-            asyncio.run(scheduler._run_defer_watchlist_check())
+            # Wave 2: dry_run now follows Config.ROBINHOOD_DRY_RUN_ONLY, so the
+            # guardrails enforce market hours at queue time; pin market open.
+            from unittest.mock import patch as _patch
+
+            from artha.scheduler import MarketHours as _MarketHours
+
+            with _patch.object(_MarketHours, "is_market_open", lambda self, now=None: True):
+                asyncio.run(scheduler._run_defer_watchlist_check())
             watch = journal.get_defer_watch("watch-buy")
             orders = journal.get_execution_orders(limit=5)
-            self.assertEqual(watch["status"], "review_ready")
+            self.assertEqual(watch["status"], "auto_buy_queued")
             self.assertIn("execution_order_row", watch["notes"])
             self.assertEqual(len(orders), 1)
             self.assertEqual(orders[0]["status"], "review_ready")
@@ -2481,8 +2911,12 @@ class TestExecutionReadiness(unittest.TestCase):
             self.assertIn('"account_number": "222233334"', orders[0]["request_json"])
             self.assertIn('"market_hours": "regular_hours"', orders[0]["request_json"])
             self.assertEqual(len(scheduler.telegram.messages), 1)
-            self.assertIn("Robinhood review request prepared", scheduler.telegram.messages[0])
+            self.assertIn("Automatic buy queued", scheduler.telegram.messages[0])
+            self.assertIn("no user review or buy button", scheduler.telegram.messages[0])
             self.assertIn("No real Robinhood order was placed", scheduler.telegram.messages[0])
+            actions = journal.get_trade_actions(limit=5)
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["action_type"], "auto_buy")
         finally:
             (
                 Config.DEFER_AUTO_REVIEW_ENABLED,
@@ -2490,6 +2924,8 @@ class TestExecutionReadiness(unittest.TestCase):
                 Config.DEFER_AUTO_REVIEW_PREPARE_ROBINHOOD_REVIEW,
                 Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
                 Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+                Config.EXECUTION_OFFICER_LLM_ENABLED,
+                Config.ROBINHOOD_AUTO_BUY_ENABLED,
             ) = old_config
 
     def test_execution_guardrails_allow_clean_limit_dry_run(self):
@@ -2576,6 +3012,283 @@ class TestExecutionReadiness(unittest.TestCase):
         )
         self.assertTrue(result.passed, result.reasons)
         self.assertTrue(result.checks["supervisor"]["buy_gate"]["allowed"])
+
+    def test_pause_buying_persists_control_notifies_once_and_never_touches_services(self):
+        from artha.config import Config
+        from artha.stand_down import buying_paused, pause_buying
+
+        class FakeSender:
+            enabled = True
+
+            def __init__(self):
+                self.messages = []
+
+            def send_message(self, text, parse_mode=None, silent=False):
+                self.messages.append((text, parse_mode, silent))
+                return True
+
+        old_config = (
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT,
+            Config.ROBINHOOD_CONTROL_FILE,
+        )
+        sender = FakeSender()
+        try:
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = True
+            Config.ROBINHOOD_CONTROL_FILE = str(self.tmp_dir / "control.json")
+            # Pre-existing operator state must be preserved, never clobbered.
+            Path(Config.ROBINHOOD_CONTROL_FILE).write_text(
+                json.dumps({"trading_disabled": False, "reason": "operator baseline"}),
+                encoding="utf-8",
+            )
+
+            result = pause_buying(
+                "Daily buy order cap reached (2).",
+                source="unit-test",
+                telegram_sender=sender,
+            )
+
+            control = json.loads(Path(Config.ROBINHOOD_CONTROL_FILE).read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertEqual(result["operation"], "buy_pause")
+            # The pause NEVER flips the global kill switch: sells must stay live.
+            self.assertFalse(control["trading_disabled"])
+            self.assertEqual(control["reason"], "operator baseline")
+            self.assertIn("Daily buy order cap reached", control["buying_paused_reason"])
+            paused, pause_reason = buying_paused(control)
+            self.assertTrue(paused)
+            self.assertIn("Daily buy order cap reached", pause_reason)
+            self.assertEqual(len(sender.messages), 1)
+            self.assertIn("Buys paused", sender.messages[0][0])
+            self.assertIn("stop-losses", sender.messages[0][0])
+
+            # Same-day repeat: control refreshed, but no duplicate Telegram.
+            repeat = pause_buying(
+                "Daily buy order cap reached (2).",
+                source="unit-test-repeat",
+                telegram_sender=sender,
+            )
+            self.assertTrue(repeat["telegram_suppressed_duplicate"])
+            self.assertEqual(len(sender.messages), 1)
+
+            # An expired pause (yesterday) no longer blocks buys.
+            control["buying_paused_until"] = "2020-01-01"
+            paused, _ = buying_paused(control)
+            self.assertFalse(paused)
+        finally:
+            (
+                Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT,
+                Config.ROBINHOOD_CONTROL_FILE,
+            ) = old_config
+
+    def test_fast_news_probe_suppressed_after_sentinel_alert(self):
+        """run_fast_scan skips a headline whose rich sentinel alert already went out.
+
+        The fast path probes AlertManager with an INFO-severity Alert for the
+        sentinel key; INFO must not trip the severity-upgrade bypass.
+        """
+        from artha.monitor import Alert, AlertManager
+
+        history = AlertManager(history_path=self.tmp_dir / "alert_history.json")
+        history.record_sent_alerts(
+            [Alert(ticker="V", alert_type="news_sentinel_abc123def456", severity="CRITICAL", message="rich analysis")]
+        )
+        probe = Alert(ticker="V", alert_type="news_sentinel_abc123def456", severity="INFO", message="")
+        self.assertFalse(history.should_send(probe))
+        fresh = Alert(ticker="V", alert_type="news_sentinel_zzz999zzz999", severity="INFO", message="")
+        self.assertTrue(history.should_send(fresh))
+
+    def test_pause_buying_refuses_unreadable_control_file(self):
+        """A corrupt control.json means fail-closed everywhere; the pause must
+        never 'heal' it and erase whatever the operator had put in it."""
+        from artha.config import Config
+        from artha.stand_down import pause_buying
+
+        old_enabled = Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT
+        try:
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = True
+            corrupt = '{"trading_disabled": true,,}'
+            Path(Config.ROBINHOOD_CONTROL_FILE).write_text(corrupt, encoding="utf-8")
+            result = pause_buying("Daily buy order cap reached (2).", source="unit", send_telegram=False)
+            self.assertFalse(result["success"])
+            self.assertEqual(result["operation"], "buy_pause_refused_unreadable_control")
+            self.assertEqual(Path(Config.ROBINHOOD_CONTROL_FILE).read_text(encoding="utf-8"), corrupt)
+        finally:
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = old_enabled
+
+    def test_pause_buying_preserves_future_dated_pause_without_rewrite(self):
+        from artha.config import Config
+        from artha.stand_down import pause_buying
+
+        old_enabled = Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT
+        try:
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = True
+            Path(Config.ROBINHOOD_CONTROL_FILE).write_text(
+                json.dumps({"buying_paused_until": "2099-01-01", "buying_paused_reason": "operator hold"}),
+                encoding="utf-8",
+            )
+            before = Path(Config.ROBINHOOD_CONTROL_FILE).read_text(encoding="utf-8")
+            result = pause_buying("Daily buy order cap reached (2).", source="unit", send_telegram=False)
+            self.assertTrue(result["telegram_suppressed_duplicate"])
+            self.assertEqual(result["buying_paused_until"], "2099-01-01")
+            self.assertEqual(Path(Config.ROBINHOOD_CONTROL_FILE).read_text(encoding="utf-8"), before)
+        finally:
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = old_enabled
+
+    def test_set_trading_disabled_preserves_buy_pause_keys(self):
+        from artha.config import Config
+        from artha.robinhood_bridge import set_trading_disabled
+
+        old_control = Config.ROBINHOOD_CONTROL_FILE
+        try:
+            Config.ROBINHOOD_CONTROL_FILE = str(self.tmp_dir / "control.json")
+            Path(Config.ROBINHOOD_CONTROL_FILE).write_text(
+                json.dumps(
+                    {
+                        "trading_disabled": False,
+                        "buying_paused_until": "2026-07-06",
+                        "buying_paused_reason": "Daily buy order cap reached (2).",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            set_trading_disabled(True, "emergency", path=Config.ROBINHOOD_CONTROL_FILE)
+            control = json.loads(Path(Config.ROBINHOOD_CONTROL_FILE).read_text(encoding="utf-8"))
+            self.assertTrue(control["trading_disabled"])
+            self.assertEqual(control["buying_paused_until"], "2026-07-06")
+            self.assertEqual(control["buying_paused_reason"], "Daily buy order cap reached (2).")
+        finally:
+            Config.ROBINHOOD_CONTROL_FILE = old_control
+
+    def test_pause_echo_and_sizing_reasons_never_retrigger_pause(self):
+        from artha.stand_down import reason_is_buy_capacity_limit
+
+        # The pause's own gate message embeds the original marker — it must
+        # not re-match, or the pause rewrites control.json all day.
+        echo = (
+            "Buy-side paused until the next trading day: Daily buy order cap "
+            "reached (2). Sells are unaffected."
+        )
+        self.assertFalse(reason_is_buy_capacity_limit(echo))
+        # Per-order sizing blocks are not capacity limits.
+        self.assertFalse(
+            reason_is_buy_capacity_limit("Order size $400.00 exceeds the $350.00 account pilot cap.")
+        )
+        self.assertFalse(
+            reason_is_buy_capacity_limit("Order size $30.00 exceeds the $25.00 pilot cap.")
+        )
+        # Real capacity limits still match, including the live broker cash check.
+        self.assertTrue(reason_is_buy_capacity_limit("Daily buy order cap reached (2)."))
+        self.assertTrue(
+            reason_is_buy_capacity_limit(
+                "Insufficient Robinhood cash/buying power for this order plus safety buffer."
+            )
+        )
+
+    def test_buy_pause_blocks_buys_but_never_sells(self):
+        from datetime import datetime, timezone
+
+        from artha.config import Config
+        from artha.execution import RobinhoodExecutionGuardrails, build_order_intent
+        from artha.stand_down import _eastern_today
+
+        old_enabled = Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT
+        try:
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = True
+            Path(Config.ROBINHOOD_CONTROL_FILE).write_text(
+                json.dumps(
+                    {
+                        "trading_disabled": False,
+                        "buying_paused_until": _eastern_today().isoformat(),
+                        "buying_paused_reason": "Daily buy order cap reached (2).",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            journal = self._journal_with_clean_buy_decision()
+
+            buy_intent = build_order_intent("TEST", "buy", notional=10, limit_price=100, estimated_price=100)
+            buy_result = RobinhoodExecutionGuardrails().evaluate(
+                buy_intent,
+                self._market_data(),
+                journal,
+                now=datetime.now(timezone.utc),
+            )
+            self.assertFalse(buy_result.passed)
+            self.assertTrue(
+                any("Buy-side paused" in reason for reason in buy_result.reasons),
+                buy_result.reasons,
+            )
+
+            sell_intent = build_order_intent("TEST", "sell", notional=10, limit_price=100, estimated_price=100)
+            sell_result = RobinhoodExecutionGuardrails().evaluate(
+                sell_intent,
+                self._market_data(),
+                journal,
+                now=datetime.now(timezone.utc),
+            )
+            # Sells may fail other gates (thesis, market data) but the buy
+            # pause itself must never appear as a sell-blocking reason.
+            self.assertFalse(
+                any("Buy-side paused" in reason for reason in sell_result.reasons),
+                sell_result.reasons,
+            )
+        finally:
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = old_enabled
+
+    def test_execution_guardrails_daily_buy_cap_pauses_buys(self):
+        from datetime import datetime, timezone
+
+        from artha.config import Config
+        from artha.execution import RobinhoodExecutionGuardrails, build_order_intent
+        from artha.journal import DecisionJournal
+
+        old_max = Config.ROBINHOOD_MAX_TRADES_PER_DAY
+        old_enabled = Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT
+        try:
+            Config.ROBINHOOD_MAX_TRADES_PER_DAY = 1
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = True
+            journal = self._journal_with_clean_buy_decision()
+            journal.save_execution_order(
+                {
+                    "order_intent_id": "existing-buy",
+                    "ticker": "OLD",
+                    "side": "buy",
+                    "order_type": "market",
+                    "status": "filled",
+                    "dry_run": False,
+                    "submitted_at": datetime.now(timezone.utc).isoformat(),
+                    "filled_at": datetime.now(timezone.utc).isoformat(),
+                    "notional": 12.25,
+                    "quantity": 0.1,
+                    "estimated_price": 122.5,
+                    "request_json": {},
+                    "response_json": {},
+                    "notes": "unit existing buy",
+                }
+            )
+            intent = build_order_intent("TEST", "buy", notional=10, limit_price=100, estimated_price=100)
+            with patch(
+                "artha.execution.maybe_pause_buying_for_limit",
+                return_value={"success": True, "operation": "buy_pause", "reason": "Daily buy order cap reached (1)."},
+            ) as maybe_stop:
+                result = RobinhoodExecutionGuardrails().evaluate(
+                    intent,
+                    self._market_data(),
+                    journal,
+                    now=datetime.now(timezone.utc),
+                )
+
+            self.assertFalse(result.passed)
+            self.assertIn("Daily buy order cap reached", " ".join(result.reasons))
+            self.assertEqual(result.checks["buy_pause"]["operation"], "buy_pause")
+            maybe_stop.assert_called_once()
+            self.assertTrue(
+                any("Daily buy order cap reached" in str(r) for r in maybe_stop.call_args.args[0]),
+                maybe_stop.call_args.args[0],
+            )
+        finally:
+            Config.ROBINHOOD_MAX_TRADES_PER_DAY = old_max
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = old_enabled
 
     def test_execution_order_attempt_is_audited_when_blocked(self):
         from datetime import datetime, timezone
@@ -2664,6 +3377,64 @@ class TestExecutionReadiness(unittest.TestCase):
                 Config.ROBINHOOD_KILL_SWITCH,
                 Config.ROBINHOOD_CONTROL_FILE,
             ) = old_values
+
+    def test_live_execution_readiness_text_states_unattended_auto_trade_contract(self):
+        from artha.execution import format_execution_readiness
+
+        text = format_execution_readiness(
+            {
+                "status": "PASS",
+                "ready_for_dry_run": True,
+                "live_trading_enabled": True,
+                "message": "Live configuration enabled.",
+                "guardrails": {},
+                "supervisor": {},
+            }
+        )
+        self.assertIn("auto_buy and auto_sell actions can execute unattended", text)
+        self.assertIn("no user approval click is required", text)
+        self.assertIn("fresh Robinhood snapshot", text)
+
+    def test_trade_action_maintenance_reconciles_fills_and_expires_old_reviews(self):
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        intent_id = "rh-intent-maintenance"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "TEST",
+                "side": "buy",
+                "order_type": "market",
+                "status": "filled",
+                "dry_run": False,
+            }
+        )
+        journal.save_trade_action(
+            {
+                "action_id": "ta-maintenance-filled",
+                "action_type": "buy",
+                "ticker": "TEST",
+                "side": "buy",
+                "status": "submitted",
+                "order_intent_id": intent_id,
+            }
+        )
+        journal.save_trade_action(
+            {
+                "action_id": "ta-maintenance-expired",
+                "action_type": "buy",
+                "ticker": "OLD",
+                "side": "buy",
+                "status": "review_ready",
+                "expires_at": "2020-01-01T00:00:00+00:00",
+            }
+        )
+
+        self.assertEqual(journal.reconcile_trade_actions_from_execution_orders(), 1)
+        self.assertEqual(journal.expire_stale_trade_actions(), 1)
+        self.assertEqual(journal.get_trade_action("ta-maintenance-filled")["status"], "filled")
+        self.assertEqual(journal.get_trade_action("ta-maintenance-expired")["status"], "expired")
 
     def test_robinhood_account_allowlist_rejects_wrong_or_non_agentic_account(self):
         from artha.config import Config
@@ -2761,7 +3532,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 now=datetime(2026, 6, 4, 15, 0, tzinfo=timezone.utc),
             )
             rows = journal.get_execution_orders(limit=1)
-            self.assertEqual(result["broker_result"]["status"], "review_ready")
+            self.assertEqual(result["broker_result"]["status"], "review_ready", result)
             self.assertEqual(rows[0]["status"], "review_ready")
             self.assertIn('"account_number": "222233334"', rows[0]["request_json"])
             self.assertIsNone(rows[0]["submitted_at"])
@@ -2833,7 +3604,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -2964,7 +3735,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 10},
+                    "portfolio": {"buying_power": 10, "cash": 10, "total_value": 10},
                     "positions": [],
                     "orders": [],
                 },
@@ -3080,7 +3851,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -3206,7 +3977,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -3406,12 +4177,14 @@ class TestExecutionReadiness(unittest.TestCase):
             Config.ROBINHOOD_ACTION_TOKEN_TTL_MINUTES,
             Config.ROBINHOOD_REVIEW_DECISION_MAX_AGE_MINUTES,
             Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+            Config.ROBINHOOD_AUTO_BUY_ENABLED,
         )
         try:
             Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
             Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
             Config.ROBINHOOD_ACTION_TOKEN_TTL_MINUTES = 60
             Config.ROBINHOOD_REVIEW_DECISION_MAX_AGE_MINUTES = 60
+            Config.ROBINHOOD_AUTO_BUY_ENABLED = True
             Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE = str(self.tmp_dir / "robinhood_snapshot.json")
             write_robinhood_snapshot(
                 {
@@ -3424,7 +4197,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -3448,6 +4221,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 "state": "active",
             }
             intent = build_order_intent("TEST", "buy", quantity=1, limit_price=10, estimated_price=10)
+            intent.evidence = {"execution_officer": {"auto_buy_eligible": True}}
             prepare_and_record_robinhood_review(
                 intent,
                 account,
@@ -3459,6 +4233,9 @@ class TestExecutionReadiness(unittest.TestCase):
             self.assertEqual(result["created_count"], 1)
             row = journal.get_trade_action(result["created"][0]["action_id"])
             self.assertEqual(row["status"], "review_ready")
+            self.assertEqual(row["action_type"], "auto_buy")
+            self.assertIsNone(result["created"][0].get("reply_markup"))
+            self.assertEqual(result["created"][0].get("callback_data"), {})
             created = datetime.fromisoformat(row["created_at"])
             expires = datetime.fromisoformat(row["expires_at"])
             self.assertLessEqual((expires - created).total_seconds(), 60 * 60 + 5)
@@ -3473,6 +4250,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 Config.ROBINHOOD_ACTION_TOKEN_TTL_MINUTES,
                 Config.ROBINHOOD_REVIEW_DECISION_MAX_AGE_MINUTES,
                 Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+                Config.ROBINHOOD_AUTO_BUY_ENABLED,
             ) = old_config
 
     def test_auto_buy_runner_operation_is_durable_and_agentic(self):
@@ -3586,6 +4364,38 @@ class TestExecutionReadiness(unittest.TestCase):
         self.assertEqual(result["snapshot"]["status"], "PASS")
         self.assertEqual(result["sync"]["status"], "WARN")
 
+    def test_snapshot_runner_reports_compact_strict_import_failure_reason(self):
+        import subprocess
+
+        script = Path(__file__).resolve().parent.parent / "scripts" / "robinhood_snapshot_sync.mjs"
+        js = f"""
+            import {{ summarizeImporterFailure }} from {json.dumps(script.as_uri())};
+            const parsed = {{
+              success: false,
+              validation: {{status: 'PASS'}},
+              snapshot: {{status: 'PASS'}},
+              sync: {{
+                status: 'WARN',
+                unresolved: [{{ticker: 'USB', reason: 'Held in Robinhood but no active/pending Artha thesis.'}}],
+                order_sync: {{status: 'PASS'}}
+              }}
+            }};
+            console.log(summarizeImporterFailure({{code: 1, stdout: '', stderr: ''}}, parsed));
+        """
+        proc = subprocess.run(
+            ["node", "--input-type=module", "-e", js],
+            cwd=script.parent.parent,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("validation=PASS", proc.stdout)
+        self.assertIn("sync=WARN", proc.stdout)
+        self.assertIn("USB: Held in Robinhood", proc.stdout)
+        self.assertNotIn('"checks"', proc.stdout)
+
     def test_canonical_snapshot_preserves_handoff_metadata(self):
         from artha.robinhood_bridge import canonicalize_mcp_snapshot
 
@@ -3623,6 +4433,277 @@ class TestExecutionReadiness(unittest.TestCase):
         self.assertEqual(snapshot["positions"][0]["symbol"], "JNJ")
         self.assertEqual(snapshot["orders"][0]["state"], "filled")
 
+    def _external_snapshot(self, positions, cash=75, orders=None):
+        from datetime import datetime, timezone
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "robinhood_mcp",
+            "account": {
+                "account_number": "222233334",
+                "type": "cash",
+                "nickname": "Agentic",
+                "agentic_allowed": True,
+                "state": "active",
+            },
+            "portfolio": {"buying_power": cash, "cash": cash, "total_value": cash},
+            "positions": positions,
+            "orders": orders or [],
+        }
+
+    def test_transfer_detection_books_deposit_and_ignores_external_sell_proceeds(self):
+        import artha.robinhood_bridge as bridge
+        from artha.config import Config
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        old_file = bridge.CONTRIBUTIONS_FILE
+        old_auto_book = Config.ROBINHOOD_AUTO_BOOK_CASH_TRANSFERS
+        sent = []
+        try:
+            bridge.CONTRIBUTIONS_FILE = self.tmp_dir / "contributions.jsonl"
+            Config.ROBINHOOD_AUTO_BOOK_CASH_TRANSFERS = False
+
+            class FakeSender:
+                def send_message(self, text, parse_mode=None, silent=False):
+                    sent.append(text)
+                    return True
+
+            with patch("artha.telegram.TelegramSender", FakeSender):
+                # Case 1: $150 cash jump with no explaining orders is detected,
+                # but not booked/alerted unless explicit auto-booking is enabled.
+                result = bridge._detect_cash_transfer(350.0, 500.0, {"orders": []}, journal)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["direction"], "deposit")
+                self.assertAlmostEqual(result["amount"], 150.0)
+                self.assertFalse(result["booked"])
+                self.assertFalse(bridge.CONTRIBUTIONS_FILE.exists())
+                self.assertFalse(any("New money detected" in t for t in sent))
+
+                Config.ROBINHOOD_AUTO_BOOK_CASH_TRANSFERS = True
+                result_booked = bridge._detect_cash_transfer(350.0, 500.0, {"orders": []}, journal)
+                self.assertIsNotNone(result_booked)
+                self.assertTrue(result_booked["booked"])
+                ledger = bridge.CONTRIBUTIONS_FILE.read_text(encoding="utf-8").strip().splitlines()
+                self.assertEqual(len(ledger), 1)
+                self.assertIn("auto_detected_transfer", ledger[0])
+                self.assertTrue(any("New money detected" in t for t in sent))
+
+                # Case 2: cash jump fully explained by an external manual SELL
+                # (not in Artha's journal) → NOT a deposit.
+                manual_sell = {
+                    "id": "manual-1",
+                    "state": "filled",
+                    "side": "sell",
+                    "cumulative_quantity": "2.0",
+                    "average_price": "75.00",
+                }
+                result2 = bridge._detect_cash_transfer(350.0, 500.0, {"orders": [manual_sell]}, journal)
+                self.assertIsNone(result2)
+
+                # Case 3: cash drop fully explained by a fresh Artha-known BUY
+                # → NOT a withdrawal.
+                now = datetime.now(timezone.utc)
+                journal.save_execution_order(
+                    {
+                        "order_intent_id": "intent-known-buy",
+                        "ticker": "NVDA",
+                        "side": "buy",
+                        "order_type": "market",
+                        "time_in_force": "day",
+                        "quantity": 0.088228,
+                        "notional": 17.849945,
+                        "limit_price": 202.09,
+                        "estimated_price": 202.3161,
+                        "status": "filled",
+                        "broker": "robinhood",
+                        "broker_order_id": "known-buy-1",
+                        "dry_run": False,
+                    }
+                )
+                known_buy = {
+                    "id": "known-buy-1",
+                    "state": "filled",
+                    "side": "buy",
+                    "cumulative_quantity": "0.088228",
+                    "average_price": "202.316100",
+                    "last_transaction_at": now.isoformat(),
+                }
+                result3 = bridge._detect_cash_transfer(
+                    258.35,
+                    240.50,
+                    {"generated_at": now.isoformat(), "orders": [known_buy]},
+                    journal,
+                    since=now - timedelta(minutes=10),
+                )
+                self.assertIsNone(result3)
+                ledger = bridge.CONTRIBUTIONS_FILE.read_text(encoding="utf-8").strip().splitlines()
+                self.assertEqual(len(ledger), 1)
+        finally:
+            bridge.CONTRIBUTIONS_FILE = old_file
+            Config.ROBINHOOD_AUTO_BOOK_CASH_TRANSFERS = old_auto_book
+
+    def test_external_sell_autocloses_position_after_three_confirmations(self):
+        import artha.robinhood_bridge as bridge
+        from artha.config import Config
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.thesis_tracker import ThesisTracker
+
+        old_account = Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+        old_tracker_file = bridge.EXTERNAL_SELL_TRACKER_FILE
+        old_contrib = bridge.CONTRIBUTIONS_FILE
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            bridge.EXTERNAL_SELL_TRACKER_FILE = self.tmp_dir / "external_sell_tracker.json"
+            bridge.CONTRIBUTIONS_FILE = self.tmp_dir / "contributions.jsonl"
+            journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+            tracker = ThesisTracker(journal)
+            portfolio_path = self.tmp_dir / "portfolio.json"
+
+            # Seed: KEEP stays at the broker, GONE was sold manually.
+            for tick in ("KEEP", "GONE"):
+                pending = tracker.create_thesis(
+                    ticker=tick,
+                    position_type="STARTER",
+                    thesis_summary=f"Unit thesis {tick}.",
+                    invalidation_conditions=["Unit invalidation"],
+                )
+            seed = self._external_snapshot(
+                [
+                    {"symbol": "KEEP", "quantity": "1.0", "average_buy_price": "10.00", "market_price": "10.00"},
+                    {"symbol": "GONE", "quantity": "2.0", "average_buy_price": "20.00", "market_price": "20.00"},
+                ]
+            )
+            bridge.sync_snapshot_to_artha(seed, journal=journal, portfolio_path=portfolio_path)
+            self.assertIsNotNone(Portfolio.load(portfolio_path).get_position("GONE"))
+
+            sent = []
+
+            class FakeSender:
+                def send_message(self, text, parse_mode=None, silent=False):
+                    sent.append(text)
+                    return True
+
+            gone_absent = self._external_snapshot(
+                [{"symbol": "KEEP", "quantity": "1.0", "average_buy_price": "10.00", "market_price": "10.00"}],
+                cash=115,  # proceeds of the manual GONE sale arrived in cash
+            )
+            with patch("artha.telegram.TelegramSender", FakeSender):
+                for i in range(3):
+                    result = bridge.sync_snapshot_to_artha(gone_absent, journal=journal, portfolio_path=portfolio_path)
+                    still_there = Portfolio.load(portfolio_path).get_position("GONE")
+                    if i < 2:
+                        self.assertIsNotNone(still_there, f"GONE removed too early on pass {i+1}")
+                        self.assertEqual(result["externally_closed"], [])
+                    else:
+                        self.assertIsNone(still_there, "GONE should be auto-closed on 3rd confirmation")
+                        self.assertEqual(result["externally_closed"][0]["ticker"], "GONE")
+
+            portfolio = Portfolio.load(portfolio_path)
+            self.assertIsNotNone(portfolio.get_position("KEEP"))
+            sells = [t for t in portfolio.transactions if t.get("type") == "SELL" and t.get("ticker") == "GONE"]
+            self.assertEqual(len(sells), 1)
+            self.assertIn("Sold outside Artha", sells[0]["notes"])
+            self.assertTrue(any("Sold outside Artha" in t for t in sent))
+            # tracker resets after close
+            self.assertEqual(bridge._load_external_sell_tracker(), {})
+        finally:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = old_account
+            bridge.EXTERNAL_SELL_TRACKER_FILE = old_tracker_file
+            bridge.CONTRIBUTIONS_FILE = old_contrib
+
+    def test_external_sell_does_not_autoclose_artha_managed_sell(self):
+        import artha.robinhood_bridge as bridge
+        from artha.config import Config
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.thesis_tracker import ThesisTracker
+
+        old_account = Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+        old_tracker_file = bridge.EXTERNAL_SELL_TRACKER_FILE
+        old_contrib = bridge.CONTRIBUTIONS_FILE
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            bridge.EXTERNAL_SELL_TRACKER_FILE = self.tmp_dir / "external_sell_tracker.json"
+            bridge.CONTRIBUTIONS_FILE = self.tmp_dir / "contributions.jsonl"
+            journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+            tracker = ThesisTracker(journal)
+            portfolio_path = self.tmp_dir / "portfolio.json"
+
+            tracker.create_thesis(
+                ticker="KEEP",
+                position_type="STARTER",
+                thesis_summary="Unit thesis KEEP.",
+                invalidation_conditions=["Unit invalidation"],
+            )
+            managed = tracker.create_thesis(
+                ticker="ARTHA",
+                position_type="STARTER",
+                thesis_summary="Unit thesis ARTHA.",
+                invalidation_conditions=["Unit invalidation"],
+            )
+            seed = self._external_snapshot(
+                [
+                    {"symbol": "KEEP", "quantity": "1.0", "average_buy_price": "10.00", "market_price": "10.00"},
+                    {"symbol": "ARTHA", "quantity": "2.0", "average_buy_price": "20.00", "market_price": "20.00"},
+                ]
+            )
+            bridge.sync_snapshot_to_artha(seed, journal=journal, portfolio_path=portfolio_path)
+            self.assertIsNotNone(Portfolio.load(portfolio_path).get_position("ARTHA"))
+
+            journal.save_execution_order(
+                {
+                    "order_intent_id": "intent-managed-sell",
+                    "ticker": "ARTHA",
+                    "side": "sell",
+                    "order_type": "market",
+                    "time_in_force": "day",
+                    "quantity": 2.0,
+                    "notional": 42.0,
+                    "estimated_price": 21.0,
+                    "status": "submitted",
+                    "broker": "robinhood",
+                    "broker_order_id": "managed-sell-1",
+                    "dry_run": False,
+                    "thesis_id": managed.thesis_id,
+                    "submitted_at": seed["generated_at"],
+                }
+            )
+
+            sent = []
+
+            class FakeSender:
+                def send_message(self, text, parse_mode=None, silent=False):
+                    sent.append(text)
+                    return True
+
+            managed_absent = self._external_snapshot(
+                [{"symbol": "KEEP", "quantity": "1.0", "average_buy_price": "10.00", "market_price": "10.00"}],
+                cash=115,
+                orders=[
+                    {
+                        "id": "managed-sell-1",
+                        "symbol": "ARTHA",
+                        "side": "sell",
+                        "state": "unconfirmed",
+                        "quantity": "2.0",
+                        "cumulative_quantity": "0.0",
+                    }
+                ],
+            )
+            with patch("artha.telegram.TelegramSender", FakeSender):
+                for _ in range(3):
+                    result = bridge.sync_snapshot_to_artha(managed_absent, journal=journal, portfolio_path=portfolio_path)
+                    self.assertEqual(result["externally_closed"], [])
+                    self.assertIsNotNone(Portfolio.load(portfolio_path).get_position("ARTHA"))
+
+            self.assertEqual(bridge._load_external_sell_tracker(), {})
+            self.assertFalse(any("Sold outside Artha" in t for t in sent))
+        finally:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = old_account
+            bridge.EXTERNAL_SELL_TRACKER_FILE = old_tracker_file
+            bridge.CONTRIBUTIONS_FILE = old_contrib
+
     def test_snapshot_sync_activates_pending_thesis_and_portfolio(self):
         from artha.config import Config
         from artha.journal import DecisionJournal
@@ -3652,7 +4733,7 @@ class TestExecutionReadiness(unittest.TestCase):
                     "agentic_allowed": True,
                     "state": "active",
                 },
-                "portfolio": {"buying_power": 75},
+                "portfolio": {"buying_power": 75, "cash": 75, "total_value": 75},
                 "positions": [
                     {
                         "symbol": "TEST",
@@ -3672,6 +4753,49 @@ class TestExecutionReadiness(unittest.TestCase):
             self.assertIsNotNone(pos)
             self.assertEqual(pos.thesis_id, pending.thesis_id)
             self.assertIsNotNone(tracker.get_active("TEST"))
+        finally:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = old_account
+
+    def test_snapshot_sync_marks_position_to_market_when_broker_price_missing(self):
+        from artha.config import Config
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.robinhood_bridge import sync_snapshot_to_artha
+        from artha.thesis_tracker import ThesisTracker
+
+        class FakeFMPCollector:
+            def quote(self, ticker):
+                return {"symbol": ticker, "price": 9.50}
+
+        old_account = Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+            tracker = ThesisTracker(journal)
+            pending = tracker.create_thesis(
+                ticker="TEST",
+                position_type="STARTER",
+                thesis_summary="Unit pending buy thesis.",
+                invalidation_conditions=["Unit invalidation"],
+            )
+            portfolio_path = self.tmp_dir / "portfolio.json"
+            snapshot = {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "source": "robinhood_mcp",
+                "account": {"account_number": "222233334", "agentic_allowed": True, "state": "active"},
+                "portfolio": {"buying_power": 75, "cash": 75, "total_value": 75},
+                "positions": [{"symbol": "TEST", "quantity": "1.25", "average_buy_price": "10.00"}],
+                "orders": [],
+            }
+            with patch("artha.collector.FMPCollector", return_value=FakeFMPCollector()):
+                result = sync_snapshot_to_artha(snapshot, journal=journal, portfolio_path=portfolio_path)
+
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["activated"][0]["thesis_id"], pending.thesis_id)
+            self.assertEqual(result["activated"][0]["price_source"], "fmp_quote")
+            pos = Portfolio.load(portfolio_path).get_position("TEST")
+            self.assertAlmostEqual(pos.current_price, 9.50)
+            self.assertAlmostEqual(pos.market_value, 11.875)
         finally:
             Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = old_account
 
@@ -3761,7 +4885,7 @@ class TestExecutionReadiness(unittest.TestCase):
             pos = portfolio_after_fill.get_position("TEST")
             self.assertEqual(pos.thesis_id, pending.thesis_id)
             self.assertAlmostEqual(pos.shares, 1.25)
-            self.assertAlmostEqual(pos.hard_stop_price, 8.8)
+            self.assertAlmostEqual(pos.hard_stop_price, 9.2)  # rule-4.1 initial stop: -8% (was legacy -12%)
             buy_transactions = [
                 txn for txn in portfolio_after_fill.transactions
                 if txn.get("type") == "BUY" and txn.get("ticker") == "TEST"
@@ -3847,7 +4971,7 @@ class TestExecutionReadiness(unittest.TestCase):
                     "agentic_allowed": True,
                     "state": "active",
                 },
-                "portfolio": {"buying_power": 75},
+                "portfolio": {"buying_power": 75, "cash": 75, "total_value": 75},
                 "positions": [
                     {
                         "symbol": "TEST",
@@ -3861,7 +4985,7 @@ class TestExecutionReadiness(unittest.TestCase):
             result = sync_snapshot_to_artha(snapshot, journal=journal, portfolio_path=portfolio_path)
             self.assertEqual(result["status"], "PASS")
             pos = Portfolio.load(portfolio_path).get_position("TEST")
-            self.assertAlmostEqual(pos.hard_stop_price, 8.8)
+            self.assertAlmostEqual(pos.hard_stop_price, 9.2)  # rule-4.1 initial stop: -8% (was legacy -12%)
         finally:
             Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = old_account
 
@@ -3945,7 +5069,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "source": "robinhood_mcp",
                 "account": account,
-                "portfolio": {"buying_power": 75},
+                "portfolio": {"buying_power": 75, "cash": 75, "total_value": 75},
                 "positions": [
                     {
                         "symbol": "TEST",
@@ -3973,7 +5097,154 @@ class TestExecutionReadiness(unittest.TestCase):
             self.assertTrue(result.get("already_recorded"))
             pos = Portfolio.load(portfolio_path).get_position("TEST")
             self.assertAlmostEqual(pos.shares, 1.25)
-            self.assertAlmostEqual(pos.hard_stop_price, 8.8)
+            self.assertAlmostEqual(pos.hard_stop_price, 9.2)  # rule-4.1 initial stop: -8% (was legacy -12%)
+        finally:
+            (
+                Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+                Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+            ) = old_config
+
+    def test_fill_callback_does_not_double_count_snapshot_imported_top_up(self):
+        from artha.config import Config
+        from artha.execution import build_order_intent, prepare_and_record_robinhood_review
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.robinhood_bridge import record_order_fill, sync_snapshot_to_artha
+        from artha.thesis_tracker import ThesisTracker
+
+        old_config = (
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+        )
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
+            journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+            journal.save_supervisor_run(
+                {
+                    "generated_at": "2026-06-04T14:30:00+00:00",
+                    "severity": "PASS",
+                    "payload": {"checks": []},
+                }
+            )
+            dossier_path = str(self.tmp_dir / "TEST_dossier.json")
+            journal.save_decision_features(
+                {
+                    "dossier_path": dossier_path,
+                    "generated_at": "2026-06-04T14:20:00+00:00",
+                    "ticker": "TEST",
+                    "final_verdict": "ACCUMULATE",
+                    "opportunity_score": 74,
+                    "confidence": 8,
+                    "price": 10.0,
+                    "evidence_count": 12,
+                    "feature_json": "{}",
+                }
+            )
+            tracker = ThesisTracker(journal)
+            pending = tracker.create_thesis(
+                "TEST",
+                "STARTER",
+                thesis_summary="Unit top-up thesis",
+                stop_loss_pct=-0.12,
+            )
+            account = {
+                "account_number": "222233334",
+                "type": "cash",
+                "nickname": "Agentic",
+                "agentic_allowed": True,
+                "state": "active",
+            }
+            portfolio_path = self.tmp_dir / "portfolio.json"
+            sync_snapshot_to_artha(
+                {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "robinhood_mcp",
+                    "account": account,
+                    "portfolio": {"buying_power": 75, "cash": 75, "total_value": 75},
+                    "positions": [
+                        {
+                            "symbol": "TEST",
+                            "quantity": "1.00",
+                            "average_buy_price": "9.00",
+                            "market_price": "9.00",
+                        }
+                    ],
+                    "orders": [],
+                },
+                journal=journal,
+                portfolio_path=portfolio_path,
+            )
+            intent = build_order_intent(
+                "TEST",
+                "buy",
+                quantity=0.25,
+                limit_price=10,
+                estimated_price=10,
+                decision_dossier_path=dossier_path,
+            )
+            intent.thesis_id = pending.thesis_id
+            prepare_and_record_robinhood_review(
+                intent,
+                account,
+                market_data={"price": 10, "volume": 2_000_000, "bid": 9.99, "ask": 10.01},
+                journal=journal,
+                now=datetime(2026, 6, 4, 15, 0, tzinfo=timezone.utc),
+            )
+            submitted_at = datetime.now(timezone.utc).isoformat()
+            journal.update_execution_order(
+                intent.order_intent_id,
+                {
+                    "status": "submitted",
+                    "broker_order_id": "rh-top-up-order",
+                    "submitted_at": submitted_at,
+                    "dry_run": False,
+                },
+            )
+            sync_snapshot_to_artha(
+                {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "robinhood_mcp",
+                    "account": account,
+                    "portfolio": {"buying_power": 72.5, "cash": 72.5, "total_value": 72.5},
+                    "positions": [
+                        {
+                            "symbol": "TEST",
+                            "quantity": "1.25",
+                            "average_buy_price": "9.20",
+                            "market_price": "10.00",
+                        }
+                    ],
+                    "orders": [
+                        {
+                            "id": "rh-top-up-order",
+                            "symbol": "TEST",
+                            "side": "buy",
+                            "state": "unconfirmed",
+                        }
+                    ],
+                },
+                journal=journal,
+                portfolio_path=portfolio_path,
+            )
+            result = record_order_fill(
+                order_intent_id=intent.order_intent_id,
+                fill_payload={
+                    "id": "rh-top-up-order",
+                    "symbol": "TEST",
+                    "side": "buy",
+                    "state": "filled",
+                    "cumulative_quantity": "0.25",
+                    "average_price": "10.00",
+                    "last_transaction_at": datetime.now(timezone.utc).isoformat(),
+                },
+                journal=journal,
+                portfolio_path=portfolio_path,
+            )
+            self.assertTrue(result.get("already_recorded"))
+            pos = Portfolio.load(portfolio_path).get_position("TEST")
+            self.assertAlmostEqual(pos.shares, 1.25)
+            self.assertAlmostEqual(pos.avg_cost, 9.2)
         finally:
             (
                 Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
@@ -4194,7 +5465,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -4241,6 +5512,155 @@ class TestExecutionReadiness(unittest.TestCase):
                 Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
             ) = old_config
 
+    def test_manual_place_final_clearance_preserves_place_authorization(self):
+        from datetime import datetime, timezone
+
+        from artha.config import Config
+        from artha.execution import build_order_intent, prepare_and_record_robinhood_review
+        from artha.robinhood_bridge import (
+            build_action_operation,
+            queue_trade_action_from_order_payload,
+            record_action_review,
+            run_final_clearance_for_action,
+            set_trading_disabled,
+            write_robinhood_snapshot,
+        )
+
+        old_config = (
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+            Config.ROBINHOOD_REVIEW_ONLY,
+            Config.ROBINHOOD_DRY_RUN_ONLY,
+            Config.ROBINHOOD_AGENTIC_ENABLED,
+            Config.ROBINHOOD_KILL_SWITCH,
+            Config.ROBINHOOD_CONTROL_FILE,
+            Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+            Config.EXECUTION_OFFICER_LLM_ENABLED,
+        )
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
+            Config.ROBINHOOD_REVIEW_ONLY = False
+            Config.ROBINHOOD_DRY_RUN_ONLY = False
+            Config.ROBINHOOD_AGENTIC_ENABLED = True
+            Config.ROBINHOOD_KILL_SWITCH = False
+            Config.ROBINHOOD_CONTROL_FILE = str(self.tmp_dir / "control.json")
+            Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE = str(self.tmp_dir / "robinhood_snapshot.json")
+            Config.EXECUTION_OFFICER_LLM_ENABLED = True
+            set_trading_disabled(False, "unit test")
+            write_robinhood_snapshot(
+                {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "robinhood_mcp",
+                    "account": {
+                        "account_number": "222233334",
+                        "type": "cash",
+                        "nickname": "Agentic",
+                        "agentic_allowed": True,
+                        "state": "active",
+                    },
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
+                    "positions": [],
+                    "orders": [],
+                },
+                path=Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+            )
+            journal = self._journal_with_clean_buy_decision()
+            account = {
+                "account_number": "222233334",
+                "type": "cash",
+                "nickname": "Agentic",
+                "agentic_allowed": True,
+                "state": "active",
+            }
+            intent = build_order_intent("TEST", "buy", notional=25, quantity=0.25, limit_price=100, estimated_price=100)
+            result = prepare_and_record_robinhood_review(
+                intent,
+                account,
+                market_data=self._market_data(),
+                journal=journal,
+                now=datetime(2026, 6, 4, 15, 0, tzinfo=timezone.utc),
+            )
+            action = queue_trade_action_from_order_payload(result, journal=journal)
+            review_response = {
+                "data": {
+                    "symbol": "TEST",
+                    "side": "buy",
+                    "type": "market",
+                    "dollar_amount": "25.00",
+                    "order_checks": {},
+                    "quote_data": {
+                        "symbol": "TEST",
+                        "state": "active",
+                        "bid_price": "99.95",
+                        "ask_price": "100.05",
+                        "last_trade_price": "100.00",
+                    },
+                    "market_data_disclosure": "Bid $99.95 x 1 P · Ask $100.05 x 1 M · Last $100.00 x 1. Updated 10:00 AM ET.",
+                }
+            }
+            tradability_response = {
+                "data": {
+                    "results": [
+                        {
+                            "symbol": "TEST",
+                            "tradeable": True,
+                            "state": "active",
+                            "fractional_tradability": "tradable",
+                        }
+                    ]
+                }
+            }
+
+            first_review = record_action_review(
+                action["action_id"],
+                review_response,
+                tradability_response=tradability_response,
+                journal=journal,
+            )
+            self.assertEqual(first_review["status"], "review_clear")
+            with patch("artha.scheduler.MarketHours.is_market_open", return_value=True):
+                place_op = build_action_operation(action["callback_data"]["place"], journal=journal)
+            self.assertEqual(place_op["operation"], "tradability_then_review_then_place_equity_order", place_op)
+            self.assertEqual(journal.get_trade_action(action["action_id"])["status"], "place_requested")
+
+            second_review = record_action_review(
+                action["action_id"],
+                review_response,
+                tradability_response=tradability_response,
+                journal=journal,
+            )
+            self.assertEqual(second_review["status"], "review_clear")
+            stored = journal.get_trade_action(action["action_id"])
+            self.assertEqual(stored["status"], "review_clear")
+            stored_result = json.loads(stored["result_json"]) if isinstance(stored["result_json"], str) else stored["result_json"]
+            self.assertTrue(stored_result["manual_place_requested"]["passed"])
+
+            prompts = []
+
+            def fake_clearance(prompt):
+                prompts.append(prompt)
+                return '{"allow_place":true,"confidence":9,"rationale":"Manual Place was requested and the second review remains clear.","risk_flags":[],"requested_data":[]}'
+
+            with patch("artha.execution_officer.ChatGPTBackendClient.chat", side_effect=fake_clearance):
+                final = run_final_clearance_for_action(action["action_id"], journal=journal)
+            self.assertTrue(final["allow_place"])
+            self.assertIn('"status": "place_requested"', prompts[0])
+            self.assertIn('"manual_place_requested"', prompts[0])
+            self.assertEqual(journal.get_trade_action(action["action_id"])["status"], "review_clear")
+        finally:
+            (
+                Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+                Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+                Config.ROBINHOOD_REVIEW_ONLY,
+                Config.ROBINHOOD_DRY_RUN_ONLY,
+                Config.ROBINHOOD_AGENTIC_ENABLED,
+                Config.ROBINHOOD_KILL_SWITCH,
+                Config.ROBINHOOD_CONTROL_FILE,
+                Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+                Config.EXECUTION_OFFICER_LLM_ENABLED,
+            ) = old_config
+
     def test_execution_officer_uses_gpt55_extra_high_and_selects_whole_share_limit(self):
         from types import SimpleNamespace
 
@@ -4248,6 +5668,7 @@ class TestExecutionReadiness(unittest.TestCase):
         from artha.execution_officer import BUY_READY, WHOLE_SHARE_LIMIT, build_execution_officer_plan
 
         old_config = (
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
             Config.EXECUTION_OFFICER_LLM_ENABLED,
             Config.EXECUTION_OFFICER_MODEL,
             Config.EXECUTION_OFFICER_REASONING_EFFORT,
@@ -4255,6 +5676,7 @@ class TestExecutionReadiness(unittest.TestCase):
             Config.ROBINHOOD_AUTO_BUY_ENABLED,
         )
         try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
             Config.EXECUTION_OFFICER_LLM_ENABLED = True
             Config.EXECUTION_OFFICER_MODEL = "gpt-5.5"
             Config.EXECUTION_OFFICER_REASONING_EFFORT = "xhigh"
@@ -4306,11 +5728,294 @@ class TestExecutionReadiness(unittest.TestCase):
             self.assertIn("Robinhood review/tradability", prompt)
         finally:
             (
+                Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
                 Config.EXECUTION_OFFICER_LLM_ENABLED,
                 Config.EXECUTION_OFFICER_MODEL,
                 Config.EXECUTION_OFFICER_REASONING_EFFORT,
                 Config.EXECUTION_OFFICER_TEMPERATURE,
                 Config.ROBINHOOD_AUTO_BUY_ENABLED,
+            ) = old_config
+
+    def test_accumulate_verdict_is_allowed_for_unattended_auto_buy(self):
+        from types import SimpleNamespace
+
+        from artha.config import Config
+        from artha.execution_officer import BUY_READY, FRACTIONAL_MARKET, build_execution_officer_plan
+
+        old_config = (
+            Config.EXECUTION_OFFICER_LLM_ENABLED,
+            Config.ROBINHOOD_AUTO_BUY_ENABLED,
+        )
+        try:
+            Config.EXECUTION_OFFICER_LLM_ENABLED = False
+            Config.ROBINHOOD_AUTO_BUY_ENABLED = True
+            self.assertIn("ACCUMULATE", Config.ROBINHOOD_AUTO_BUY_ALLOWED_VERDICTS)
+            decision = SimpleNamespace(
+                ticker="TEST",
+                final_verdict="ACCUMULATE",
+                adjusted_score=76,
+                opportunity_score=76,
+                confidence=7,
+                recommended_allocation_pct=5.0,
+                recommended_action="ACCUMULATE near $20.00 if the live broker quote stays inside guardrails.",
+                dossier_path=str(self.tmp_dir / "TEST_dossier.json"),
+            )
+
+            plan = build_execution_officer_plan(
+                ticker="TEST",
+                decision=decision,
+                recommended_notional=17.50,
+                reference_price=20.00,
+                current_price=20.00,
+                market_data={"price": 20.00, "volume": 1_000_000, "bid": 19.99, "ask": 20.01},
+            )
+
+            self.assertEqual(plan.execution_verdict, BUY_READY)
+            self.assertEqual(plan.strategy, FRACTIONAL_MARKET)
+            self.assertTrue(plan.checks["auto_buy_verdict_allowed"])
+            self.assertTrue(plan.auto_buy_eligible)
+        finally:
+            (
+                Config.EXECUTION_OFFICER_LLM_ENABLED,
+                Config.ROBINHOOD_AUTO_BUY_ENABLED,
+            ) = old_config
+
+    def test_stage_a_execution_officer_cannot_deadlock_clean_fractional_buy_on_future_broker_checks(self):
+        from types import SimpleNamespace
+
+        from artha.config import Config
+        from artha.execution_officer import BUY_READY, FRACTIONAL_MARKET, build_execution_officer_plan
+
+        old_config = (
+            Config.EXECUTION_OFFICER_LLM_ENABLED,
+            Config.ROBINHOOD_AUTO_BUY_ENABLED,
+        )
+        try:
+            Config.EXECUTION_OFFICER_LLM_ENABLED = True
+            Config.ROBINHOOD_AUTO_BUY_ENABLED = True
+            decision = SimpleNamespace(
+                ticker="USB",
+                final_verdict="STARTER",
+                adjusted_score=87,
+                opportunity_score=87,
+                confidence=7,
+                recommended_allocation_pct=6.0,
+                recommended_action="STARTER near $63.90 if execution remains safe.",
+                dossier_path=str(self.tmp_dir / "USB_dossier.json"),
+            )
+            premature_wait = json.dumps(
+                {
+                    "selected_candidate_id": "wait_for_safe_execution",
+                    "execution_verdict": "WAIT_FOR_SAFE_EXECUTION",
+                    "confidence": 8,
+                    "rationale": "A current Robinhood order review was not supplied.",
+                    "requested_data": ["Robinhood tradability", "Robinhood exact-order review"],
+                    "risk_flags": [],
+                }
+            )
+            with patch("artha.execution_officer.ChatGPTBackendClient.chat", return_value=premature_wait) as mock_chat:
+                plan = build_execution_officer_plan(
+                    ticker="USB",
+                    decision=decision,
+                    recommended_notional=21.87,
+                    reference_price=63.90,
+                    current_price=63.90,
+                    market_data={"price": 63.90, "volume": 1_000_000, "bid": 63.89, "ask": 63.91},
+                )
+
+            self.assertEqual(plan.execution_verdict, BUY_READY)
+            self.assertEqual(plan.strategy, FRACTIONAL_MARKET)
+            self.assertTrue(plan.auto_buy_eligible)
+            self.assertFalse(plan.officer_used)
+            self.assertIn("attempted to downgrade", plan.officer_json["rejected_reason"])
+            self.assertFalse(any("Robinhood order review was not supplied" in reason for reason in plan.reasons))
+            prompt = mock_chat.call_args.args[0]
+            self.assertIn("Stage A: order planning", prompt)
+            self.assertIn("intentionally_deferred_to_stage_b", prompt)
+            self.assertIn("Do not request or require Stage B Robinhood evidence", prompt)
+        finally:
+            (
+                Config.EXECUTION_OFFICER_LLM_ENABLED,
+                Config.ROBINHOOD_AUTO_BUY_ENABLED,
+            ) = old_config
+
+    def test_stage_a_execution_officer_preserves_real_score_gate_after_clean_order_plan(self):
+        from types import SimpleNamespace
+
+        from artha.config import Config
+        from artha.execution_officer import BUY_READY, build_execution_officer_plan
+
+        old_config = Config.EXECUTION_OFFICER_LLM_ENABLED
+        try:
+            Config.EXECUTION_OFFICER_LLM_ENABLED = False
+            decision = SimpleNamespace(
+                ticker="EPR",
+                final_verdict="TACTICAL_BUY",
+                adjusted_score=67,
+                opportunity_score=67,
+                confidence=6,
+                recommended_allocation_pct=4.0,
+                recommended_action="TACTICAL_BUY near $61.49.",
+            )
+            plan = build_execution_officer_plan(
+                ticker="EPR",
+                decision=decision,
+                recommended_notional=14.58,
+                reference_price=61.49,
+                current_price=61.49,
+                market_data={"price": 61.49, "volume": 500_000, "bid": 61.46, "ask": 61.52},
+            )
+            self.assertEqual(plan.execution_verdict, BUY_READY)
+            self.assertFalse(plan.checks["auto_buy_score_allowed"])
+            self.assertFalse(plan.auto_buy_eligible)
+        finally:
+            Config.EXECUTION_OFFICER_LLM_ENABLED = old_config
+
+    def test_stage_a_execution_officer_cannot_upgrade_price_drift_blocked_candidate(self):
+        from types import SimpleNamespace
+
+        from artha.config import Config
+        from artha.execution_officer import WAIT_FOR_SAFE_EXECUTION, build_execution_officer_plan
+
+        old_config = Config.EXECUTION_OFFICER_LLM_ENABLED
+        try:
+            Config.EXECUTION_OFFICER_LLM_ENABLED = True
+            decision = SimpleNamespace(
+                ticker="MU",
+                final_verdict="STARTER",
+                adjusted_score=85,
+                opportunity_score=85,
+                confidence=8,
+                recommended_allocation_pct=5.0,
+                recommended_action="STARTER only inside the price guardrail.",
+            )
+            unsafe_upgrade = json.dumps(
+                {
+                    "selected_candidate_id": "fractional_market_notional",
+                    "execution_verdict": "BUY_READY",
+                    "confidence": 9,
+                    "rationale": "Buy immediately.",
+                    "requested_data": [],
+                    "risk_flags": [],
+                }
+            )
+            with patch("artha.execution_officer.ChatGPTBackendClient.chat", return_value=unsafe_upgrade):
+                plan = build_execution_officer_plan(
+                    ticker="MU",
+                    decision=decision,
+                    recommended_notional=22.78,
+                    reference_price=894.27,
+                    current_price=894.27,
+                    market_data={"price": 894.27, "volume": 2_000_000, "bid": 899.50, "ask": 900.00},
+                )
+
+            self.assertEqual(plan.execution_verdict, WAIT_FOR_SAFE_EXECUTION)
+            self.assertFalse(plan.auto_buy_eligible)
+            self.assertFalse(plan.officer_used)
+            self.assertIn("disallowed BUY_READY", plan.officer_json["rejected_reason"])
+        finally:
+            Config.EXECUTION_OFFICER_LLM_ENABLED = old_config
+
+    def test_scheduled_fractional_buy_queues_stage_b_even_when_stage_a_llm_requests_future_broker_data(self):
+        from types import SimpleNamespace
+
+        from artha.config import Config
+        from artha.scheduler import ArthaScheduler, MarketHours
+
+        old_config = (
+            Config.SCAN_PREPARE_ROBINHOOD_REVIEW_FOR_BUYS,
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+            Config.EXECUTION_OFFICER_LLM_ENABLED,
+            Config.ROBINHOOD_AUTO_BUY_ENABLED,
+            Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+        )
+        try:
+            Config.SCAN_PREPARE_ROBINHOOD_REVIEW_FOR_BUYS = True
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
+            Config.EXECUTION_OFFICER_LLM_ENABLED = True
+            Config.ROBINHOOD_AUTO_BUY_ENABLED = True
+            Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE = str(self._write_agentic_snapshot_file(cash=100.0))
+            journal = self._journal_with_clean_buy_decision()
+            scheduler = ArthaScheduler()
+            scheduler.market_hours = SimpleNamespace(is_market_open=lambda dt=None: True)
+            dossier_path = self.tmp_dir / "USB_dossier.json"
+            dossier_path.write_text(
+                '{"ticker":"USB","evidence":[{"id":"E001","source":"fmp.quote"}]}',
+                encoding="utf-8",
+            )
+            journal.save_decision_features(
+                {
+                    "dossier_path": str(dossier_path),
+                    "generated_at": "2026-08-07T16:52:05+00:00",
+                    "ticker": "USB",
+                    "final_verdict": "STARTER",
+                    "opportunity_score": 87,
+                    "adjusted_score": 87,
+                    "confidence": 7,
+                    "price": 63.90,
+                    "sector": "Financial Services",
+                    "evidence_count": 34,
+                    "source_count": 12,
+                    "feature_json": json.dumps({"unit": True}),
+                }
+            )
+            decision = SimpleNamespace(
+                ticker="USB",
+                final_verdict="STARTER",
+                recommended_action="STARTER - buy about $21.87 near $63.90 if execution remains safe.",
+                synthesis_report="",
+                recommended_allocation_pct=6.0,
+                opportunity_score=87,
+                adjusted_score=87,
+                confidence=7,
+                dossier_path=str(dossier_path),
+            )
+            stock_data = {
+                "quote": {"price": 63.90, "volume": 1_000_000, "bid": 63.89, "ask": 63.91},
+                "yf_quote": {"price": 63.90, "volume": 1_000_000, "bid": 63.89, "ask": 63.91},
+            }
+            premature_wait = json.dumps(
+                {
+                    "selected_candidate_id": "wait_for_safe_execution",
+                    "execution_verdict": "WAIT_FOR_SAFE_EXECUTION",
+                    "confidence": 8,
+                    "rationale": "Robinhood tradability and exact-order review are not supplied.",
+                    "requested_data": ["Robinhood tradability", "Robinhood exact-order review"],
+                    "risk_flags": [],
+                }
+            )
+
+            with patch("artha.execution_officer.ChatGPTBackendClient.chat", return_value=premature_wait), \
+                 patch.object(MarketHours, "is_market_open", lambda self, now=None: True):
+                result = scheduler._prepare_scan_buy_robinhood_review(
+                    "USB",
+                    decision,
+                    stock_data,
+                    journal,
+                    nav=364.50,
+                    recommendation_id=504,
+                )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["broker_result"]["status"], "review_ready", result)
+            self.assertEqual(result["intent"]["order_type"], "market")
+            self.assertAlmostEqual(result["intent"]["notional"], 21.87, places=2)
+            self.assertEqual(result["trade_action"]["action_type"], "auto_buy")
+            self.assertNotEqual(result["trade_action"]["status"], "not_queued")
+            self.assertNotIn("entry_watch", result)
+            self.assertIsNone(result["trade_action"]["reply_markup"])
+            stored = journal.get_trade_action(result["trade_action"]["action_id"])
+            self.assertEqual(stored["action_type"], "auto_buy")
+        finally:
+            (
+                Config.SCAN_PREPARE_ROBINHOOD_REVIEW_FOR_BUYS,
+                Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+                Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+                Config.EXECUTION_OFFICER_LLM_ENABLED,
+                Config.ROBINHOOD_AUTO_BUY_ENABLED,
+                Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
             ) = old_config
 
     def test_execution_officer_expensive_stock_does_not_force_whole_share(self):
@@ -4387,14 +6092,21 @@ class TestExecutionReadiness(unittest.TestCase):
                 "quote": {"price": 10.0, "volume": 2_000_000, "bid": 9.99, "ask": 10.01},
                 "yf_quote": {"price": 10.0, "volume": 2_000_000, "bid": 9.99, "ask": 10.01},
             }
-            result = scheduler._prepare_scan_buy_robinhood_review(
-                "TEST",
-                decision,
-                stock_data,
-                journal,
-                nav=350.0,
-                recommendation_id=123,
-            )
+            # Wave 2: dry_run now follows Config.ROBINHOOD_DRY_RUN_ONLY, so the
+            # guardrails enforce market hours at queue time; pin market open.
+            from unittest.mock import patch as _patch
+
+            from artha.scheduler import MarketHours as _MarketHours
+
+            with _patch.object(_MarketHours, "is_market_open", lambda self, now=None: True):
+                result = scheduler._prepare_scan_buy_robinhood_review(
+                    "TEST",
+                    decision,
+                    stock_data,
+                    journal,
+                    nav=350.0,
+                    recommendation_id=123,
+                )
             rows = journal.get_execution_orders(limit=1)
             self.assertIsNotNone(result)
             self.assertEqual(rows[0]["status"], "review_ready")
@@ -4474,6 +6186,8 @@ class TestExecutionReadiness(unittest.TestCase):
             self.assertEqual(result["intent"]["quantity"], 1.0)
             self.assertAlmostEqual(result["intent"]["limit_price"], 16.29, places=2)
             self.assertEqual(result["trade_action"]["action_type"], "auto_buy")
+            self.assertIsNone(result["trade_action"]["reply_markup"])
+            self.assertEqual(result["trade_action"]["callback_data"], {})
             rows = journal.get_execution_orders(limit=1)
             self.assertIn('"type": "limit"', rows[0]["request_json"])
             self.assertIn('"quantity": "1"', rows[0]["request_json"])
@@ -4599,7 +6313,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -4766,7 +6480,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -4902,7 +6616,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -4994,6 +6708,343 @@ class TestExecutionReadiness(unittest.TestCase):
                 Config.EXECUTION_OFFICER_AGENTIC_MAX_TOOL_STEPS,
             ) = old_config
 
+    def test_agentic_prompt_surfaces_compact_broker_review_evidence(self):
+        from artha.execution_officer import build_agentic_execution_prompt
+
+        tool_trace = [
+            {
+                "step": 1,
+                "tool_name": "robinhood_get_quote",
+                "status": "PASS",
+                "result": {
+                    "data": {
+                        "results": [
+                            {
+                                "quote": {
+                                    "symbol": "TEST",
+                                    "bid_price": "16.14",
+                                    "ask_price": "16.17",
+                                    "last_trade_price": "16.15",
+                                }
+                            }
+                        ]
+                    }
+                },
+            },
+            {
+                "step": 2,
+                "tool_name": "robinhood_get_tradability",
+                "status": "PASS",
+                "result": {
+                    "data": {
+                        "results": [
+                            {
+                                "symbol": "TEST",
+                                "tradeable": True,
+                                "state": "active",
+                                "fractional_tradability": "tradable",
+                            }
+                        ]
+                    }
+                },
+            },
+            {
+                "step": 3,
+                "tool_name": "robinhood_review_order",
+                "status": "PASS",
+                "result": {
+                    "recorded_review": {
+                        "review_gate": {
+                            "passed": True,
+                            "status": "PASS",
+                            "reasons": [],
+                            "checks": {
+                                "tradability": {
+                                    "passed": True,
+                                    "status": "PASS",
+                                    "checks": {
+                                        "tradeable": True,
+                                        "state": "active",
+                                        "fractional_tradability": "tradable",
+                                    },
+                                },
+                                "review_price_drift": {
+                                    "passed": True,
+                                    "status": "PASS",
+                                    "checks": {"ask": 16.17, "reference_price": 16.15},
+                                },
+                                "order_checks_classification": {
+                                    "blocking": False,
+                                    "blocking_reasons": [],
+                                    "has_checks": False,
+                                },
+                            },
+                        }
+                    }
+                },
+            },
+        ]
+
+        prompt = build_agentic_execution_prompt(
+            action={"action_id": "ta_test", "ticker": "TEST", "action_type": "auto_buy"},
+            operation={
+                "operation": "auto_tradability_review_then_place_equity_order",
+                "action_id": "ta_test",
+                "review_mcp_args": {"symbol": "TEST", "side": "buy"},
+                "tradability_mcp_args": {"symbols": ["TEST"]},
+            },
+            tool_trace=tool_trace,
+            step=4,
+        )
+
+        self.assertIn("mandatory_broker_evidence", prompt)
+        self.assertIn('"review_gate_passed": true', prompt)
+        self.assertIn('"tradability_passed": true', prompt)
+        self.assertIn('"fractional_tradability": "tradable"', prompt)
+        self.assertIn('"blocking": false', prompt)
+
+    def test_stage_b_reserves_broker_tools_and_corrects_false_missing_proof_denial(self):
+        from datetime import datetime, timezone
+
+        from artha.config import Config
+        from artha.execution import build_order_intent, prepare_and_record_robinhood_review
+        from artha.execution_officer import run_agentic_execution_officer
+        from artha.robinhood_bridge import queue_trade_action_from_order_payload
+
+        class FakeRobinhood:
+            def __init__(self):
+                self.calls = []
+
+            def get_equity_quotes(self, **kwargs):
+                self.calls.append("quote")
+                return {
+                    "data": {
+                        "results": [
+                            {"quote": {"symbol": "TEST", "bid_price": "99.95", "ask_price": "100.05", "last_trade_price": "100.00"}}
+                        ]
+                    }
+                }
+
+            def get_equity_tradability(self, **kwargs):
+                self.calls.append("tradability")
+                return {
+                    "data": {
+                        "results": [
+                            {"symbol": "TEST", "tradeable": True, "state": "active", "fractional_tradability": "tradable"}
+                        ]
+                    }
+                }
+
+            def review_equity_order(self, **kwargs):
+                self.calls.append("review")
+                response = dict(kwargs)
+                response["order_checks"] = {}
+                response["market_data_disclosure"] = "Bid $99.95 x 100 P; Ask $100.05 x 100 P; Last $100.00 x 10 P."
+                return {"data": response}
+
+        old_config = (
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            Config.EXECUTION_OFFICER_LLM_ENABLED,
+            Config.EXECUTION_OFFICER_AGENTIC_ENABLED,
+            Config.EXECUTION_OFFICER_AGENTIC_MAX_TOOL_STEPS,
+        )
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            Config.EXECUTION_OFFICER_LLM_ENABLED = True
+            Config.EXECUTION_OFFICER_AGENTIC_ENABLED = True
+            Config.EXECUTION_OFFICER_AGENTIC_MAX_TOOL_STEPS = 4
+            journal = self._journal_with_clean_buy_decision()
+            intent = build_order_intent(
+                "TEST",
+                "buy",
+                notional=20,
+                limit_price=100,
+                estimated_price=100,
+                decision_dossier_path=str(self.tmp_dir / "TEST_dossier.json"),
+            )
+            intent.evidence = {
+                "execution_officer": {
+                    "auto_buy_eligible": True,
+                    "execution_verdict": "BUY_READY",
+                    "strategy": "FRACTIONAL_MARKET",
+                }
+            }
+            prepared = prepare_and_record_robinhood_review(
+                intent,
+                {
+                    "account_number": "222233334",
+                    "type": "cash",
+                    "nickname": "Agentic",
+                    "agentic_allowed": True,
+                    "state": "active",
+                },
+                market_data=self._market_data(),
+                journal=journal,
+                now=datetime(2026, 6, 4, 15, 0, tzinfo=timezone.utc),
+            )
+            action = queue_trade_action_from_order_payload(prepared, action_type="auto_buy", journal=journal)
+            operation = {
+                "success": True,
+                "operation": "auto_tradability_review_then_place_equity_order",
+                "action_id": action["action_id"],
+                "review_mcp_args": {
+                    "account_number": "222233334",
+                    "symbol": "TEST",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "dollar_amount": "20.00",
+                },
+                "tradability_mcp_args": {"account_number": "222233334", "symbols": ["TEST"]},
+            }
+            model_steps = [
+                '{"tool_name":"web_news_context","args":{},"reason":"optional research"}',
+                '{"tool_name":"web_news_context","args":{},"reason":"optional research"}',
+                '{"tool_name":"web_news_context","args":{},"reason":"optional research"}',
+                '{"final_decision":{"allow_place":false,"confidence":8,"order_unchanged":true,"rationale":"Broker tradability and order review are not visible, so I cannot verify them.","evidence_refs":[],"risk_flags":[],"missing_data":["Robinhood review gate"]}}',
+                '{"final_decision":{"allow_place":true,"confidence":9,"order_unchanged":true,"rationale":"The compact deterministic broker packet confirms quote, tradability, price drift, and order review all pass.","evidence_refs":["mandatory_broker_evidence"],"risk_flags":[],"missing_data":[]}}',
+            ]
+            with patch("artha.execution_officer.ChatGPTBackendClient.chat", side_effect=model_steps) as chat:
+                result = run_agentic_execution_officer(
+                    action=journal.get_trade_action(action["action_id"]),
+                    operation=operation,
+                    broker=FakeRobinhood(),
+                    journal=journal,
+                )
+            self.assertTrue(result["allow_place"], result)
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(chat.call_count, 5)
+            self.assertEqual(
+                [item["tool_name"] for item in result["tool_trace"]],
+                ["robinhood_get_quote", "robinhood_get_tradability", "robinhood_review_order", "invalid_final_decision"],
+            )
+        finally:
+            (
+                Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+                Config.EXECUTION_OFFICER_LLM_ENABLED,
+                Config.EXECUTION_OFFICER_AGENTIC_ENABLED,
+                Config.EXECUTION_OFFICER_AGENTIC_MAX_TOOL_STEPS,
+            ) = old_config
+
+    def test_stage_b_rejects_empty_quote_even_when_other_broker_checks_pass(self):
+        from artha.execution_officer import _broker_evidence_gate
+
+        trace = [
+            {"tool_name": "robinhood_get_quote", "status": "PASS", "result": {}},
+            {"tool_name": "robinhood_get_tradability", "status": "PASS", "result": {"tradeable": True}},
+            {
+                "tool_name": "robinhood_review_order",
+                "status": "PASS",
+                "result": {
+                    "recorded_review": {
+                        "review_gate": {
+                            "passed": True,
+                            "status": "PASS",
+                            "reasons": [],
+                            "checks": {
+                                "tradability": {"passed": True, "status": "PASS", "checks": {}},
+                                "review_price_drift": {"passed": True, "status": "PASS", "checks": {}},
+                                "order_checks_classification": {"blocking": False, "has_checks": False},
+                            },
+                        }
+                    }
+                },
+            },
+        ]
+        gate = _broker_evidence_gate(trace)
+        self.assertFalse(gate["passed"])
+        self.assertIn("did not return an actual positive", " ".join(gate["reasons"]))
+
+    def test_auto_buy_action_binds_current_thesis_to_action_and_order(self):
+        from datetime import datetime, timezone
+
+        from artha.execution import build_order_intent, prepare_and_record_robinhood_review
+        from artha.robinhood_bridge import queue_trade_action_from_order_payload
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = self._journal_with_clean_buy_decision()
+        pending = ThesisTracker(journal).get_pending_for_ticker("TEST")
+        self.assertIsNotNone(pending)
+        intent = build_order_intent("TEST", "buy", notional=20, limit_price=100, estimated_price=100)
+        intent.evidence = {
+            "execution_officer": {
+                "auto_buy_eligible": True,
+                "execution_verdict": "BUY_READY",
+                "strategy": "FRACTIONAL_MARKET",
+            }
+        }
+        prepared = prepare_and_record_robinhood_review(
+            intent,
+            {
+                "account_number": "222233334",
+                "type": "cash",
+                "nickname": "Agentic",
+                "agentic_allowed": True,
+                "state": "active",
+            },
+            market_data=self._market_data(),
+            journal=journal,
+            now=datetime(2026, 6, 4, 15, 0, tzinfo=timezone.utc),
+        )
+        action = queue_trade_action_from_order_payload(prepared, action_type="auto_buy", journal=journal)
+        execution_row = journal.get_execution_order_by_intent_id(intent.order_intent_id)
+        payload = json.loads(action["payload_json"]) if isinstance(action["payload_json"], str) else action["payload_json"]
+        self.assertEqual(action["thesis_id"], pending.thesis_id)
+        self.assertEqual((payload["intent"] or {}).get("thesis_id"), pending.thesis_id)
+        self.assertEqual(execution_row["thesis_id"], pending.thesis_id)
+
+    def test_auto_buy_authorization_blocks_when_no_current_thesis_exists(self):
+        from datetime import datetime, timezone
+
+        from artha.execution import build_order_intent, prepare_and_record_robinhood_review
+        from artha.robinhood_bridge import _auto_buy_authorization_gate, queue_trade_action_from_order_payload
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = self._journal_with_clean_buy_decision()
+        tracker = ThesisTracker(journal)
+        pending = tracker.get_pending_for_ticker("TEST")
+        self.assertIsNotNone(pending)
+        tracker.update_thesis_fields(pending.thesis_id, status="expired")
+        intent = build_order_intent("TEST", "buy", notional=20, limit_price=100, estimated_price=100)
+        intent.evidence = {
+            "execution_officer": {
+                "auto_buy_eligible": True,
+                "execution_verdict": "BUY_READY",
+                "strategy": "FRACTIONAL_MARKET",
+            }
+        }
+        prepared = prepare_and_record_robinhood_review(
+            intent,
+            {
+                "account_number": "222233334",
+                "type": "cash",
+                "nickname": "Agentic",
+                "agentic_allowed": True,
+                "state": "active",
+            },
+            market_data=self._market_data(),
+            journal=journal,
+            now=datetime(2026, 6, 4, 15, 0, tzinfo=timezone.utc),
+        )
+        action = queue_trade_action_from_order_payload(prepared, action_type="auto_buy", journal=journal)
+        gate = _auto_buy_authorization_gate(journal.get_trade_action(action["action_id"]), journal)
+        self.assertFalse(gate["passed"])
+        self.assertIn("requires a matching pending or active investment thesis", " ".join(gate["reasons"]))
+
+    def test_fresh_council_thesis_refresh_extends_pending_expiry(self):
+        from datetime import datetime, timezone
+
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = self._journal_with_clean_buy_decision()
+        tracker = ThesisTracker(journal)
+        pending = tracker.get_pending_for_ticker("TEST")
+        self.assertIsNotNone(pending)
+        tracker.update_thesis_fields(pending.thesis_id, pending_expiry="2026-08-07T16:54:05+00:00")
+        self.assertTrue(tracker.refresh_pending_expiry(pending.thesis_id))
+        refreshed = tracker.get(pending.thesis_id)
+        self.assertGreater(datetime.fromisoformat(refreshed.pending_expiry), datetime.now(timezone.utc))
+
     def test_auto_buy_operation_does_not_retry_blocked_status(self):
         from datetime import datetime, timezone
 
@@ -5028,7 +7079,7 @@ class TestExecutionReadiness(unittest.TestCase):
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "source": "robinhood_mcp",
                     "account": {"account_number": "222233334", "type": "cash", "nickname": "Agentic", "agentic_allowed": True, "state": "active"},
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -5068,6 +7119,217 @@ class TestExecutionReadiness(unittest.TestCase):
                 Config.ROBINHOOD_CONTROL_FILE,
                 Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
                 Config.ROBINHOOD_AUTO_BUY_ENABLED,
+            ) = old_config
+
+    def test_auto_buy_queue_keeps_actions_visible_after_review_request(self):
+        from datetime import datetime, timezone
+
+        from artha.config import Config
+        from artha.execution import build_order_intent, prepare_and_record_robinhood_review
+        from artha.robinhood_bridge import (
+            build_pending_auto_buy_queue_status,
+            queue_trade_action_from_order_payload,
+            set_trading_disabled,
+            write_robinhood_snapshot,
+        )
+
+        old_config = (
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+            Config.ROBINHOOD_REVIEW_ONLY,
+            Config.ROBINHOOD_DRY_RUN_ONLY,
+            Config.ROBINHOOD_AGENTIC_ENABLED,
+            Config.ROBINHOOD_KILL_SWITCH,
+            Config.ROBINHOOD_CONTROL_FILE,
+            Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+            Config.ROBINHOOD_AUTO_BUY_ENABLED,
+        )
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
+            Config.ROBINHOOD_REVIEW_ONLY = False
+            Config.ROBINHOOD_DRY_RUN_ONLY = False
+            Config.ROBINHOOD_AGENTIC_ENABLED = True
+            Config.ROBINHOOD_KILL_SWITCH = False
+            Config.ROBINHOOD_CONTROL_FILE = str(self.tmp_dir / "control.json")
+            Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE = str(self.tmp_dir / "robinhood_snapshot.json")
+            Config.ROBINHOOD_AUTO_BUY_ENABLED = True
+            set_trading_disabled(False, "unit test")
+            write_robinhood_snapshot(
+                {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "robinhood_mcp",
+                    "account": {
+                        "account_number": "222233334",
+                        "type": "cash",
+                        "nickname": "Agentic",
+                        "agentic_allowed": True,
+                        "state": "active",
+                    },
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
+                    "positions": [],
+                    "orders": [],
+                },
+                path=Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+            )
+            journal = self._journal_with_clean_buy_decision()
+            account = {
+                "account_number": "222233334",
+                "type": "cash",
+                "nickname": "Agentic",
+                "agentic_allowed": True,
+                "state": "active",
+            }
+            intent = build_order_intent(
+                "TEST",
+                "buy",
+                notional=17.85,
+                estimated_price=100.0,
+                decision_dossier_path=str(self.tmp_dir / "TEST_dossier.json"),
+            )
+            intent.evidence = {
+                "execution_officer": {
+                    "auto_buy_eligible": True,
+                    "execution_verdict": "BUY_READY",
+                    "strategy": "FRACTIONAL_MARKET",
+                    "selected_candidate_id": "fractional_market_notional",
+                    "officer_model": "gpt-5.5",
+                    "officer_reasoning_effort": "xhigh",
+                    "officer_temperature": 0.2,
+                }
+            }
+            result = prepare_and_record_robinhood_review(
+                intent,
+                account,
+                market_data={"price": 100.0, "volume": 1_000_000, "bid": 99.95, "ask": 100.05},
+                journal=journal,
+                now=datetime(2026, 6, 4, 15, 0, tzinfo=timezone.utc),
+            )
+            action = queue_trade_action_from_order_payload(result, action_type="auto_buy", journal=journal)
+            journal.update_trade_action(action["action_id"], {"status": "auto_review_requested"})
+            self.assertEqual(journal.get_trade_action(action["action_id"])["status"], "auto_review_requested")
+
+            queue = build_pending_auto_buy_queue_status(journal=journal)
+            self.assertEqual(queue["operation_count"], 1)
+            self.assertEqual(queue["actions"][0]["action_id"], action["action_id"])
+            self.assertEqual(queue["actions"][0]["status"], "auto_review_requested")
+        finally:
+            (
+                Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+                Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+                Config.ROBINHOOD_REVIEW_ONLY,
+                Config.ROBINHOOD_DRY_RUN_ONLY,
+                Config.ROBINHOOD_AGENTIC_ENABLED,
+                Config.ROBINHOOD_KILL_SWITCH,
+                Config.ROBINHOOD_CONTROL_FILE,
+                Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+                Config.ROBINHOOD_AUTO_BUY_ENABLED,
+            ) = old_config
+
+    def test_auto_buy_daily_dollar_cap_pauses_buys(self):
+        from datetime import datetime, timezone
+
+        from artha.config import Config
+        from artha.execution import build_order_intent, prepare_and_record_robinhood_review
+        from artha.robinhood_bridge import build_auto_buy_operation, queue_trade_action_from_order_payload, set_trading_disabled, write_robinhood_snapshot
+
+        old_config = (
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+            Config.ROBINHOOD_REVIEW_ONLY,
+            Config.ROBINHOOD_DRY_RUN_ONLY,
+            Config.ROBINHOOD_AGENTIC_ENABLED,
+            Config.ROBINHOOD_KILL_SWITCH,
+            Config.ROBINHOOD_CONTROL_FILE,
+            Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+            Config.ROBINHOOD_AUTO_BUY_ENABLED,
+            Config.ROBINHOOD_AUTO_BUY_MAX_DAILY_DOLLARS,
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT,
+        )
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
+            Config.ROBINHOOD_REVIEW_ONLY = False
+            Config.ROBINHOOD_DRY_RUN_ONLY = False
+            Config.ROBINHOOD_AGENTIC_ENABLED = True
+            Config.ROBINHOOD_KILL_SWITCH = False
+            Config.ROBINHOOD_CONTROL_FILE = str(self.tmp_dir / "control.json")
+            Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE = str(self.tmp_dir / "robinhood_snapshot.json")
+            Config.ROBINHOOD_AUTO_BUY_ENABLED = True
+            Config.ROBINHOOD_AUTO_BUY_MAX_DAILY_DOLLARS = 50.0
+            Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT = True
+            set_trading_disabled(False, "unit test")
+            write_robinhood_snapshot(
+                {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "robinhood_mcp",
+                    "account": {"account_number": "222233334", "type": "cash", "nickname": "Agentic", "agentic_allowed": True, "state": "active"},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
+                    "positions": [],
+                    "orders": [],
+                },
+                path=Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+            )
+            journal = self._journal_with_clean_buy_decision()
+            journal.save_execution_order(
+                {
+                    "order_intent_id": "existing-auto-buy",
+                    "ticker": "OLD",
+                    "side": "buy",
+                    "order_type": "market",
+                    "status": "filled",
+                    "dry_run": False,
+                    "submitted_at": datetime.now(timezone.utc).isoformat(),
+                    "filled_at": datetime.now(timezone.utc).isoformat(),
+                    "notional": 45.0,
+                    "quantity": 1.0,
+                    "estimated_price": 45.0,
+                    "request_json": {},
+                    "response_json": {},
+                    "notes": "unit existing buy",
+                }
+            )
+            account = {"account_number": "222233334", "type": "cash", "nickname": "Agentic", "agentic_allowed": True, "state": "active"}
+            intent = build_order_intent("TEST", "buy", quantity=1, notional=16.29, limit_price=16.29, estimated_price=16.15)
+            intent.evidence = {
+                "execution_officer": {
+                    "auto_buy_eligible": True,
+                    "execution_verdict": "BUY_READY",
+                    "strategy": "WHOLE_SHARE_LIMIT",
+                }
+            }
+            result = prepare_and_record_robinhood_review(
+                intent,
+                account,
+                market_data={"price": 16.15, "volume": 1_000_000, "bid": 16.14, "ask": 16.17},
+                journal=journal,
+                now=datetime.now(timezone.utc),
+            )
+            action = queue_trade_action_from_order_payload(result, action_type="auto_buy", journal=journal)
+            with patch(
+                "artha.robinhood_bridge.maybe_pause_buying_for_limit",
+                return_value={"success": True, "operation": "buy_pause", "reason": "Auto-buy daily cap would be exceeded."},
+            ) as maybe_stop:
+                op = build_auto_buy_operation(action["action_id"], journal=journal)
+
+            self.assertFalse(op["success"])
+            self.assertEqual(op["operation"], "blocked")
+            self.assertIn("Auto-buy daily cap would be exceeded", op["message"])
+            self.assertEqual(op["auto_trade_gate"]["checks"]["buy_pause"]["operation"], "buy_pause")
+            maybe_stop.assert_called_once()
+        finally:
+            (
+                Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+                Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+                Config.ROBINHOOD_REVIEW_ONLY,
+                Config.ROBINHOOD_DRY_RUN_ONLY,
+                Config.ROBINHOOD_AGENTIC_ENABLED,
+                Config.ROBINHOOD_KILL_SWITCH,
+                Config.ROBINHOOD_CONTROL_FILE,
+                Config.ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE,
+                Config.ROBINHOOD_AUTO_BUY_ENABLED,
+                Config.ROBINHOOD_AUTO_BUY_MAX_DAILY_DOLLARS,
+                Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT,
             ) = old_config
 
     def test_agentic_execution_officer_blocks_final_without_required_tools(self):
@@ -5137,7 +7399,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -5262,7 +7524,7 @@ class TestExecutionReadiness(unittest.TestCase):
                         "agentic_allowed": True,
                         "state": "active",
                     },
-                    "portfolio": {"buying_power": 100},
+                    "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
                     "positions": [],
                     "orders": [],
                 },
@@ -5338,6 +7600,9 @@ class TestExecutionReadiness(unittest.TestCase):
             scheduler.market_hours = MarketHours()
             scheduler.ct_tz = ZoneInfo("America/Chicago")
             scheduler._last_run = {}
+            scheduler._mark_run_slot = (
+                lambda name, slot: scheduler._last_run.__setitem__(name, slot)
+            )
 
             def utc_at(year: int, month: int, day: int, hour: int, minute: int):
                 return datetime(year, month, day, hour, minute, tzinfo=scheduler.ct_tz).astimezone(timezone.utc)
@@ -5433,7 +7698,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 confidence=7,
                 dossier_path=str(self.tmp_dir / "UTHR_dossier.json"),
                 invalidation_conditions=["unit"],
-                entry_valid_until="2026-07-08",
+                entry_valid_until=(datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat(),
                 agentic_trace={},
             )
             stock_data = {
@@ -5506,7 +7771,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 confidence=7,
                 dossier_path=str(self.tmp_dir / "KRYS_dossier.json"),
                 invalidation_conditions=["unit"],
-                entry_valid_until="2026-07-08",
+                entry_valid_until=(datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat(),
                 agentic_trace={},
             )
             stock_data = {
@@ -5567,7 +7832,7 @@ class TestExecutionReadiness(unittest.TestCase):
         journal.update_pending_order_recheck("unit-recheck", {"status": "review_ready", "notes": "unit"})
         self.assertEqual(journal.get_pending_order_rechecks(limit=1)[0]["status"], "review_ready")
 
-    def test_market_open_recheck_runs_council_and_sends_button_summary(self):
+    def test_market_open_recheck_runs_council_and_queues_auto_buy_without_buttons(self):
         import asyncio
         from datetime import datetime, timedelta, timezone
         from types import SimpleNamespace
@@ -5589,10 +7854,14 @@ class TestExecutionReadiness(unittest.TestCase):
         old_config = (
             Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
             Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+            Config.EXECUTION_OFFICER_LLM_ENABLED,
+            Config.ROBINHOOD_AUTO_BUY_ENABLED,
         )
         try:
             Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
             Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
+            Config.EXECUTION_OFFICER_LLM_ENABLED = False
+            Config.ROBINHOOD_AUTO_BUY_ENABLED = True
             now = datetime.now(timezone.utc)
             dossier_path = str(self.tmp_dir / "TEST_fresh_dossier.json")
             journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
@@ -5650,7 +7919,7 @@ class TestExecutionReadiness(unittest.TestCase):
                 collect_market_overview=lambda: {"fear_greed": {"value": 50, "label": "neutral"}},
             )
             scheduler.council = SimpleNamespace(
-                analyze_stock=lambda stock, macro, market: SimpleNamespace(
+                analyze_stock=lambda stock, macro, market, **kwargs: SimpleNamespace(
                     ticker="TEST",
                     final_verdict="STARTER",
                     adjusted_score=70,
@@ -5661,23 +7930,34 @@ class TestExecutionReadiness(unittest.TestCase):
                 )
             )
 
-            asyncio.run(scheduler._run_pending_order_rechecks())
+            # Wave 2: dry_run now follows Config.ROBINHOOD_DRY_RUN_ONLY, so the
+            # guardrails enforce market hours at queue time; pin market open.
+            from unittest.mock import patch as _patch
+
+            from artha.scheduler import MarketHours as _MarketHours
+
+            with _patch.object(_MarketHours, "is_market_open", lambda self, now=None: True):
+                asyncio.run(scheduler._run_pending_order_rechecks())
             row = journal.get_pending_order_rechecks(limit=1)[0]
             orders = journal.get_execution_orders(limit=1)
             self.assertEqual(row["status"], "review_ready")
             self.assertEqual(len(orders), 1)
             self.assertEqual(orders[0]["status"], "review_ready")
+            actions = journal.get_trade_actions(limit=5)
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["action_type"], "auto_buy")
             self.assertEqual(len(scheduler.telegram.messages), 1)
             message, _, _, reply_markup = scheduler.telegram.messages[0]
             self.assertIn("ARTHA MONDAY OPEN RE-REVIEW", message)
-            self.assertIsNotNone(reply_markup)
-            self.assertIn("inline_keyboard", reply_markup)
-            self.assertIn("artha:review:", json.dumps(reply_markup))
-            self.assertNotIn("artha:place:", json.dumps(reply_markup))
+            self.assertIn("Auto-buy queued", message)
+            self.assertIn("No manual permission is required", message)
+            self.assertIsNone(reply_markup)
         finally:
             (
                 Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
                 Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+                Config.EXECUTION_OFFICER_LLM_ENABLED,
+                Config.ROBINHOOD_AUTO_BUY_ENABLED,
             ) = old_config
 
     def test_live_robinhood_adapter_is_disabled_by_default(self):
@@ -5969,10 +8249,17 @@ class TestCalibrationDiagnostics(unittest.TestCase):
 
 class TestSellSideHardening(unittest.TestCase):
     def setUp(self):
+        from artha.config import Config
+
         self._tmp_ctx = tempfile.TemporaryDirectory()
         self.tmp_dir = Path(self._tmp_ctx.name)
+        self._control_file = Config.ROBINHOOD_CONTROL_FILE
+        Config.ROBINHOOD_CONTROL_FILE = str(self.tmp_dir / "control.json")
 
     def tearDown(self):
+        from artha.config import Config
+
+        Config.ROBINHOOD_CONTROL_FILE = self._control_file
         self._tmp_ctx.cleanup()
 
     def _active_thesis(self, journal, ticker="TEST", position_type="STARTER", entry=100.0):
@@ -6007,19 +8294,78 @@ class TestSellSideHardening(unittest.TestCase):
         rows = journal.get_active_sell_signals("TEST")
         self.assertTrue(any(r["signal_type"] == "hard_stop" for r in rows))
 
+    def test_drawdown_never_suppresses_sell_council_signal(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from artha.journal import DecisionJournal
+        from artha.sell_engine import SellEngine, SellSignal
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        engine = SellEngine(journal=journal, collector=SimpleNamespace())
+        signal = SellSignal(
+            ticker="TEST",
+            signal_type="thesis_break",
+            severity="HIGH",
+            action_recommended="EXIT",
+            message="Fundamental trigger fired.",
+        )
+        with patch.object(engine.circuit_breaker, "is_portfolio_in_drawdown", return_value=True), \
+                patch.object(engine.aggregator, "suppress") as suppress, \
+                patch.object(engine.circuit_breaker, "record_exit") as record_exit:
+            routed = engine._apply_circuit_breaker([signal])
+
+        self.assertEqual(routed, [signal])
+        self.assertIn("Sell Council", signal.message)
+        suppress.assert_not_called()
+        record_exit.assert_not_called()
+
     def test_periodic_sell_review_slot_is_independent_from_daily_health(self):
         from datetime import datetime, timezone
 
         from artha.scheduler import ArthaScheduler
 
         scheduler = ArthaScheduler()
+        scheduler._last_run = {}
+        scheduler._mark_run_slot = lambda name, slot: scheduler._last_run.__setitem__(name, slot)
         # Friday June 5 2026, 4:30 PM ET: close + 30 minutes.
         now = datetime(2026, 6, 5, 20, 30, tzinfo=timezone.utc)
 
         self.assertTrue(scheduler._should_run_daily_health(now))
         self.assertTrue(scheduler._should_run_periodic_review_check(now))
 
+    def test_daily_health_digest_never_marks_position_pending_exit(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        from artha.scheduler import ArthaScheduler
+
+        scheduler = ArthaScheduler()
+        scheduler.monitor = SimpleNamespace(run_and_dedupe=lambda: [])
+        scheduler.telegram = SimpleNamespace(
+            enabled=True,
+            send_health_check=lambda message: True,
+        )
+        scheduler._pending_nonurgent_sell_signals = lambda: [
+            {
+                "signal_id": "sig-unit",
+                "ticker": "TEST",
+                "thesis_id": "thesis-unit",
+                "action_recommended": "EXIT",
+                "message": "Unit exit warning",
+            }
+        ]
+        scheduler._format_nonurgent_sell_digest = lambda rows: "Unit sell digest"
+        scheduler._mark_sell_signals_actioned = Mock()
+        scheduler.sell_engine.tracker.mark_waiting_for_sell = Mock()
+
+        asyncio.run(scheduler._run_quick_health_check())
+
+        scheduler._mark_sell_signals_actioned.assert_not_called()
+        scheduler.sell_engine.tracker.mark_waiting_for_sell.assert_not_called()
+
     def test_robinhood_sell_review_prepares_sell_side_review_only_row(self):
+        from types import SimpleNamespace
         from unittest.mock import patch
 
         from artha.config import Config
@@ -6027,9 +8373,14 @@ class TestSellSideHardening(unittest.TestCase):
         from artha.portfolio import Portfolio, Position
         from artha.scheduler import ArthaScheduler
 
-        old_config = (Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, Config.ROBINHOOD_ALLOW_AFTER_HOURS)
+        old_config = (
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+            Config.ROBINHOOD_AUTO_SELL_ENABLED,
+        )
         Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = "222233334"
         Config.ROBINHOOD_ALLOW_AFTER_HOURS = True
+        Config.ROBINHOOD_AUTO_SELL_ENABLED = True
         try:
             journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
             thesis = self._active_thesis(journal, ticker="TEST", position_type="STARTER", entry=100.0)
@@ -6051,7 +8402,28 @@ class TestSellSideHardening(unittest.TestCase):
             scheduler = ArthaScheduler()
             scheduler.sell_engine.journal = journal
             scheduler.sell_engine.tracker.journal = journal
-            with patch("artha.scheduler.PORTFOLIO_FILE", portfolio_path):
+            # Wave 2: dry_run follows Config.ROBINHOOD_DRY_RUN_ONLY, so pin the
+            # market open and keep the (unrelated) live snapshot out of the gate.
+            from artha.scheduler import MarketHours as _MarketHours
+
+            scheduler._load_robinhood_position_snapshot = lambda: {
+                "status": "MISSING",
+                "fresh": False,
+                "positions": [],
+                "warnings": ["unit test"],
+            }
+            dossier_path = self.tmp_dir / "sell_dossier.json"
+            dossier_path.write_text("{}", encoding="utf-8")
+            decision = SimpleNamespace(
+                action="EXIT",
+                session_id="sell-session-unit",
+                dossier_path=str(dossier_path),
+                sell_score=88,
+                confidence=8,
+                trigger_type="unit_test",
+            )
+            with patch("artha.scheduler.PORTFOLIO_FILE", portfolio_path), \
+                    patch.object(_MarketHours, "is_market_open", lambda self, now=None: True):
                 result = scheduler._prepare_robinhood_sell_review(
                     thesis=thesis,
                     action="EXIT",
@@ -6059,16 +8431,34 @@ class TestSellSideHardening(unittest.TestCase):
                     journal=journal,
                     trigger_type="unit_test",
                     reason="unit sell review",
+                    sell_decision=decision,
+                )
+                action_row = journal.get_trade_actions(limit=1)[0]
+                journal.update_trade_action(action_row["action_id"], {"status": "submitted"})
+                duplicate = scheduler._prepare_robinhood_sell_review(
+                    thesis=thesis,
+                    action="EXIT",
+                    current_price=94.0,
+                    journal=journal,
+                    trigger_type="unit_test",
+                    reason="duplicate unit sell review",
+                    sell_decision=decision,
                 )
             rows = journal.get_execution_orders(limit=1)
             self.assertIsNotNone(result)
+            self.assertIsNone(duplicate)
             self.assertEqual(rows[0]["side"], "sell")
             self.assertEqual(rows[0]["status"], "review_ready")
             self.assertIn('"side": "sell"', rows[0]["request_json"])
             self.assertIn('"quantity": "1.5"', rows[0]["request_json"])
             self.assertIsNone(rows[0]["submitted_at"])
+            self.assertEqual(journal.get_trade_actions(limit=1)[0]["action_type"], "auto_sell")
         finally:
-            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, Config.ROBINHOOD_ALLOW_AFTER_HOURS = old_config
+            (
+                Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+                Config.ROBINHOOD_ALLOW_AFTER_HOURS,
+                Config.ROBINHOOD_AUTO_SELL_ENABLED,
+            ) = old_config
 
     def test_broker_reconciliation_reports_missing_and_mismatched_positions(self):
         from artha.execution import reconcile_robinhood_positions
@@ -6326,7 +8716,7 @@ class TestSellSideHardening(unittest.TestCase):
                     "state": "active",
                 },
                 "accounts": [],
-                "portfolio": {"buying_power": "350"},
+                "portfolio": {"buying_power": "350", "cash": "350", "total_value": "350"},
                 "positions": [],
                 "orders": [],
             }
@@ -6409,10 +8799,758 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertEqual(result["status"], "FAIL")
         self.assertEqual(result["unmonitored_positions"], ["UNMON"])
 
+    def test_supervisor_fails_pending_exit_without_drainable_auto_sell(self):
+        from unittest.mock import patch
+
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        import artha.supervisor as supervisor
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal=journal)
+        pending = tracker.create_thesis("RTX", "TACTICAL_BUY", thesis_summary="unit pending")
+        tracker.activate_thesis(pending.thesis_id, entry_price=100.0, shares=0.1)
+        with journal._connect() as conn:
+            conn.execute("UPDATE position_theses SET status = 'pending_exit' WHERE ticker = 'RTX'")
+            conn.commit()
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="RTX",
+                    asset_type="stock",
+                    shares=0.1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                )
+            ]
+        ).save(portfolio_path)
+
+        with patch.object(supervisor, "PORTFOLIO_FILE", portfolio_path):
+            result = supervisor._check_position_monitoring(journal)
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["pending_exit_theses"], ["RTX"])
+        self.assertEqual(result["pending_exit_without_auto_sell"], ["RTX"])
+        journal.save_trade_action(
+            {
+                "action_id": "ta_sell_rtx",
+                "status": "review_ready",
+                "action_type": "auto_sell",
+                "ticker": "RTX",
+                "side": "sell",
+                "thesis_id": pending.thesis_id,
+            }
+        )
+        with patch.object(supervisor, "PORTFOLIO_FILE", portfolio_path):
+            repaired = supervisor._check_position_monitoring(journal)
+        self.assertEqual(repaired["status"], "PASS")
+
+    def test_supervisor_does_not_count_expired_auto_sell_as_drainable(self):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        import artha.supervisor as supervisor
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal=journal)
+        thesis = self._active_thesis(journal, ticker="STALE", entry=100)
+        tracker.mark_waiting_for_sell(thesis.thesis_id, reason="EXIT")
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="STALE",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                )
+            ]
+        ).save(portfolio_path)
+        journal.save_trade_action(
+            {
+                "action_id": "ta_expired_sell",
+                "status": "review_ready",
+                "action_type": "auto_sell",
+                "ticker": "STALE",
+                "side": "sell",
+                "thesis_id": thesis.thesis_id,
+                "expires_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+            }
+        )
+
+        with patch.object(supervisor, "PORTFOLIO_FILE", portfolio_path):
+            result = supervisor._check_position_monitoring(journal)
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["pending_exit_without_auto_sell"], ["STALE"])
+
+    def test_portfolio_nav_includes_cash_and_partial_sell_refreshes_mark(self):
+        from artha.portfolio import Portfolio, Position
+
+        portfolio = Portfolio(
+            positions=[
+                Position(
+                    ticker="TEST",
+                    asset_type="stock",
+                    shares=2,
+                    avg_cost=20,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    current_price=30,
+                    market_value=60,
+                )
+            ],
+            cash_available=40,
+        )
+        self.assertEqual(portfolio.invested_value(), 60)
+        self.assertEqual(portfolio.total_nav(), 100)
+        portfolio.sell_position("TEST", 0.5, 32)
+        remaining = portfolio.get_position("TEST")
+        self.assertAlmostEqual(remaining.shares, 1.5)
+        self.assertAlmostEqual(remaining.market_value, 48)
+
+    def test_tactical_buy_uses_three_day_initial_sell_cooldown(self):
+        from datetime import datetime, timezone
+
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(
+            journal,
+            ticker="TACT",
+            position_type="TACTICAL_BUY",
+            entry=25,
+        )
+        entry = datetime.fromisoformat(thesis.entry_date).astimezone(timezone.utc)
+        cooldown = datetime.fromisoformat(thesis.sell_cooldown_until).astimezone(timezone.utc)
+        self.assertLessEqual((cooldown - entry).total_seconds(), 3 * 86400 + 5)
+
+    def test_sell_signal_persists_exact_trim_fraction(self):
+        from artha.journal import DecisionJournal
+        from artha.sell_engine import SellSignal, SellSignalAggregator
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        signal = SellSignal(
+            ticker="TEST",
+            signal_type="earnings_risk",
+            severity="HIGH",
+            source="unit",
+            action_recommended="TRIM",
+            trim_pct=0.37,
+        )
+        SellSignalAggregator(journal=journal).record(signal)
+        row = journal.get_active_sell_signals("TEST")[0]
+        self.assertAlmostEqual(float(row["trim_pct"]), 0.37)
+
+    def test_sell_council_trim_fraction_reaches_execution_queue_unchanged(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from artha.journal import DecisionJournal
+        from artha.scheduler import ArthaScheduler
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="TRIM", entry=100)
+        scheduler = ArthaScheduler()
+        scheduler.sell_engine.journal = journal
+        scheduler.sell_engine.tracker.journal = journal
+        scheduler.telegram = SimpleNamespace(enabled=False)
+        decision = SimpleNamespace(
+            action="TRIM",
+            trim_pct=0.37,
+            session_id="sell-trim-unit",
+            dossier_path=str(self.tmp_dir / "sell-trim.json"),
+            sell_score=72,
+            confidence=7,
+            trigger_type="earnings_risk",
+            next_review_date=None,
+            health_score=None,
+        )
+        council = SimpleNamespace(format_sell_telegram=lambda decision, thesis: "")
+        queued = {
+            "trade_action": {
+                "action_type": "auto_sell",
+                "status": "review_ready",
+            }
+        }
+
+        with patch.object(
+            scheduler,
+            "_prepare_robinhood_sell_review",
+            return_value=queued,
+        ) as prepare:
+            result = scheduler._apply_sell_council_decision(
+                sell_council=council,
+                decision=decision,
+                thesis=thesis,
+                stock_data={"quote": {"price": 101}},
+                trigger_type="earnings_risk",
+                fallback_trim_pct=0.25,
+            )
+
+        self.assertTrue(result["queued"])
+        self.assertAlmostEqual(prepare.call_args.kwargs["trim_pct"], 0.37)
+
+    def test_projected_account_exposure_is_hard_blocked_above_ninety_percent(self):
+        from artha.execution import build_order_intent, evaluate_broker_snapshot_guardrails
+
+        intent = build_order_intent("NEW", "buy", notional=20, estimated_price=10)
+        snapshot = {
+            "status": "PASS",
+            "fresh": True,
+            "portfolio": {"buying_power": 20, "cash": 20, "total_value": 20},
+            "positions": [
+                {"symbol": "OLD", "quantity": "18", "market_price": "10"}
+            ],
+            "orders": [],
+        }
+        blocked = evaluate_broker_snapshot_guardrails(intent, snapshot, 20)
+        self.assertFalse(blocked["passed"])
+        self.assertTrue(any("90%" in reason for reason in blocked["reasons"]))
+
+        allowed_snapshot = {
+            **snapshot,
+            "portfolio": {"buying_power": 20, "cash": 20, "total_value": 20},
+            "positions": [
+                {"symbol": "OLD", "quantity": "8", "market_price": "10"}
+            ],
+        }
+        allowed = evaluate_broker_snapshot_guardrails(
+            build_order_intent("NEW", "buy", notional=10, estimated_price=10),
+            allowed_snapshot,
+            10,
+        )
+        self.assertTrue(allowed["passed"], allowed["reasons"])
+
+    def test_full_sell_fill_archives_pending_exit_and_updates_trade_action(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import record_order_fill
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal=journal)
+        thesis = self._active_thesis(journal, ticker="FULL", position_type="STARTER", entry=100)
+        tracker.mark_waiting_for_sell(thesis.thesis_id, reason="EXIT")
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="FULL",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=100,
+                )
+            ]
+        ).save(portfolio_path)
+        intent_id = "sell-intent-full"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "FULL",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 1,
+                "notional": 95,
+                "estimated_price": 95,
+                "status": "submitted",
+                "thesis_id": thesis.thesis_id,
+                "evidence_json": {
+                    "sell_council": {"confirmed": True, "action": "EXIT"}
+                },
+                "request_json": {"symbol": "FULL", "side": "sell", "quantity": "1"},
+            }
+        )
+        journal.save_trade_action(
+            {
+                "action_id": "ta_full",
+                "status": "submitted",
+                "action_type": "auto_sell",
+                "ticker": "FULL",
+                "side": "sell",
+                "thesis_id": thesis.thesis_id,
+                "order_intent_id": intent_id,
+            }
+        )
+        result = record_order_fill(
+            order_intent_id=intent_id,
+            fill_payload={
+                "id": "rh-full",
+                "symbol": "FULL",
+                "side": "sell",
+                "state": "filled",
+                "cumulative_quantity": "1",
+                "average_price": "95",
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+        self.assertEqual(result["status"], "PASS")
+        self.assertIsNone(Portfolio.load(portfolio_path).get_position("FULL"))
+        self.assertEqual(tracker.get(thesis.thesis_id).status, "archived")
+        self.assertEqual(journal.get_trade_action("ta_full")["status"], "filled")
+        journal.update_trade_action("ta_full", {"status": "submitted"})
+        repeated = record_order_fill(
+            order_intent_id=intent_id,
+            fill_payload={
+                "id": "rh-full",
+                "symbol": "FULL",
+                "side": "sell",
+                "state": "filled",
+                "cumulative_quantity": "1",
+                "average_price": "95",
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+        self.assertTrue(repeated["already_recorded"])
+        self.assertEqual(journal.get_trade_action("ta_full")["status"], "filled")
+
+    def test_partial_trim_fill_keeps_thesis_active_and_updates_remaining_value(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import record_order_fill
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal=journal)
+        thesis = self._active_thesis(journal, ticker="PART", position_type="STARTER", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="PART",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=100,
+                )
+            ]
+        ).save(portfolio_path)
+        intent_id = "sell-intent-part"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "PART",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 0.25,
+                "notional": 23.75,
+                "estimated_price": 95,
+                "status": "submitted",
+                "thesis_id": thesis.thesis_id,
+                "evidence_json": {
+                    "sell_council": {"confirmed": True, "action": "TRIM"}
+                },
+                "request_json": {"symbol": "PART", "side": "sell", "quantity": "0.25"},
+            }
+        )
+        result = record_order_fill(
+            order_intent_id=intent_id,
+            fill_payload={
+                "id": "rh-part",
+                "symbol": "PART",
+                "side": "sell",
+                "state": "filled",
+                "cumulative_quantity": "0.25",
+                "average_price": "95",
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+        self.assertEqual(result["status"], "PASS")
+        position = Portfolio.load(portfolio_path).get_position("PART")
+        self.assertAlmostEqual(position.shares, 0.75)
+        self.assertAlmostEqual(position.market_value, 71.25)
+        refreshed = tracker.get(thesis.thesis_id)
+        self.assertEqual(refreshed.status, "active")
+        self.assertIsNotNone(refreshed.sell_cooldown_until)
+
+    def test_snapshot_order_sync_does_not_double_apply_already_reflected_sell(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import sync_orders_to_artha
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="SYNCSELL", position_type="STARTER", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="SYNCSELL",
+                    asset_type="stock",
+                    shares=0.75,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=75,
+                    thesis_id=thesis.thesis_id,
+                )
+            ]
+        ).save(portfolio_path)
+        intent_id = "sell-intent-snapshot-reflected"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "SYNCSELL",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 0.25,
+                "notional": 23.75,
+                "estimated_price": 95,
+                "status": "submitted",
+                "broker_order_id": "rh-snapshot-sell",
+                "thesis_id": thesis.thesis_id,
+                "evidence_json": {
+                    "sell_council": {"confirmed": True, "action": "TRIM"}
+                },
+                "request_json": {"symbol": "SYNCSELL", "side": "sell", "quantity": "0.25"},
+            }
+        )
+
+        result = sync_orders_to_artha(
+            {
+                "positions": [
+                    {
+                        "symbol": "SYNCSELL",
+                        "quantity": "0.75",
+                        "average_buy_price": "100.00",
+                    }
+                ],
+                "orders": [
+                    {
+                        "id": "rh-snapshot-sell",
+                        "symbol": "SYNCSELL",
+                        "side": "sell",
+                        "state": "filled",
+                        "cumulative_quantity": "0.25",
+                        "average_price": "95",
+                        "last_transaction_at": "2026-06-06T14:00:00Z",
+                    }
+                ],
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["filled"][0]["fill"]["source"], "broker_snapshot_already_reflected")
+        position = Portfolio.load(portfolio_path).get_position("SYNCSELL")
+        self.assertAlmostEqual(position.shares, 0.75)
+        self.assertEqual(journal.get_execution_order_by_intent_id(intent_id)["status"], "filled")
+        self.assertEqual(journal.get_thesis(thesis.thesis_id)["status"], "active")
+
+    def test_snapshot_order_sync_repairs_filled_sell_missing_from_portfolio(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import sync_orders_to_artha
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="STALE", position_type="STARTER", entry=100)
+        ThesisTracker(journal).archive_thesis(
+            thesis.thesis_id,
+            exit_price=95,
+            exit_reason="Robinhood sell order filled.",
+        )
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="STALE",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=100,
+                    thesis_id=thesis.thesis_id,
+                )
+            ]
+        ).save(portfolio_path)
+        intent_id = "sell-intent-stale-portfolio"
+        broker_order_id = "rh-stale-sell"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "STALE",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 1,
+                "notional": 95,
+                "estimated_price": 95,
+                "status": "filled",
+                "broker_order_id": broker_order_id,
+                "thesis_id": thesis.thesis_id,
+                "filled_at": "2026-06-06T14:00:00Z",
+                "evidence_json": {
+                    "sell_council": {"confirmed": True, "action": "EXIT"}
+                },
+                "request_json": {"symbol": "STALE", "side": "sell", "quantity": "1"},
+                "response_json": {
+                    "artha_fill_applied": True,
+                    "artha_fill_broker_order_id": broker_order_id,
+                    "artha_fill_quantity": 1,
+                    "artha_fill_average_price": 95,
+                },
+            }
+        )
+        journal.save_trade_action(
+            {
+                "action_id": "ta_stale_sell",
+                "status": "filled",
+                "action_type": "auto_sell",
+                "ticker": "STALE",
+                "side": "sell",
+                "thesis_id": thesis.thesis_id,
+                "order_intent_id": intent_id,
+            }
+        )
+
+        result = sync_orders_to_artha(
+            {
+                "positions": [],
+                "orders": [],
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["filled"][0]["fill"]["already_recorded"])
+        self.assertTrue(result["filled"][0]["fill"]["portfolio_repaired"])
+        portfolio = Portfolio.load(portfolio_path)
+        self.assertIsNone(portfolio.get_position("STALE"))
+        sells = [t for t in portfolio.transactions if t.get("type") == "SELL" and t.get("ticker") == "STALE"]
+        self.assertEqual(len(sells), 1)
+        self.assertIn(broker_order_id, sells[0]["notes"])
+        self.assertEqual(journal.get_thesis(thesis.thesis_id)["status"], "archived")
+
+    def test_auto_sell_authorization_requires_sell_council_provenance(self):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+
+        from artha.config import Config
+        from artha.journal import DecisionJournal
+        from artha.robinhood_bridge import _auto_sell_authorization_gate
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="AUTH", position_type="STARTER", entry=20)
+        now = datetime.now(timezone.utc)
+        row = {
+            "action_id": "ta_auth",
+            "action_type": "auto_sell",
+            "ticker": "AUTH",
+            "side": "sell",
+            "status": "review_ready",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=30)).isoformat(),
+            "thesis_id": thesis.thesis_id,
+            "payload_json": json.dumps(
+                {
+                    "intent": {
+                        "ticker": "AUTH",
+                        "side": "sell",
+                        "quantity": 1,
+                        "estimated_price": 20,
+                        "evidence": {},
+                    }
+                }
+            ),
+        }
+        snapshot = {
+            "status": "PASS",
+            "fresh": True,
+            "portfolio": {"buying_power": 100, "cash": 100, "total_value": 100},
+            "positions": [{"symbol": "AUTH", "quantity": "1", "market_price": "20"}],
+            "orders": [],
+        }
+        old = (
+            Config.ROBINHOOD_AUTO_SELL_ENABLED,
+            Config.ROBINHOOD_REVIEW_ONLY,
+            Config.ROBINHOOD_DRY_RUN_ONLY,
+            Config.ROBINHOOD_AGENTIC_ENABLED,
+            Config.ROBINHOOD_KILL_SWITCH,
+        )
+        try:
+            Config.ROBINHOOD_AUTO_SELL_ENABLED = True
+            Config.ROBINHOOD_REVIEW_ONLY = False
+            Config.ROBINHOOD_DRY_RUN_ONLY = False
+            Config.ROBINHOOD_AGENTIC_ENABLED = True
+            Config.ROBINHOOD_KILL_SWITCH = False
+            with patch("artha.scheduler.MarketHours.is_market_open", return_value=True), \
+                    patch("artha.robinhood_bridge.load_robinhood_snapshot", return_value=snapshot):
+                gate = _auto_sell_authorization_gate(row, journal)
+            self.assertFalse(gate["passed"])
+            self.assertTrue(
+                any("Sell Council approval" in reason for reason in gate["reasons"])
+            )
+        finally:
+            (
+                Config.ROBINHOOD_AUTO_SELL_ENABLED,
+                Config.ROBINHOOD_REVIEW_ONLY,
+                Config.ROBINHOOD_DRY_RUN_ONLY,
+                Config.ROBINHOOD_AGENTIC_ENABLED,
+                Config.ROBINHOOD_KILL_SWITCH,
+            ) = old
+
+    def test_agentic_execution_officer_is_used_for_auto_sell(self):
+        from unittest.mock import patch
+
+        from artha.journal import DecisionJournal
+        from artha.openclaw_robinhood_handler import run_agentic_auto_buy_clearance_from_responses
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        journal.save_trade_action(
+            {
+                "action_id": "ta_agentic_sell",
+                "status": "review_ready",
+                "action_type": "auto_sell",
+                "ticker": "TEST",
+                "side": "sell",
+            }
+        )
+        operation = {
+            "success": True,
+            "operation": "auto_tradability_review_then_place_equity_order",
+            "action_id": "ta_agentic_sell",
+            "side": "sell",
+            "action_type": "auto_sell",
+        }
+        officer_result = {
+            "allow_place": True,
+            "status": "PASS",
+            "reason": "All sell execution checks passed.",
+            "officer_used": True,
+            "tool_trace": [],
+        }
+        with patch(
+            "artha.openclaw_robinhood_handler.build_auto_buy_operation",
+            return_value=operation,
+        ), patch(
+            "artha.openclaw_robinhood_handler.run_agentic_execution_officer",
+            return_value=officer_result,
+        ) as officer:
+            result = run_agentic_auto_buy_clearance_from_responses(
+                "ta_agentic_sell",
+                quote_response={"data": {}},
+                tradability_response={"data": {}},
+                review_response={"data": {}},
+                journal=journal,
+            )
+        self.assertTrue(result["allow_place"])
+        officer.assert_called_once()
+
+    def test_auto_sell_final_clearance_prompt_does_not_require_extra_human_confirmation(self):
+        from artha.execution_officer import build_robinhood_review_clearance_prompt
+
+        prompt = build_robinhood_review_clearance_prompt(
+            action={
+                "action_id": "ta_auto_sell",
+                "ticker": "SNX",
+                "side": "sell",
+                "action_type": "auto_sell",
+                "status": "review_clear",
+            },
+            review_response={
+                "data": {
+                    "symbol": "SNX",
+                    "side": "sell",
+                    "type": "market",
+                    "quantity": "0.014338",
+                    "order_checks": {},
+                    "market_data_disclosure": "Bid $238.47 x 200 N",
+                }
+            },
+            tradability_response={
+                "data": {
+                    "results": [
+                        {
+                            "symbol": "SNX",
+                            "state": "active",
+                            "tradeable": True,
+                            "fractional_tradability": "tradable",
+                        }
+                    ]
+                }
+            },
+            recorded_review={
+                "status": "review_clear",
+                "review_gate": {
+                    "passed": True,
+                    "status": "PASS",
+                    "reasons": [],
+                    "checks": {
+                        "order_checks_classification": {"blocking": False},
+                        "tradability": {"passed": True},
+                    },
+                },
+            },
+        )
+
+        self.assertIn("do not treat the Robinhood review tool's generic user-confirmation guide as missing data", prompt)
+        self.assertIn("No extra human confirmation is required for auto_buy/auto_sell", prompt)
+        self.assertIn("Manual actions require a Place request before final clearance", prompt)
+
+    def test_in_process_auto_sell_does_not_disable_agentic_officer(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from artha.journal import DecisionJournal
+        from artha.openclaw_robinhood_handler import handle_auto_buy_action
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        journal.save_trade_action(
+            {
+                "action_id": "ta_inprocess_sell",
+                "status": "review_ready",
+                "action_type": "auto_sell",
+                "ticker": "TEST",
+                "side": "sell",
+            }
+        )
+        operation = {
+            "success": True,
+            "operation": "auto_tradability_review_then_place_equity_order",
+            "action_id": "ta_inprocess_sell",
+            "side": "sell",
+            "action_type": "auto_sell",
+        }
+        with patch(
+            "artha.openclaw_robinhood_handler.build_auto_buy_operation",
+            return_value=operation,
+        ), patch(
+            "artha.openclaw_robinhood_handler.run_agentic_execution_officer",
+            return_value={
+                "allow_place": False,
+                "status": "BLOCKED",
+                "reason": "Unit block.",
+                "tool_trace": [],
+            },
+        ) as officer:
+            result = handle_auto_buy_action(
+                "ta_inprocess_sell",
+                SimpleNamespace(),
+                journal=journal,
+            )
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertNotIn("use_llm", officer.call_args.kwargs)
+
     def test_robinhood_pilot_account_cap_is_350(self):
         from artha.config import Config
 
         self.assertEqual(Config.ROBINHOOD_PILOT_MAX_ACCOUNT_VALUE, 350.0)
+        self.assertEqual(Config.ROBINHOOD_MAX_TRADES_PER_DAY, 5)
+        self.assertEqual(Config.SELL_MAX_EXITS_PER_DAY, 5)
+        self.assertEqual(Config.MAX_INVESTED_PCT, 0.90)
 
     def test_review_only_buy_allows_nonfatal_supervisor_warn(self):
         from datetime import datetime, timezone
@@ -6737,6 +9875,191 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertEqual(decision.action, "EXIT")
         self.assertEqual(decision.scoring_audit["cio_requested_action"], "HOLD")
         self.assertEqual(decision.scoring_audit["score_mapped_action"], "EXIT")
+
+
+class TestBrokerCapacityAndScanLifecycle(unittest.TestCase):
+    @staticmethod
+    def _snapshot(*, generated_at: str = "2026-08-05T16:00:00+00:00", buying_power: float = 156.53):
+        return {
+            "generated_at": generated_at,
+            "status": "PASS",
+            "fresh": True,
+            "portfolio": {
+                "total_value": "364.04",
+                "cash": "195.44",
+                "equity_value": "168.60",
+                "buying_power": {
+                    "buying_power": str(buying_power),
+                    "unleveraged_buying_power": str(buying_power),
+                },
+            },
+            "positions": [],
+        }
+
+    def test_capacity_separates_total_cash_from_spendable_buying_power(self):
+        from artha.broker_capacity import calculate_broker_capacity
+
+        capacity = calculate_broker_capacity(
+            self._snapshot(),
+            now=datetime(2026, 8, 5, 16, 2, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(capacity["usable"], capacity["reasons"])
+        self.assertAlmostEqual(capacity["total_account_value"], 364.04, places=2)
+        self.assertAlmostEqual(capacity["invested_value"], 168.60, places=2)
+        self.assertAlmostEqual(capacity["buying_power"], 156.53, places=2)
+        self.assertAlmostEqual(capacity["unsettled_or_unspendable_cash"], 38.91, places=2)
+        self.assertAlmostEqual(capacity["exposure_headroom"], 159.036, places=3)
+        self.assertAlmostEqual(capacity["deployable_amount"], 156.53, places=2)
+        self.assertTrue(capacity["scan_buy_enabled"])
+
+    def test_capacity_fails_closed_on_stale_snapshot(self):
+        from artha.broker_capacity import calculate_broker_capacity
+
+        capacity = calculate_broker_capacity(
+            self._snapshot(generated_at="2026-08-05T15:00:00+00:00"),
+            now=datetime(2026, 8, 5, 16, 0, tzinfo=timezone.utc),
+            max_age_minutes=10,
+        )
+
+        self.assertFalse(capacity["usable"])
+        self.assertFalse(capacity["scan_buy_enabled"])
+        self.assertTrue(any("stale" in reason.lower() for reason in capacity["reasons"]))
+
+    def test_execution_exposure_uses_total_account_value_not_buying_power_denominator(self):
+        from artha.execution import build_order_intent, evaluate_broker_snapshot_guardrails
+
+        intent = build_order_intent(
+            ticker="TEST",
+            side="buy",
+            notional=125.0,
+            quantity=1.25,
+            limit_price=100.0,
+            estimated_price=100.0,
+            decision_dossier_path="unit.json",
+            dry_run=True,
+        )
+        with patch("artha.execution.Config.ROBINHOOD_MAX_POSITION_DOLLARS", 200.0):
+            result = evaluate_broker_snapshot_guardrails(intent, self._snapshot(), 125.0)
+
+        self.assertTrue(result["passed"], result["reasons"])
+        self.assertAlmostEqual(result["checks"]["account_nav"], 364.04, places=2)
+        self.assertAlmostEqual(result["checks"]["cash_available"], 156.53, places=2)
+        self.assertLess(result["checks"]["projected_invested_pct"], 0.90)
+
+    def test_scheduled_scan_stops_before_research_when_capacity_is_closed(self):
+        from artha.scheduler import ArthaScheduler
+
+        scheduler = ArthaScheduler.__new__(ArthaScheduler)
+        scheduler._broker_buy_scan_capacity = Mock(
+            return_value={"status": "PASS", "scan_buy_enabled": False, "deployable_amount": 0.0}
+        )
+        scheduler._pause_scheduled_buy_scan_for_capacity = Mock()
+        scheduler._run_full_scan_and_council_sync()
+
+        scheduler._pause_scheduled_buy_scan_for_capacity.assert_called_once()
+
+    def test_paused_scan_auto_claims_once_when_sale_reopens_capacity(self):
+        from zoneinfo import ZoneInfo
+
+        from artha.scheduler import ArthaScheduler, MarketHours
+
+        temp_dir = Path(tempfile.mkdtemp())
+        scheduler = ArthaScheduler.__new__(ArthaScheduler)
+        scheduler.market_hours = MarketHours()
+        scheduler.ct_tz = ZoneInfo("America/Chicago")
+        scheduler.telegram = Mock(enabled=False)
+        scheduler._BUY_SCAN_CAPACITY_STATE_FILE = temp_dir / "capacity.json"
+        scheduler._save_buy_scan_capacity_state(
+            {
+                "status": "paused",
+                "scan_date_ct": "2026-08-05",
+                "catchup_pending": True,
+            }
+        )
+        scheduler._broker_buy_scan_capacity = Mock(
+            return_value={
+                "status": "PASS",
+                "scan_buy_enabled": True,
+                "deployable_amount": 25.0,
+                "total_account_value": 350.0,
+                "invested_value": 290.0,
+                "invested_pct": 290.0 / 350.0,
+                "buying_power": 25.0,
+                "exposure_headroom": 25.0,
+                "reasons": [],
+            }
+        )
+        at_noon_ct = datetime(2026, 8, 5, 12, 0, tzinfo=scheduler.ct_tz).astimezone(timezone.utc)
+
+        self.assertTrue(scheduler._should_run_buy_capacity_catchup(at_noon_ct))
+        self.assertFalse(scheduler._should_run_buy_capacity_catchup(at_noon_ct + timedelta(minutes=1)))
+        state = scheduler._load_buy_scan_capacity_state()
+        self.assertEqual(state["status"], "catchup_claimed")
+        self.assertFalse(state["catchup_pending"])
+
+
+class TestAccuracyReportHardening(unittest.TestCase):
+    def test_modern_buy_side_verdicts_are_graded(self):
+        from artha.accuracy import AccuracyTracker, Recommendation
+
+        path = Path(tempfile.mkdtemp()) / "accuracy.json"
+        tracker = AccuracyTracker(path=path)
+        rec = Recommendation(
+            ticker="DAR",
+            verdict="TACTICAL_BUY",
+            consensus="2-1",
+            entry_price="50.00",
+            recommended_action="TACTICAL_BUY small starter",
+            allocation="5%",
+            fundamental_verdict="BUY",
+            fundamental_confidence=7,
+            technical_verdict="HOLD",
+            technical_confidence=7,
+            contrarian_verdict="HOLD",
+            contrarian_confidence=7,
+        )
+        tracker.record_recommendation(rec)
+        stored = tracker._load()[0]
+        graded = tracker.grade_recommendation("DAR", stored["timestamp"], current_price=55.0)
+
+        self.assertIsNotNone(graded)
+        self.assertEqual(graded["grade"], "CORRECT")
+        stats = tracker.get_summary_stats()
+        self.assertEqual(stats["usable_graded"], 1)
+        self.assertEqual(stats["ungraded"], 0)
+        self.assertEqual(stats["strict_accuracy"], 100.0)
+
+    def test_accuracy_report_labels_weighted_and_current_unproven(self):
+        from artha.accuracy import AccuracyTracker
+
+        path = Path(tempfile.mkdtemp()) / "accuracy.json"
+        tracker = AccuracyTracker(path=path)
+        tracker._save(
+            [
+                {
+                    "ticker": "OLD",
+                    "timestamp": "2026-05-01T00:00:00+00:00",
+                    "status": "GRADED",
+                    "grade": "PARTIALLY_CORRECT",
+                    "price_change_pct": "2.0",
+                    "analyst_grades": {},
+                },
+                {
+                    "ticker": "NEW",
+                    "timestamp": "2026-06-10T00:00:00+00:00",
+                    "status": "PENDING",
+                    "grade": "",
+                    "price_change_pct": "0",
+                    "analyst_grades": {},
+                },
+            ]
+        )
+        report = tracker.format_monthly_report()
+
+        self.assertIn("No final usable grades yet", report)
+        self.assertIn("Weighted historical score", report)
+        self.assertIn("Strict correct-only score", report)
 
 
 if __name__ == "__main__":

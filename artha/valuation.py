@@ -37,11 +37,39 @@ def _first_dict(value: Any) -> dict[str, Any]:
 
 
 def _latest_and_prior_quarters(rows: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not isinstance(rows, list) or not rows:
+    """Return (latest quarter, same quarter one year earlier) for YoY math.
+
+    Preference order for the year-ago quarter:
+      1. Exact fiscal-period match: same `period` (e.g. Q2) with
+         fiscalYear/calendarYear exactly one less than the latest row.
+      2. Positional: rows[4], i.e. four quarters back (needs >= 5 rows —
+         the collector fetches 5 quarterly statements for this reason).
+      3. Legacy fallback for period-less fixtures/dossiers with exactly 4
+         rows: rows[3] (three quarters back — NOT a true YoY compare).
+    """
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
         return {}, {}
-    latest = rows[0] if isinstance(rows[0], dict) else {}
-    prior = rows[3] if len(rows) >= 4 and isinstance(rows[3], dict) else {}
-    return latest, prior
+    latest = rows[0]
+
+    period = str(latest.get("period") or "").strip().upper()
+    latest_fy = _num(latest.get("fiscalYear"), _num(latest.get("calendarYear")))
+    if period and latest_fy is not None:
+        for row in rows[1:]:
+            if not isinstance(row, dict):
+                continue
+            row_fy = _num(row.get("fiscalYear"), _num(row.get("calendarYear")))
+            if (
+                str(row.get("period") or "").strip().upper() == period
+                and row_fy is not None
+                and int(row_fy) == int(latest_fy) - 1
+            ):
+                return latest, row
+
+    if len(rows) >= 5 and isinstance(rows[4], dict):
+        return latest, rows[4]
+    if not period and len(rows) == 4 and isinstance(rows[3], dict):
+        return latest, rows[3]
+    return latest, {}
 
 
 def _score_clamp(value: float) -> int:

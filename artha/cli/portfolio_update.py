@@ -103,32 +103,27 @@ def cmd_buy(args: argparse.Namespace) -> None:
     hard_stop = round(price * (1 + stop_pct), 4)
     review_days = _REVIEW_DAYS.get(effective_type, 30)
 
-    # Check for existing position (add shares)
-    existing = next((p for p in portfolio.positions if p.ticker.upper() == ticker), None)
-    if existing:
-        old_value = float(existing.shares) * float(existing.avg_cost)
-        new_value = shares * price
-        total_shares = float(existing.shares) + shares
-        new_avg = (old_value + new_value) / total_shares if total_shares > 0 else price
-        existing.shares = total_shares
-        existing.avg_cost = round(new_avg, 4)
-        existing.current_price = price
-        existing.market_value = round(total_shares * price, 4)
-        # Update sell fields
-        _set_position_sell_fields(existing, thesis, hard_stop, review_days)
-    else:
-        from artha.portfolio import Position
-        pos = Position(
-            ticker=ticker,
-            shares=shares,
-            avg_cost=price,
-            opened_at=datetime.now(timezone.utc).isoformat(),  # FIX A: required field
-            current_price=price,
-            market_value=round(shares * price, 4),
-            asset_type="stock",
-        )
-        _set_position_sell_fields(pos, thesis, hard_stop, review_days)
-        portfolio.positions.append(pos)
+    # ACCOUNTING FIX: route through Portfolio.add_position so a BUY transaction
+    # is journaled and cash_deployed stays consistent. The old code mutated
+    # positions directly, so the transaction ledger never saw CLI buys and the
+    # monthly-budget/deployable math downstream ran on phantom numbers.
+    portfolio.add_position(
+        ticker=ticker,
+        shares=shares,
+        price=price,
+        asset_type="stock",
+        notes=f"CLI buy via portfolio_update (thesis {thesis.thesis_id[:8]})",
+    )
+    pos = portfolio.get_position(ticker)
+    if pos is None:  # defensive: add_position always creates/updates the position
+        _out(False, f"Failed to record position for {ticker}")
+        return
+    pos.current_price = price
+    pos.market_value = round(float(pos.shares) * price, 4)
+    _set_position_sell_fields(pos, thesis, hard_stop, review_days)
+
+    # Real cash accounting: buys consume cash_available (floored at $0)
+    portfolio.cash_available = max(0.0, float(portfolio.cash_available or 0.0) - shares * price)
 
     # Compute NAV and allocation BEFORE persisting (FIX: move save after all validation)
     nav = portfolio.total_nav()
@@ -233,6 +228,8 @@ def cmd_sell(args: argparse.Namespace) -> None:
     # (mirrors Portfolio.sell_position() logic; avoids a nonexistent portfolio.cash field)
     cost_basis_removed = avg_cost_at_sell * shares
     portfolio.cash_deployed = max(0.0, portfolio.cash_deployed - cost_basis_removed)
+    # Real cash accounting: sale proceeds return to cash_available
+    portfolio.cash_available = float(portfolio.cash_available or 0.0) + shares * price
     portfolio.transactions.append({
         "type": "SELL",
         "ticker": ticker,
@@ -301,7 +298,7 @@ def cmd_trim(args: argparse.Namespace) -> None:
 
 
 def cmd_activate_thesis(args: argparse.Namespace) -> None:
-    """Activate a pending thesis (called after Sarath buys on Fidelity)."""
+    """Activate a pending thesis after an operator-recorded purchase."""
     thesis_id = args.thesis_id
     entry_price = float(args.entry_price)
     shares = float(args.shares) if args.shares else None

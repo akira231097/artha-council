@@ -372,18 +372,40 @@ def build_execution_officer_prompt(
 ) -> str:
     payload = {
         "ticker": ticker,
-        "role": "Execution Officer",
-        "objective": "Choose the safest executable Robinhood order path for an already-approved Artha buy-side idea.",
+        "role": "Execution Officer - Stage A order planner",
+        "objective": (
+            "Choose the safest pre-broker order shape for an already-approved Artha buy-side idea. "
+            "A separate Stage B tool-using Execution Officer will obtain Robinhood evidence before placement."
+        ),
+        "stage_contract": {
+            "current_stage": "Stage A: order planning before an auto-buy action exists",
+            "available_now": "Council decision, provider quote, deterministic policy checks, and bounded order candidates",
+            "intentionally_deferred_to_stage_b": [
+                "fresh Robinhood quote",
+                "Robinhood tradability and fractional eligibility",
+                "buying power and open-order reconciliation",
+                "Robinhood exact-order review",
+                "regular-market-hours confirmation at placement",
+                "final agentic clearance",
+            ],
+            "handoff_rule": (
+                "BUY_READY authorizes queueing only. It never authorizes placement by itself; Stage B must "
+                "independently pass every broker and account gate before place_equity_order."
+            ),
+        },
         "source_hierarchy": [
-            "Robinhood review/tradability and current broker state are the execution source of truth.",
+            "The later Stage B Robinhood review/tradability/current broker state are the final execution source of truth.",
             "Structured provider prices/fundamentals from FMP, Massive, yfinance, Finnhub, and SEC are hard-data context.",
             "Web/news/search context can add risks but must not override structured market data or broker checks.",
         ],
         "non_negotiable_rules": [
             "Do not increase notional, quantity, or limit price beyond the deterministic candidates.",
             "Prefer marketable whole-share limit orders when one or more shares fit the starter budget and ask is within the no-chase cap.",
-            "Fractional/dollar orders must be market/regular-hours only and must pass live quote drift plus Robinhood review.",
-            "If required data is missing or conflicting, choose WAIT_FOR_SAFE_EXECUTION and list the missing data.",
+            "Fractional/dollar orders must ultimately be market/regular-hours only and pass Stage B live quote drift plus Robinhood review.",
+            "Do not request or require Stage B Robinhood evidence in order to return BUY_READY at Stage A.",
+            "If at least one supplied deterministic candidate is allowed and BUY_READY, select a BUY_READY candidate.",
+            "Choose WAIT_FOR_SAFE_EXECUTION only when every executable order candidate is already WAIT or blocked by supplied Stage A evidence.",
+            "Never state that a deterministic gate is false unless deterministic_checks explicitly contains that false value.",
             "Return JSON only.",
         ],
         "decision": _decision_packet(decision),
@@ -395,13 +417,16 @@ def build_execution_officer_prompt(
             "execution_verdict": "BUY_READY | WAIT_FOR_SAFE_EXECUTION | BLOCKED",
             "confidence": "integer 1-10",
             "rationale": "short explanation grounded in supplied evidence",
-            "requested_data": ["missing data needed before execution, if any"],
+            "requested_data": [
+                "missing Stage A planning data only; do not list evidence intentionally deferred to Stage B"
+            ],
             "risk_flags": ["execution risks"],
         },
     }
     return (
-        "You are Artha's GPT-5.5 Execution Officer. Think carefully, but output only JSON.\n"
-        "Your job is execution quality, not investment thesis generation. Choose exactly one deterministic candidate.\n\n"
+        "You are Artha's Execution Officer Stage A order planner. Think carefully, but output only JSON.\n"
+        "Your job is order-shape planning, not investment thesis generation or final broker clearance. "
+        "Choose exactly one deterministic candidate under the stage contract.\n\n"
         f"{json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2)}"
     )
 
@@ -452,9 +477,24 @@ def build_execution_officer_plan(
             parsed = _extract_json_object(officer_raw) or {}
             if parsed:
                 by_id = {candidate.candidate_id: candidate for candidate in candidates}
+                ready_candidates = {
+                    candidate.candidate_id
+                    for candidate in candidates
+                    if candidate.allowed
+                    and candidate.verdict == BUY_READY
+                    and candidate.strategy in {WHOLE_SHARE_LIMIT, FRACTIONAL_MARKET}
+                }
                 requested = str(parsed.get("selected_candidate_id") or "")
                 candidate = by_id.get(requested)
-                if candidate and (candidate.allowed or candidate.verdict != BUY_READY):
+                if candidate and ready_candidates and requested not in ready_candidates:
+                    officer_json = {
+                        **parsed,
+                        "rejected_reason": (
+                            "Stage A LLM attempted to downgrade a deterministic BUY_READY order before "
+                            "Stage B broker checks. Deterministic BUY_READY default retained."
+                        ),
+                    }
+                elif candidate and (candidate.allowed or candidate.verdict == BLOCKED):
                     selected = candidate
                     officer_json = parsed
                     officer_used = True
@@ -482,9 +522,9 @@ def build_execution_officer_plan(
         and checks.get("auto_buy_confidence_allowed")
     )
     reasons = list(selected.reasons)
-    if officer_json.get("rationale"):
+    if officer_used and officer_json.get("rationale"):
         reasons.append(f"Execution Officer: {officer_json.get('rationale')}")
-    if officer_json.get("requested_data"):
+    if officer_used and officer_json.get("requested_data"):
         reasons.append(f"Execution Officer requested data: {officer_json.get('requested_data')}")
     return ExecutionOfficerPlan(
         ticker=ticker,
@@ -530,7 +570,7 @@ def _action_tool_context(action: dict[str, Any], operation: dict[str, Any]) -> d
             "action_id": operation.get("action_id"),
             "review_mcp_args": operation.get("review_mcp_args"),
             "tradability_mcp_args": operation.get("tradability_mcp_args"),
-            "auto_buy_gate": operation.get("auto_buy_gate"),
+            "auto_trade_gate": operation.get("auto_buy_gate") or operation.get("auto_sell_gate"),
         },
     }
 
@@ -570,9 +610,9 @@ def build_agentic_execution_prompt(
     step: int,
 ) -> str:
     payload = {
-        "role": "Artha GPT-5.5 Agentic Execution Officer",
+        "role": f"Artha {Config.EXECUTION_OFFICER_MODEL} Agentic Execution Officer",
         "objective": (
-            "Use available tools to gather enough evidence to decide whether this queued auto-buy can be placed now. "
+            "Use available tools to gather enough evidence to decide whether this queued automated equity trade can be placed now. "
             "You are responsible for execution quality, not changing the investment thesis."
         ),
         "source_hierarchy": [
@@ -636,6 +676,7 @@ def build_agentic_execution_prompt(
         "current_step": step,
         "max_tool_steps": Config.EXECUTION_OFFICER_AGENTIC_MAX_TOOL_STEPS,
         "context": _action_tool_context(action, operation),
+        "mandatory_broker_evidence": _broker_evidence_summary(tool_trace),
         "tool_trace": _json_safe(tool_trace, max_chars=28000),
     }
     return (
@@ -654,6 +695,127 @@ def _latest_tool_result(tool_trace: list[dict[str, Any]], tool_name: str) -> dic
         if item.get("tool_name") == tool_name:
             return item
     return None
+
+
+def _nested_positive_number(payload: Any, keys: set[str]) -> float | None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if str(key or "").lower() in keys:
+                number = _as_float(value)
+                if number is not None and number > 0:
+                    return number
+        for value in payload.values():
+            number = _nested_positive_number(value, keys)
+            if number is not None:
+                return number
+    elif isinstance(payload, list):
+        for value in payload:
+            number = _nested_positive_number(value, keys)
+            if number is not None:
+                return number
+    return None
+
+
+def _broker_quote_available(payload: Any) -> bool:
+    """Require an actual broker price, not merely a successful empty tool call."""
+    if not isinstance(payload, dict) or payload.get("error"):
+        return False
+    return _nested_positive_number(
+        payload,
+        {
+            "ask",
+            "ask_price",
+            "best_ask",
+            "bid",
+            "bid_price",
+            "best_bid",
+            "last",
+            "last_price",
+            "last_trade_price",
+            "mark",
+            "mark_price",
+        },
+    ) is not None
+
+
+def _broker_evidence_summary(tool_trace: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compact decisive broker evidence so it cannot be hidden in a truncated trace."""
+    seen = _tool_names_seen(tool_trace)
+    required = ("robinhood_get_quote", "robinhood_get_tradability", "robinhood_review_order")
+    quote_result = ((_latest_tool_result(tool_trace, "robinhood_get_quote") or {}).get("result") or {})
+    review_result = ((_latest_tool_result(tool_trace, "robinhood_review_order") or {}).get("result") or {})
+    recorded = review_result.get("recorded_review") if isinstance(review_result, dict) else {}
+    recorded = recorded if isinstance(recorded, dict) else {}
+    review_gate = recorded.get("review_gate") if isinstance(recorded.get("review_gate"), dict) else {}
+    checks = review_gate.get("checks") if isinstance(review_gate.get("checks"), dict) else {}
+    tradability = checks.get("tradability") if isinstance(checks.get("tradability"), dict) else {}
+    drift = checks.get("review_price_drift") if isinstance(checks.get("review_price_drift"), dict) else {}
+    return {
+        "required_tools_seen": sorted(seen),
+        "required_tools_missing": [name for name in required if name not in seen],
+        "robinhood_quote_available": _broker_quote_available(quote_result),
+        "robinhood_quote": _json_safe(quote_result, max_chars=2500),
+        "review_gate_passed": review_gate.get("passed"),
+        "review_gate_status": review_gate.get("status"),
+        "review_gate_reasons": list(review_gate.get("reasons") or []),
+        "tradability_passed": tradability.get("passed"),
+        "tradability_status": tradability.get("status"),
+        "tradability_checks": tradability.get("checks") or {},
+        "review_price_drift": {
+            "passed": drift.get("passed"),
+            "status": drift.get("status"),
+            "reasons": list(drift.get("reasons") or []),
+            "checks": drift.get("checks") or {},
+        },
+        "order_checks_classification": checks.get("order_checks_classification") or {},
+    }
+
+
+def _broker_evidence_gate(tool_trace: list[dict[str, Any]]) -> dict[str, Any]:
+    """Deterministically validate the broker proof required before placement."""
+    summary = _broker_evidence_summary(tool_trace)
+    reasons: list[str] = []
+    missing = list(summary.get("required_tools_missing") or [])
+    if missing:
+        reasons.append(f"Required live tools are missing: {', '.join(missing)}.")
+    if not summary.get("robinhood_quote_available"):
+        reasons.append("Robinhood quote tool did not return an actual positive bid, ask, last, or mark price.")
+    if summary.get("review_gate_passed") is not True:
+        reasons.append("Recorded Robinhood review gate is not PASS.")
+    if summary.get("tradability_passed") is not True:
+        reasons.append("Recorded Robinhood tradability gate is not PASS.")
+    drift = summary.get("review_price_drift") if isinstance(summary.get("review_price_drift"), dict) else {}
+    if drift.get("passed") is not True:
+        reasons.append("Recorded Robinhood review-price drift gate is not PASS.")
+    classification = (
+        summary.get("order_checks_classification")
+        if isinstance(summary.get("order_checks_classification"), dict)
+        else {}
+    )
+    if classification.get("blocking") is not False:
+        reasons.append("Robinhood order-check classification is blocking, missing, or ambiguous.")
+    return {
+        "passed": not reasons,
+        "status": "PASS" if not reasons else "BLOCKED",
+        "reasons": reasons,
+        "summary": summary,
+    }
+
+
+def _denial_claims_missing_broker_proof(final: dict[str, Any]) -> bool:
+    """Detect the Stage B false-negative seen when compact broker proof was ignored."""
+    if bool(final.get("allow_place")):
+        return False
+    text = " ".join(
+        [
+            str(final.get("rationale") or ""),
+            " ".join(str(item) for item in (final.get("missing_data") or [])),
+            " ".join(str(item) for item in (final.get("risk_flags") or [])),
+        ]
+    ).lower()
+    broker_terms = ("broker", "robinhood", "quote", "tradability", "review_gate", "review gate", "order review")
+    missing_terms = ("missing", "not visible", "cannot verify", "can't verify", "unknown", "unavailable", "not supplied")
+    return any(term in text for term in broker_terms) and any(term in text for term in missing_terms)
 
 
 def _provider_market_context(ticker: str) -> dict[str, Any]:
@@ -730,13 +892,16 @@ def _validate_agentic_final_decision(
         )
     if not bool(final.get("order_unchanged")):
         reasons.append("Agentic Execution Officer did not affirm that order parameters are unchanged.")
+    broker_evidence = _broker_evidence_gate(tool_trace)
+    for reason in broker_evidence.get("reasons") or []:
+        if reason not in reasons:
+            reasons.append(str(reason))
     review_tool = _latest_tool_result(tool_trace, "robinhood_review_order")
-    recorded = ((review_tool or {}).get("result") or {}).get("recorded_review") if isinstance((review_tool or {}).get("result"), dict) else {}
+    review_result = (review_tool or {}).get("result") if isinstance((review_tool or {}).get("result"), dict) else {}
+    recorded = review_result.get("recorded_review") if isinstance(review_result, dict) else {}
     review_gate = recorded.get("review_gate") if isinstance(recorded, dict) else {}
     if not isinstance(review_gate, dict):
         review_gate = {}
-    if not review_gate.get("passed"):
-        reasons.append("Recorded Robinhood review gate is not PASS.")
     return {
         "allow_place": bool(allow_requested and not reasons),
         "status": "PASS" if allow_requested and not reasons else "BLOCKED",
@@ -744,6 +909,7 @@ def _validate_agentic_final_decision(
         "officer_json": final,
         "required_tools_seen": sorted(seen),
         "review_gate": review_gate,
+        "broker_evidence": broker_evidence,
     }
 
 
@@ -755,7 +921,7 @@ def run_agentic_execution_officer(
     journal: Any,
     use_llm: bool | None = None,
 ) -> dict[str, Any]:
-    """Run a tool-using execution session before real-money auto-buy placement."""
+    """Run a tool-using execution session before real-money automated placement."""
     action_id = str(action.get("action_id") or operation.get("action_id") or "")
     ticker = str(action.get("ticker") or (operation.get("review_mcp_args") or {}).get("symbol") or "").upper()
     llm_enabled = Config.EXECUTION_OFFICER_ENABLED and Config.EXECUTION_OFFICER_AGENTIC_ENABLED and (
@@ -830,7 +996,10 @@ def run_agentic_execution_officer(
             }
         return {"error": f"Unknown tool: {tool_name}"}
 
-    for step in range(1, max(1, Config.EXECUTION_OFFICER_AGENTIC_MAX_TOOL_STEPS) + 1):
+    max_steps = max(1, Config.EXECUTION_OFFICER_AGENTIC_MAX_TOOL_STEPS)
+    correction_steps_granted = 0
+    step = 1
+    while step <= max_steps + correction_steps_granted:
         prompt = build_agentic_execution_prompt(
             action=action,
             operation=operation,
@@ -859,10 +1028,11 @@ def run_agentic_execution_officer(
 
         if isinstance(parsed.get("final_decision"), dict) or "allow_place" in parsed:
             validation = _validate_agentic_final_decision(parsed, tool_trace)
+            final = parsed.get("final_decision") if isinstance(parsed.get("final_decision"), dict) else parsed
             if (
                 validation["status"] != "PASS"
                 and validation.get("required_tools_seen") is not None
-                and step < max(1, Config.EXECUTION_OFFICER_AGENTIC_MAX_TOOL_STEPS)
+                and step < max_steps
                 and any("required live tools" in str(reason) for reason in validation.get("reasons") or [])
             ):
                 tool_trace.append(
@@ -874,6 +1044,27 @@ def run_agentic_execution_officer(
                         "result": _json_safe(validation, max_chars=8000),
                     }
                 )
+                step += 1
+                continue
+            if (
+                validation.get("broker_evidence", {}).get("passed")
+                and _denial_claims_missing_broker_proof(final)
+                and correction_steps_granted < 1
+            ):
+                correction_steps_granted += 1
+                tool_trace.append(
+                    {
+                        "step": step,
+                        "tool_name": "invalid_final_decision",
+                        "status": "FAIL",
+                        "reason": (
+                            "Model claimed mandatory broker proof was missing even though the deterministic "
+                            "broker evidence gate is PASS; return one corrected final decision."
+                        ),
+                        "result": _json_safe(validation, max_chars=8000),
+                    }
+                )
+                step += 1
                 continue
             trace = {
                 "status": validation["status"],
@@ -891,6 +1082,23 @@ def run_agentic_execution_officer(
             }
 
         tool_name = str(parsed.get("tool_name") or "").strip()
+        missing_before = [
+            name
+            for name in ("robinhood_get_quote", "robinhood_get_tradability", "robinhood_review_order")
+            if name not in _tool_names_seen(tool_trace)
+        ]
+        remaining_including_current = max_steps - step + 1
+        reserve_needed = len(missing_before) + 1
+        if (
+            missing_before
+            and remaining_including_current <= reserve_needed
+            and tool_name != missing_before[0]
+        ):
+            requested_tool = tool_name or "invalid_model_output"
+            tool_name = missing_before[0]
+            parsed["reason"] = (
+                f"Reserved mandatory broker-proof budget: replaced {requested_tool} with {tool_name}."
+            )
         if not tool_name:
             tool_result = {"error": "Model returned neither a tool request nor final_decision."}
             tool_name = "invalid_model_output"
@@ -907,6 +1115,7 @@ def run_agentic_execution_officer(
                 "result": _json_safe(tool_result, max_chars=14000),
             }
         )
+        step += 1
 
     trace = {
         "status": "BLOCKED",
@@ -927,7 +1136,7 @@ def build_robinhood_review_clearance_prompt(
     recorded_review: dict[str, Any],
 ) -> str:
     payload = {
-        "role": "Execution Officer final auto-buy clearance",
+        "role": "Execution Officer final automated-trade clearance",
         "objective": "Decide whether the just-reviewed Robinhood order can proceed to place.",
         "non_negotiable_rules": [
             "If Artha review_gate is not PASS, allow_place must be false.",
@@ -935,15 +1144,26 @@ def build_robinhood_review_clearance_prompt(
             "A clearly classified non-blocking EQUITY_SUITABILITY broker alert can pass, but mention it in risk_flags.",
             "If broker order checks are ambiguous, unknown, or missing classification, allow_place must be false.",
             "If tradability is missing, halted, inactive, not tradeable, or fractional-ineligible for a fractional order, allow_place must be false.",
+            "For action_type auto_buy or auto_sell, do not treat the Robinhood review tool's generic user-confirmation guide as missing data; Artha's queued unattended policy plus a PASS review_gate is the execution authorization.",
+            "For manual actions, status place_requested means the user explicitly pressed Place for the reviewed order.",
             "Do not change order parameters. This is a yes/no final clearance only.",
             "Return JSON only.",
         ],
+        "authorization_context": {
+            "auto_trade_action_types": ["auto_buy", "auto_sell"],
+            "auto_trade_confirmation_rule": (
+                "No extra human confirmation is required for auto_buy/auto_sell after Artha "
+                "authorization, broker tradability, and exact-order review_gate all pass."
+            ),
+            "manual_confirmation_rule": "Manual actions require a Place request before final clearance.",
+        },
         "action": {
             "action_id": action.get("action_id"),
             "ticker": action.get("ticker"),
             "side": action.get("side"),
             "action_type": action.get("action_type"),
             "status": action.get("status"),
+            "manual_place_requested": action.get("manual_place_requested"),
             "payload_json": action.get("payload_json"),
         },
         "recorded_review": recorded_review,
@@ -958,7 +1178,7 @@ def build_robinhood_review_clearance_prompt(
         },
     }
     return (
-        "You are Artha's GPT-5.5 Execution Officer. Think carefully, but output only JSON.\n"
+        f"You are Artha's {Config.EXECUTION_OFFICER_MODEL} Execution Officer. Think carefully, but output only JSON.\n"
         "This is the final gate before a real-money Robinhood place_equity_order call.\n\n"
         f"{json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2)}"
     )

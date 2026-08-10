@@ -262,9 +262,9 @@ REGIME_TAXONOMY: Dict[str, Dict[str, Any]] = {
 
 BEGINNER_RULES = {
     # =====================================================================
-    # Sarath's actual setup as of 2026-06-02:
-    #   $350/month → FXAIX (self-managed core, auto-recurring on Fidelity)
-    #   $350/month → Artha council satellite stock-picking budget
+    # Example two-sleeve setup:
+    #   separately managed index-fund core
+    #   Artha council satellite stock-picking budget
     #
     # Artha can recommend individual-stock tactical opportunities within the
     # satellite budget, while preserving FXAIX as the separate core.
@@ -273,7 +273,7 @@ BEGINNER_RULES = {
 
     # Budget
     "monthly_budget": 350,             # Artha-managed satellite budget
-    "core_already_covered": True,      # Sarath has $350/month FXAIX separately
+    "core_already_covered": True,      # A separate core allocation already exists
     "core_fund": "FXAIX",             # For reference only — we don't manage this
 
     # Allocation within the satellite budget

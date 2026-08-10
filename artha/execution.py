@@ -18,6 +18,7 @@ from .config import Config
 from .journal import DecisionJournal
 from .portfolio import Portfolio
 from .scheduler import MarketHours
+from .stand_down import buying_paused, maybe_pause_buying_for_limit
 from .telegram import TelegramSender
 
 logger = logging.getLogger(__name__)
@@ -81,9 +82,9 @@ def _latest_supervisor_payload(journal: DecisionJournal) -> dict[str, Any]:
 def _supervisor_buy_gate(supervisor: dict[str, Any], *, review_only: bool) -> dict[str, Any]:
     """Decide whether Supervisor state should block a buy-side order review.
 
-    Live orders require a clean PASS. Review-only/dry-run preparation can proceed
-    through non-fatal WARN states so old log noise or pending-buy warnings do not
-    prevent the very review that resolves them.
+    Only execution-relevant failing checks (broker/data plumbing) block orders.
+    WARN states and failures in reporting-style checks such as recent_logs are
+    surfaced but do not prevent the very review/placement that resolves them.
     """
     severity = str(supervisor.get("severity") or "").upper()
     payload = supervisor.get("payload") or {}
@@ -93,29 +94,38 @@ def _supervisor_buy_gate(supervisor: dict[str, Any], *, review_only: bool) -> di
         for check in checks
         if str(check.get("status") or "").upper() == "FAIL"
     ]
+    relevant_failures = [
+        name for name in failing_checks
+        if name.lower() in set(Config.SUPERVISOR_EXECUTION_RELEVANT_CHECKS)
+    ]
     if severity == "PASS":
         return {"allowed": True, "reason": "Supervisor is PASS.", "failing_checks": []}
-    if failing_checks:
+    if relevant_failures:
         return {
             "allowed": False,
-            "reason": f"Supervisor has failing check(s): {', '.join(failing_checks[:5])}.",
+            "reason": f"Supervisor has execution-relevant failing check(s): {', '.join(relevant_failures[:5])}.",
             "failing_checks": failing_checks,
+            "execution_relevant_failures": relevant_failures,
         }
-    if severity == "WARN" and review_only:
+    if severity in {"WARN", "FAIL"}:
         warning_checks = [
             str(check.get("name") or "unknown")
             for check in checks
-            if str(check.get("status") or "").upper() == "WARN"
+            if str(check.get("status") or "").upper() in {"WARN", "FAIL"}
         ]
         return {
             "allowed": True,
-            "reason": "Supervisor is WARN, but this is review-only and no failing checks are present.",
+            "reason": (
+                f"Supervisor is {severity}, but no execution-relevant check "
+                "(broker/data) is failing; reporting noise does not block orders."
+            ),
             "warning_checks": warning_checks,
-            "failing_checks": [],
+            "failing_checks": failing_checks,
+            "execution_relevant_failures": [],
         }
     return {
         "allowed": False,
-        "reason": f"Supervisor is {severity or 'missing'}; live or non-review buys require PASS.",
+        "reason": f"Supervisor is {severity or 'missing'}; buys require a recorded Supervisor run.",
         "failing_checks": failing_checks,
     }
 
@@ -611,7 +621,13 @@ def load_runtime_trading_control() -> dict[str, Any]:
 
 def _snapshot_cash(snapshot: dict[str, Any]) -> float | None:
     portfolio = snapshot.get("portfolio") if isinstance(snapshot.get("portfolio"), dict) else {}
-    for key in ("buying_power", "cash_available", "cash", "withdrawable_amount"):
+    buying_power = portfolio.get("buying_power")
+    if isinstance(buying_power, dict):
+        for key in ("buying_power", "unleveraged_buying_power", "amount"):
+            value = _as_float(buying_power.get(key))
+            if value is not None:
+                return value
+    for key in ("buying_power", "cash_available", "withdrawable_amount", "cash"):
         value = _as_float(portfolio.get(key))
         if value is not None:
             return value
@@ -634,6 +650,56 @@ def _snapshot_position_notional(snapshot: dict[str, Any], ticker: str) -> float:
             or 0.0
         )
         total += max(0.0, qty * price)
+    return total
+
+
+def _snapshot_total_invested(snapshot: dict[str, Any]) -> tuple[float, int]:
+    """Return marked invested value and count of positions lacking a usable mark."""
+    total = 0.0
+    unresolved = 0
+    for row in snapshot.get("positions") or []:
+        if not isinstance(row, dict):
+            continue
+        qty = max(0.0, _broker_position_quantity(row))
+        if qty <= 0:
+            continue
+        market_value = (
+            _as_float(row.get("market_value"))
+            or _as_float(row.get("equity"))
+            or _as_float(row.get("value"))
+        )
+        if market_value is not None and market_value >= 0:
+            total += market_value
+            continue
+        price = (
+            _as_float(row.get("market_price"))
+            or _as_float(row.get("current_price"))
+            or _as_float(row.get("average_buy_price"))
+            or _as_float(row.get("average_price"))
+            or _as_float(row.get("price"))
+        )
+        if price is None or price <= 0:
+            unresolved += 1
+            continue
+        total += qty * price
+    return total, unresolved
+
+
+def _sell_drift_exempt(intent: "OrderIntent") -> bool:
+    """True for stop-driven sell intents that must not be blocked by a falling bid."""
+    if str(getattr(intent, "side", "") or "").lower() != "sell":
+        return False
+    evidence = getattr(intent, "evidence", None)
+    trigger = str((evidence or {}).get("trigger_type") or "").lower().strip() if isinstance(evidence, dict) else ""
+    return trigger in set(Config.ROBINHOOD_SELL_DRIFT_EXEMPT_TRIGGERS)
+
+
+def _snapshot_held_quantity(snapshot: dict[str, Any], ticker: str) -> float:
+    wanted = ticker.upper().strip()
+    total = 0.0
+    for row in snapshot.get("positions") or []:
+        if isinstance(row, dict) and _broker_position_symbol(row) == wanted:
+            total += max(0.0, _broker_position_quantity(row))
     return total
 
 
@@ -699,6 +765,49 @@ def evaluate_broker_snapshot_guardrails(
         if notional is not None and existing_notional + notional > Config.ROBINHOOD_MAX_POSITION_DOLLARS:
             reasons.append(
                 f"Existing {intent.ticker} exposure plus proposed buy exceeds the per-position pilot cap."
+            )
+
+        from .broker_capacity import calculate_broker_capacity
+
+        capacity = calculate_broker_capacity(snapshot, require_fresh=False)
+        invested = capacity.get("invested_value")
+        nav = capacity.get("total_account_value")
+        projected_invested_pct = (
+            (float(invested) + float(notional or 0.0)) / float(nav)
+            if capacity.get("usable") and float(nav or 0.0) > 0 and notional is not None
+            else None
+        )
+        checks["account_invested_value"] = invested
+        checks["account_nav"] = nav
+        checks["account_total_cash"] = capacity.get("total_cash")
+        checks["account_buying_power"] = capacity.get("buying_power")
+        checks["unsettled_or_unspendable_cash"] = capacity.get("unsettled_or_unspendable_cash")
+        checks["projected_invested_pct"] = projected_invested_pct
+        checks["max_invested_pct"] = Config.MAX_INVESTED_PCT
+        checks["broker_capacity"] = capacity
+        if not capacity.get("usable") or projected_invested_pct is None:
+            detail = "; ".join(str(reason) for reason in capacity.get("reasons") or [])
+            reasons.append(
+                "Cannot calculate projected account exposure for this buy."
+                + (f" {detail}" if detail else "")
+            )
+        elif projected_invested_pct > Config.MAX_INVESTED_PCT + 0.000001:
+            reasons.append(
+                f"Proposed buy would raise account exposure to {projected_invested_pct:.1%}, "
+                f"above the {Config.MAX_INVESTED_PCT:.0%} hard limit."
+            )
+
+    if intent.side == "sell":
+        held_quantity = _snapshot_held_quantity(snapshot, intent.ticker)
+        sell_quantity = _intent_resolved_quantity(intent)
+        checks["held_quantity"] = held_quantity
+        checks["sell_quantity"] = sell_quantity
+        if sell_quantity is None or sell_quantity <= 0:
+            reasons.append("Sell quantity could not be resolved from the order intent.")
+        elif sell_quantity > held_quantity + SHARE_EPSILON:
+            reasons.append(
+                f"Sell quantity {sell_quantity:.6f} exceeds the {held_quantity:.6f} "
+                f"{intent.ticker} shares held in the latest Robinhood snapshot."
             )
 
     return {
@@ -820,6 +929,7 @@ class RobinhoodExecutionGuardrails:
             if execution_price is None or execution_price <= 0:
                 execution_price = price
             max_drift = Config.ROBINHOOD_MARKET_ORDER_MAX_PRICE_DRIFT_PCT
+            stop_exempt = _sell_drift_exempt(intent)
             if execution_price is None or execution_price <= 0:
                 reasons.append("Live quote is required before resolving a fractional/dollar market order.")
             elif intent.side == "buy" and execution_price > intent.limit_price * (1 + max_drift):
@@ -828,14 +938,28 @@ class RobinhoodExecutionGuardrails:
                     f"by more than {max_drift:.2%}; re-review before buying."
                 )
             elif intent.side == "sell" and execution_price < intent.limit_price * (1 - max_drift):
-                reasons.append(
-                    f"Live bid/price ${execution_price:.2f} is below Artha reference ${intent.limit_price:.2f} "
-                    f"by more than {max_drift:.2%}; re-review before selling."
-                )
+                if stop_exempt:
+                    # Stop-driven sells exist BECAUSE the bid is falling.
+                    # Re-anchor the reference to the fresh quote and allow the
+                    # trade; refuse only below the fat-finger floor.
+                    floor = intent.limit_price * Config.ROBINHOOD_SELL_DRIFT_FLOOR_RATIO
+                    if execution_price < floor:
+                        reasons.append(
+                            f"Live bid/price ${execution_price:.2f} is below {Config.ROBINHOOD_SELL_DRIFT_FLOOR_RATIO:.0%} "
+                            f"of Artha reference ${intent.limit_price:.2f}; fat-finger guard blocked this stop sell."
+                        )
+                else:
+                    reasons.append(
+                        f"Live bid/price ${execution_price:.2f} is below Artha reference ${intent.limit_price:.2f} "
+                        f"by more than {max_drift:.2%}; re-review before selling."
+                    )
             checks["market_price_drift"] = {
                 "execution_price": execution_price,
                 "reference_price": intent.limit_price,
                 "maximum_drift_pct": max_drift,
+                "stop_exempt": stop_exempt,
+                "reanchored_reference": execution_price if stop_exempt else None,
+                "fat_finger_floor_ratio": Config.ROBINHOOD_SELL_DRIFT_FLOOR_RATIO if stop_exempt else None,
             }
 
         if notional is None or notional <= 0:
@@ -917,6 +1041,19 @@ class RobinhoodExecutionGuardrails:
             }
             if not active and not intent.thesis_id:
                 reasons.append("Sell orders need an active thesis or explicit thesis id.")
+
+        if intent.side == "buy":
+            paused, pause_reason = buying_paused()
+            if paused:
+                reasons.append(
+                    f"Buy-side paused until the next trading day: {pause_reason} Sells are unaffected."
+                )
+            buy_pause = maybe_pause_buying_for_limit(
+                reasons,
+                source=f"execution_guardrails:{intent.ticker}:{intent.order_intent_id}",
+            )
+            if buy_pause:
+                checks["buy_pause"] = buy_pause
 
         status = "PASS" if not reasons else "BLOCKED"
         return GuardrailResult(
@@ -1453,11 +1590,21 @@ def format_execution_readiness(report: dict[str, Any]) -> str:
     if errors:
         lines.extend(["", "Config problems:"])
         lines.extend(f"- {err}" for err in errors)
+    live_enabled = bool(report.get("live_trading_enabled"))
+    execution_summary = (
+        "Council-approved auto_buy and auto_sell actions can execute unattended through the "
+        "Execution Officer; no user approval click is required. Every order still requires a "
+        "fresh Robinhood snapshot, tradability check, broker review, and final clearance."
+        if live_enabled
+        else
+        "Artha can prepare audited Robinhood actions and import broker snapshots, but unattended "
+        "placement is disabled until the configured live-trading safety switches are open."
+    )
     lines.extend(
         [
             "",
             "Plain English:",
-            "Artha can prepare audited Robinhood actions, publish Telegram approval tokens, import broker snapshots, and activate sell monitoring after fills. Real placement remains blocked unless all safety switches are intentionally opened and a fresh Robinhood review passes.",
+            execution_summary,
         ]
     )
     return "\n".join(lines)

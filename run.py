@@ -16,7 +16,10 @@ Usage:
     python run.py broker-router-preview [--assume-market-open] [--no-persist]  # Real FMP/YF pre-Council router preview
     python run.py propose-order AAPL --side buy --notional 25 --limit 300 --price 300 --volume 50000000 --bid 299.9 --ask 300.1
     python run.py robinhood-action artha:review:...  # Resolve a Telegram action token into MCP args
-    python run.py robinhood-auto-buy-queue-status     # List queued auto-buy actions without mutating gate state
+    python run.py robinhood-snapshot-sync-direct     # Deterministic read-only Robinhood MCP snapshot sync
+    python run.py robinhood-auto-buy-queue-status     # List queued auto-buy/auto-sell actions without mutating gate state
+    python run.py robinhood-runner-message-v2         # Write the buy+sell runner contract to data/robinhood/runner_message_v2.txt
+    python run.py robinhood-pending-exit-confirmations  # List restart-safe pending EXIT confirmation rows
     python run.py robinhood-record-review ACTION_ID --review-file review.json --tradability-file tradability.json
     python run.py robinhood-auto-buy-agentic-clearance ACTION_ID --quote-file quote.json --review-file review.json --tradability-file tradability.json
     python run.py robinhood-final-clearance ACTION_ID
@@ -31,6 +34,7 @@ import sys
 import logging
 import tempfile
 import os
+import subprocess
 from uuid import uuid4
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1209,6 +1213,27 @@ def robinhood_snapshot_refresh_operation(args: list[str]):
     print(json.dumps(build_snapshot_refresh_operation(), indent=2, default=str))
 
 
+def robinhood_snapshot_sync_direct(args: list[str]):
+    """Run the deterministic Node MCP snapshot sync client."""
+    script = Path(__file__).resolve().parent / "scripts" / "robinhood_snapshot_sync.mjs"
+    if not script.exists():
+        print(json.dumps({"success": False, "error": f"Missing sync script: {script}"}, indent=2))
+        sys.exit(1)
+    proc = subprocess.run(
+        ["/opt/homebrew/bin/node", str(script), *args],
+        cwd=str(Path(__file__).resolve().parent),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    if proc.returncode != 0:
+        sys.exit(proc.returncode)
+
+
 def robinhood_auto_buy_runner_operation(args: list[str]):
     """Print the OpenClaw cron contract for unattended auto-buy queue drain."""
     from artha.robinhood_bridge import build_auto_buy_runner_operation
@@ -1221,6 +1246,28 @@ def robinhood_auto_buy_runner_operation(args: list[str]):
         print(result["runner_message"])
     else:
         print(json.dumps(result, indent=2, default=str))
+
+
+def robinhood_runner_message_v2(args: list[str]):
+    """Write the buy+sell runner contract to data/robinhood/runner_message_v2.txt."""
+    from artha.robinhood_bridge import write_runner_message_v2
+
+    path = None
+    if "--path" in args:
+        idx = args.index("--path")
+        if idx + 1 < len(args):
+            path = args[idx + 1]
+    result = write_runner_message_v2(path)
+    print(json.dumps(result, indent=2, default=str))
+    sys.exit(0 if result.get("success") else 1)
+
+
+def robinhood_pending_exit_confirmations(args: list[str]):
+    """List the restart-safe pending EXIT confirmation rows."""
+    from artha.journal import DecisionJournal
+
+    rows = DecisionJournal().get_pending_exit_confirmations()
+    print(json.dumps({"success": True, "count": len(rows), "rows": rows}, indent=2, default=str))
 
 
 def robinhood_queue_pending_reviews(args: list[str]):
@@ -1462,8 +1509,14 @@ def main():
         robinhood_control_center(sys.argv[2:])
     elif command == "robinhood-snapshot-refresh-operation":
         robinhood_snapshot_refresh_operation(sys.argv[2:])
+    elif command == "robinhood-snapshot-sync-direct":
+        robinhood_snapshot_sync_direct(sys.argv[2:])
     elif command == "robinhood-auto-buy-runner-operation":
         robinhood_auto_buy_runner_operation(sys.argv[2:])
+    elif command == "robinhood-runner-message-v2":
+        robinhood_runner_message_v2(sys.argv[2:])
+    elif command == "robinhood-pending-exit-confirmations":
+        robinhood_pending_exit_confirmations(sys.argv[2:])
     elif command == "robinhood-queue-pending-reviews":
         robinhood_queue_pending_reviews(sys.argv[2:])
     elif command == "robinhood-action":

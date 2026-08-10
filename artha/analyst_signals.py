@@ -6,7 +6,8 @@ Uses Finnhub for recommendations and FMP Premium for short interest and estimate
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import yfinance as yf
@@ -17,6 +18,72 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 UTC = timezone.utc
+
+# Wave-1 tunables (env-overridable; Wave 2 consolidates into config.py).
+# FMP stable `grades` endpoint returns real per-analyst rating actions
+# (upgrade/downgrade/maintain/initiate) with dates — verified live 2026-07-02.
+FMP_GRADES_ENABLED: bool = os.getenv("ARTHA_FMP_GRADES_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+GRADE_ACTION_LOOKBACK_DAYS: int = int(os.getenv("ARTHA_GRADE_ACTION_LOOKBACK_DAYS", "30"))
+
+
+def get_grade_actions(ticker: str, *, timeout: int | None = None, retries: int | None = None) -> dict:
+    """Count real analyst rating actions from the FMP `grades` endpoint.
+
+    Each row is an actual analyst action ({date, gradingCompany, previousGrade,
+    newGrade, action}) — unlike recommendation-mix deltas, these are true
+    upgrade/downgrade events.
+
+    Returns:
+        dict with keys:
+          - upgrades_30d / downgrades_30d / initiations_30d / maintains_30d:
+            action counts within GRADE_ACTION_LOOKBACK_DAYS (None if unavailable)
+          - lookback_days: the window used
+          - source: "fmp" or "unavailable"
+    """
+    result = {
+        "upgrades_30d": None,
+        "downgrades_30d": None,
+        "initiations_30d": None,
+        "maintains_30d": None,
+        "lookback_days": GRADE_ACTION_LOOKBACK_DAYS,
+        "source": "unavailable",
+        "ticker": ticker,
+    }
+    try:
+        data = _safe_get(
+            f"{Config.FMP_BASE_URL}/grades",
+            {"apikey": Config.FMP_API_KEY, "symbol": ticker, "limit": "100"},
+            "fmp",
+            timeout=timeout or 15,
+            retries=retries,
+        )
+        if not isinstance(data, list):
+            return result
+
+        cutoff = datetime.now(UTC).date() - timedelta(days=GRADE_ACTION_LOOKBACK_DAYS)
+        counts = {"upgrade": 0, "downgrade": 0, "initiate": 0, "maintain": 0}
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            try:
+                action_date = datetime.strptime(str(row.get("date") or ""), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if action_date < cutoff:
+                # Rows are newest-first; everything after this is older.
+                continue
+            action = str(row.get("action") or "").strip().lower()
+            if action in counts:
+                counts[action] += 1
+
+        result["upgrades_30d"] = counts["upgrade"]
+        result["downgrades_30d"] = counts["downgrade"]
+        result["initiations_30d"] = counts["initiate"]
+        result["maintains_30d"] = counts["maintain"]
+        result["source"] = "fmp"
+    except Exception as e:
+        logger.warning(f"[analyst_signals] Grade actions fetch failed for {ticker}: {e}")
+    return result
 
 
 def get_short_interest(ticker: str, *, timeout: int | None = None, retries: int | None = None) -> dict:
@@ -107,77 +174,105 @@ def get_short_interest(ticker: str, *, timeout: int | None = None, retries: int 
 
 
 def get_recommendation_trends(ticker: str) -> dict:
-    """Fetch analyst recommendation trends from Finnhub.
+    """Fetch analyst recommendation trends (Finnhub mix + real FMP rating actions).
 
-    Analyzes the most recent 2 months of recommendation changes to compute
-    net upgrade/downgrade momentum.
+    net_upgrades_30d/net_downgrades_30d are REAL analyst rating actions counted
+    from the FMP `grades` endpoint when available (revision_method
+    "fmp_grades_actions"). When grades are unavailable, they fall back to the
+    legacy Finnhub month-over-month coverage-mix delta (revision_method
+    "finnhub_coverage_mix_delta") — an approximation, not counted events; the
+    delta is also exposed honestly as coverage_positive_delta_30d /
+    coverage_negative_delta_30d either way.
 
     Returns:
         dict with keys:
-          - net_upgrades_30d: (upgrades - downgrades) over last 30 days
-          - net_downgrades_30d: abs(downgrades - upgrades) if negative momentum
+          - net_upgrades_30d: analyst upgrades over the last 30 days
+          - net_downgrades_30d: analyst downgrades over the last 30 days
+          - revision_method: "fmp_grades_actions" | "finnhub_coverage_mix_delta" | "unavailable"
+          - coverage_positive_delta_30d / coverage_negative_delta_30d: legacy
+            Finnhub coverage-mix delta (what net_upgrades_30d used to be)
           - recommendation_mix: dict with buy/hold/sell counts (latest period)
           - consensus: "strong_buy" | "buy" | "hold" | "sell" | "strong_sell" | "unknown"
-          - source: "finnhub" or "unavailable"
+          - source: "finnhub" | "fmp_grades" | "finnhub+fmp_grades" | "unavailable"
     """
     result = {
         "net_upgrades_30d": None,
         "net_downgrades_30d": None,
+        "revision_method": "unavailable",
+        "coverage_positive_delta_30d": None,
+        "coverage_negative_delta_30d": None,
         "recommendation_mix": {},
         "consensus": "unknown",
         "source": "unavailable",
         "ticker": ticker,
     }
 
+    finnhub_ok = False
     try:
         finnhub = FinnhubCollector()
         recs = finnhub.analyst_recommendations(ticker)
 
-        if not recs or not isinstance(recs, list):
-            return result
+        if recs and isinstance(recs, list):
+            # Sort by period descending so recs[0] is always the most recent month
+            recs = sorted(recs, key=lambda r: r.get("period", ""), reverse=True)
 
-        # Sort by period descending so recs[0] is always the most recent month
-        recs = sorted(recs, key=lambda r: r.get("period", ""), reverse=True)
+            # Most recent period
+            latest = recs[0] if recs else {}
+            result["recommendation_mix"] = {
+                "strong_buy": latest.get("strongBuy", 0),
+                "buy": latest.get("buy", 0),
+                "hold": latest.get("hold", 0),
+                "sell": latest.get("sell", 0),
+                "strong_sell": latest.get("strongSell", 0),
+            }
 
-        # Most recent period
-        latest = recs[0] if recs else {}
-        result["recommendation_mix"] = {
-            "strong_buy": latest.get("strongBuy", 0),
-            "buy": latest.get("buy", 0),
-            "hold": latest.get("hold", 0),
-            "sell": latest.get("sell", 0),
-            "strong_sell": latest.get("strongSell", 0),
-        }
+            # Consensus from latest period
+            mix = result["recommendation_mix"]
+            total = sum(mix.values())
+            if total > 0:
+                buy_pct = (mix.get("strong_buy", 0) + mix.get("buy", 0)) / total
+                sell_pct = (mix.get("sell", 0) + mix.get("strong_sell", 0)) / total
+                if buy_pct >= 0.60:
+                    result["consensus"] = "buy" if buy_pct < 0.75 else "strong_buy"
+                elif sell_pct >= 0.40:
+                    result["consensus"] = "sell" if sell_pct < 0.60 else "strong_sell"
+                else:
+                    result["consensus"] = "hold"
 
-        # Consensus from latest period
-        mix = result["recommendation_mix"]
-        total = sum(mix.values())
-        if total > 0:
-            buy_pct = (mix.get("strong_buy", 0) + mix.get("buy", 0)) / total
-            sell_pct = (mix.get("sell", 0) + mix.get("strong_sell", 0)) / total
-            if buy_pct >= 0.60:
-                result["consensus"] = "buy" if buy_pct < 0.75 else "strong_buy"
-            elif sell_pct >= 0.40:
-                result["consensus"] = "sell" if sell_pct < 0.60 else "strong_sell"
-            else:
-                result["consensus"] = "hold"
+            # Coverage-mix delta: latest period vs previous period. This is a
+            # change in analyst COUNTS by bucket, not counted upgrade events.
+            if len(recs) >= 2:
+                prev = recs[1]
+                latest_positive = latest.get("strongBuy", 0) + latest.get("buy", 0)
+                prev_positive = prev.get("strongBuy", 0) + prev.get("buy", 0)
+                latest_negative = latest.get("sell", 0) + latest.get("strongSell", 0)
+                prev_negative = prev.get("sell", 0) + prev.get("strongSell", 0)
 
-        # Net sentiment: compare latest period to previous period
-        if len(recs) >= 2:
-            prev = recs[1]
-            latest_positive = latest.get("strongBuy", 0) + latest.get("buy", 0)
-            prev_positive = prev.get("strongBuy", 0) + prev.get("buy", 0)
-            latest_negative = latest.get("sell", 0) + latest.get("strongSell", 0)
-            prev_negative = prev.get("sell", 0) + prev.get("strongSell", 0)
+                net_sentiment_change = (latest_positive - prev_positive) - (latest_negative - prev_negative)
+                result["coverage_positive_delta_30d"] = max(net_sentiment_change, 0)
+                result["coverage_negative_delta_30d"] = max(-net_sentiment_change, 0)
 
-            net_sentiment_change = (latest_positive - prev_positive) - (latest_negative - prev_negative)
-            result["net_upgrades_30d"] = max(net_sentiment_change, 0)
-            result["net_downgrades_30d"] = max(-net_sentiment_change, 0)
-
-        result["source"] = "finnhub"
+            result["source"] = "finnhub"
+            finnhub_ok = True
 
     except Exception as e:
         logger.warning(f"[analyst_signals] Recommendation trends failed for {ticker}: {e}")
+
+    # Prefer real rating actions from FMP grades for the headline fields.
+    if FMP_GRADES_ENABLED:
+        grades = get_grade_actions(ticker)
+        if grades.get("source") == "fmp":
+            result["net_upgrades_30d"] = grades.get("upgrades_30d")
+            result["net_downgrades_30d"] = grades.get("downgrades_30d")
+            result["revision_method"] = "fmp_grades_actions"
+            result["source"] = "finnhub+fmp_grades" if finnhub_ok else "fmp_grades"
+            return result
+
+    # Fallback: legacy coverage-mix delta under the historical key names.
+    if result["coverage_positive_delta_30d"] is not None:
+        result["net_upgrades_30d"] = result["coverage_positive_delta_30d"]
+        result["net_downgrades_30d"] = result["coverage_negative_delta_30d"]
+        result["revision_method"] = "finnhub_coverage_mix_delta"
 
     return result
 

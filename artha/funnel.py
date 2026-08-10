@@ -13,6 +13,7 @@ must still approve, defer, or reject each entry after deep diligence.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 from collections import Counter
@@ -30,13 +31,43 @@ UTC = timezone.utc
 # Minimum council candidates before falling back to legacy scan
 MIN_CANDIDATES_THRESHOLD = 3
 
+# ---------------------------------------------------------------------------
+# Tunables (env-var overridable; Wave 2 consolidates into config.py)
+# ---------------------------------------------------------------------------
+
+# Repeat-ticker handling: cap the freshness penalty (the old 18-point cap
+# buried persistently strong names like SNDK for months) and decay it for
+# names whose composite z-score sits in the top decile of the current scan.
+FUNNEL_REPEAT_PENALTY_CAP: float = float(os.getenv("ARTHA_FUNNEL_REPEAT_PENALTY_CAP", "12.0"))
+FUNNEL_REPEAT_STRONG_PERCENTILE: float = float(
+    os.getenv("ARTHA_FUNNEL_REPEAT_STRONG_PERCENTILE", "0.90")
+)
+FUNNEL_REPEAT_STRONG_DECAY: float = float(os.getenv("ARTHA_FUNNEL_REPEAT_STRONG_DECAY", "0.3"))
+
+# Catalyst / episodic-pivot lane feed into the enrichment pool.
+FUNNEL_CATALYST_LANE_ENABLED: bool = os.getenv(
+    "ARTHA_FUNNEL_CATALYST_LANE_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+
+# Sleeve scoring: minimum data coverage used when renormalizing sleeve scores
+# for candidates with missing enrichment data (caps extrapolation at 2x).
+FUNNEL_SLEEVE_MIN_COVERAGE: float = float(os.getenv("ARTHA_FUNNEL_SLEEVE_MIN_COVERAGE", "0.5"))
+
+# Track labels considered momentum-type for downstream track-consistent logic.
+MOMENTUM_TRACKS = {"momentum", "breakout", "catalyst_ep"}
+
 
 def _recent_scan_penalties(limit: int = 5) -> dict[str, float]:
-    """Soft penalty for tickers repeated across recent weekly scans.
+    """Soft penalty for tickers repeated across recent scans (any scan type).
 
-    Repeats are okay if justified, but the funnel should not lazily recycle the
-    same small basket forever. This is a soft freshness nudge, not a hard
-    exclusion.
+    Repeats are acceptable when justified, but the funnel should not
+    lazily recycle the same small basket forever. This is a soft freshness nudge,
+    not a hard exclusion.
+
+    Counts any scan-type session (weekly_scan, regime_scan, daily scans, ...) —
+    the old version only counted 'weekly_scan' rows and missed repeats surfaced
+    through other scan paths. Penalty capped at FUNNEL_REPEAT_PENALTY_CAP; the
+    decay for top-decile composite strength happens in _quick_score.
     """
     penalties: dict[str, float] = {}
     try:
@@ -45,7 +76,7 @@ def _recent_scan_penalties(limit: int = 5) -> dict[str, float]:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         rows = cur.execute(
-            "select tickers_analyzed from sessions where session_type='weekly_scan' order by datetime(timestamp) desc limit ?",
+            "select tickers_analyzed from sessions where session_type like '%scan%' order by datetime(timestamp) desc limit ?",
             (limit,),
         ).fetchall()
         conn.close()
@@ -56,7 +87,7 @@ def _recent_scan_penalties(limit: int = 5) -> dict[str, float]:
                 counts[ticker] = counts.get(ticker, 0) + 1
         for ticker, count in counts.items():
             if count >= 2:
-                penalties[ticker] = min(18.0, float((count - 1) * 6))
+                penalties[ticker] = min(FUNNEL_REPEAT_PENALTY_CAP, float((count - 1) * 6))
     except Exception:
         return {}
     return penalties
@@ -165,11 +196,34 @@ class PromotionFunnel:
             except Exception as mt_e:
                 logger.warning("[funnel] Momentum tracker failed (non-fatal): %s", mt_e)
 
+            # Persist deceleration flags to today's scan-signals file so the
+            # sell engine and council can read scan-time momentum state.
+            try:
+                from .rank_candidates import update_scan_signals
+                decel_updates = {
+                    str(c.get("symbol") or "").upper(): {
+                        "deceleration_flag": c.get("momentum_trend") == "decelerating",
+                    }
+                    for c in ranked
+                    if c.get("symbol") and c.get("momentum_trend") in ("accelerating", "decelerating", "stable")
+                }
+                if decel_updates:
+                    update_scan_signals(decel_updates)
+            except Exception as ss_e:
+                logger.warning("[funnel] Scan-signal deceleration update failed (non-fatal): %s", ss_e)
+
             logger.info(f"[funnel] Stage 2 complete: {len(ranked)} ranked candidates")
+
+            # --- Stage 2b: Catalyst / episodic-pivot lane ---
+            catalyst_candidates: list[dict] = []
+            if FUNNEL_CATALYST_LANE_ENABLED:
+                catalyst_candidates = self._catalyst_lane_candidates()
 
             # --- Stage 3: Enrich top ranked candidates ---
             enrich_max = max(max_council_candidates, min(Config.FUNNEL_ENRICH_MAX, len(ranked)))
-            enrichment_pool = self._build_enrichment_pool(ranked, enrich_max, universe=universe)
+            enrichment_pool = self._build_enrichment_pool(
+                ranked, enrich_max, universe=universe, catalyst_candidates=catalyst_candidates,
+            )
             logger.info("[funnel] Stage 3: Enriching top %d candidates...", len(enrichment_pool))
             enriched = self._enrich(enrichment_pool)
             logger.info(f"[funnel] Stage 3 complete: {len(enriched)} enriched")
@@ -208,15 +262,61 @@ class PromotionFunnel:
                 return self._fallback(max_council_candidates)
             return []
 
+    def _catalyst_lane_candidates(self) -> list[dict]:
+        """Fetch episodic-pivot candidates from the scanner catalyst lane.
+
+        Defensive: uses collector.get_market_movers() when the data layer
+        provides it, otherwise the scanner falls back to direct FMP endpoints.
+        Persists catalyst signals so the sell engine/council can see the track.
+        """
+        try:
+            from .scanner import get_catalyst_candidates
+            collector = None
+            try:
+                from .collector import DataCollector
+                collector = DataCollector()
+            except Exception:
+                collector = None
+            candidates = get_catalyst_candidates(collector=collector)
+        except Exception as e:
+            logger.warning("[funnel] Catalyst lane failed (non-fatal): %s", e)
+            return []
+
+        if candidates:
+            try:
+                from .rank_candidates import update_scan_signals
+                update_scan_signals({
+                    str(c.get("symbol") or "").upper(): {
+                        "track": "catalyst_ep",
+                        "gap_pct": c.get("gap_pct"),
+                        "volume_confirmed": True,
+                        "catalyst_type": c.get("catalyst_type"),
+                        "price": c.get("price"),
+                    }
+                    for c in candidates if c.get("symbol")
+                })
+            except Exception as ss_e:
+                logger.debug("[funnel] Catalyst scan-signal update failed: %s", ss_e)
+            logger.info(
+                "[funnel] Catalyst lane: %d episodic-pivot candidates (%s)",
+                len(candidates),
+                ", ".join(str(c.get("symbol")) for c in candidates[:8]),
+            )
+        return candidates
+
     def _build_enrichment_pool(
         self,
         ranked: list[dict],
         enrich_max: int,
         universe: Optional[list] = None,
+        catalyst_candidates: Optional[list[dict]] = None,
     ) -> list[dict]:
-        """Blend momentum leaders with not-overheated entry-quality candidates."""
-        if not ranked or enrich_max <= 0:
+        """Blend momentum leaders, catalyst pivots, and entry-quality candidates."""
+        if not ranked and not catalyst_candidates:
             return []
+        if enrich_max <= 0:
+            return []
+        ranked = ranked or []
 
         selected: list[dict] = []
         seen: set[str] = set()
@@ -227,9 +327,16 @@ class PromotionFunnel:
                 return False
             enriched_candidate = dict(candidate)
             enriched_candidate["enrichment_pool_reason"] = reason
+            enriched_candidate.setdefault("track", "momentum")
             selected.append(enriched_candidate)
             seen.add(symbol)
             return True
+
+        # Catalyst / episodic-pivot lane gets guaranteed slots first (they are
+        # few and time-sensitive; momentum ranking cannot surface them because
+        # it deliberately skips the most recent month).
+        for candidate in (catalyst_candidates or []):
+            add(candidate, "catalyst_ep")
 
         momentum_quota = min(len(ranked), max(12, int(enrich_max * 0.45)))
         for candidate in ranked[:momentum_quota]:
@@ -388,6 +495,7 @@ class PromotionFunnel:
                 "vol_20d": None,
                 "parallel_discovery_score": round(score, 2),
                 "enrichment_pool_reason": reason,
+                "track": "regime" if regime_score >= 8 else "momentum",
                 "data_provider_lane": "fmp_universe_parallel_discovery",
             })
             sector_counts[sector] += 1
@@ -590,9 +698,22 @@ class PromotionFunnel:
             if not c.get("passes_liquidity", True):
                 base_score -= 100
 
-            # Soft freshness penalty for stale repeat names across recent scans
+            # Soft freshness penalty for stale repeat names across recent scans.
+            # Persistent strength deserves re-evaluation: when the candidate's
+            # composite z-score is in the top decile of this scan, decay the
+            # penalty instead of burying the name (SNDK-class failure mode).
             repeat_penalty = recent_penalties.get(symbol, 0.0)
             if repeat_penalty > 0:
+                percentile = self._num(c.get("composite_percentile"))
+                if percentile >= FUNNEL_REPEAT_STRONG_PERCENTILE:
+                    decayed = round(repeat_penalty * FUNNEL_REPEAT_STRONG_DECAY, 2)
+                    logger.info(
+                        "[funnel] repeat-but-strong: %s composite percentile %.2f — "
+                        "repeat penalty decayed %.1f→%.1f for council review",
+                        symbol, percentile, repeat_penalty, decayed,
+                    )
+                    c["repeat_but_strong"] = True
+                    repeat_penalty = decayed
                 base_score -= repeat_penalty
                 c["repeat_penalty"] = repeat_penalty
 
@@ -675,11 +796,35 @@ class PromotionFunnel:
                 return PromotionFunnel._num(payload.get(key), default)
         return default
 
+    # Per-sleeve data-group weights used to renormalize sleeve scores when
+    # enrichment data is missing (provider timeout / budget exhaustion). A
+    # missing group no longer zeroes the sleeve — the achieved score from the
+    # available groups is scaled back to full range (capped by
+    # FUNNEL_SLEEVE_MIN_COVERAGE) and the gap is reported as 'data_missing'.
+    _SLEEVE_DATA_GROUPS: dict[str, dict[str, float]] = {
+        "momentum": {"price_history": 1.0},
+        "estimate_revision": {"recs": 0.6, "estimates": 0.4},
+        "quality_value": {"ratios": 0.45, "metrics": 0.35, "price_history": 0.2},
+        "contrarian_squeeze": {"short": 0.6, "recs": 0.2, "price_history": 0.2},
+        "pullback_quality": {"ratios": 0.4, "metrics": 0.3, "recs": 0.15, "price_history": 0.15},
+        "entry_quality": {
+            "ratios": 0.25, "metrics": 0.2, "recs": 0.15,
+            "estimates": 0.1, "targets": 0.15, "price_history": 0.15,
+        },
+    }
+
     def _alpha_sleeve_scores(self, candidate: dict) -> dict[str, float]:
         """Score candidate across distinct pre-council alpha sleeves.
 
         These are investigation sleeves, not buy signals. The council still
         decides whether each name is buyable, deferrable, or avoidable.
+
+        Sleeve scores carry an explicit data-missing state: when enrichment
+        data groups are unavailable (timeouts used to zero the quality/entry
+        sleeves and collapse everything to raw momentum), the score computed
+        from the available groups is renormalized by data coverage instead of
+        being zeroed, and candidate['data_missing'] / ['sleeve_data_coverage']
+        record what was absent.
         """
         ratios = candidate.get("ratios_ttm") or {}
         metrics = candidate.get("key_metrics_ttm") or {}
@@ -688,6 +833,19 @@ class PromotionFunnel:
         short_interest = candidate.get("short_interest") or {}
         targets = candidate.get("price_target_consensus") or {}
         dcf = candidate.get("dcf") or {}
+
+        groups_present = {
+            "ratios": bool(ratios),
+            "metrics": bool(metrics),
+            "recs": bool(recs),
+            "estimates": bool(estimates),
+            "short": bool(short_interest),
+            "targets": bool(targets) or bool(dcf),
+            "price_history": candidate.get("return_12m") is not None
+            or candidate.get("momentum_score") not in (None, 0, 0.0),
+        }
+        missing_groups = sorted(k for k, present in groups_present.items() if not present)
+        candidate["data_missing"] = missing_groups
 
         momentum = max(0.0, self._num(candidate.get("momentum_score")) / 40.0)
         combined = max(0.0, self._num(candidate.get("combined_score")) / 50.0)
@@ -795,7 +953,7 @@ class PromotionFunnel:
             + min(3, max(0.0, upgrades - downgrades))
         )
 
-        return {
+        raw_scores = {
             "momentum": combined + (2 if trend == "accelerating" else 0),
             "estimate_revision": (
                 (8 if consensus in {"buy", "strong_buy"} else 0)
@@ -818,6 +976,30 @@ class PromotionFunnel:
             ),
             "entry_quality": max(0.0, entry_quality),
         }
+
+        # Renormalize by data coverage: a sleeve computed from half its data
+        # groups is scaled back toward full range rather than zeroed, so
+        # provider timeouts lower ranking WEIGHT instead of collapsing all
+        # sleeves to raw momentum. Extrapolation is capped by
+        # FUNNEL_SLEEVE_MIN_COVERAGE (default 0.5 → at most 2x scaling).
+        coverage_by_sleeve: dict[str, float] = {}
+        adjusted: dict[str, float] = {}
+        for sleeve, raw in raw_scores.items():
+            weights = self._SLEEVE_DATA_GROUPS.get(sleeve, {})
+            total_w = sum(weights.values()) or 1.0
+            available_w = sum(w for g, w in weights.items() if groups_present.get(g))
+            coverage = available_w / total_w
+            coverage_by_sleeve[sleeve] = round(coverage, 2)
+            if raw > 0 and 0 < coverage < 1.0:
+                adjusted[sleeve] = raw / max(coverage, FUNNEL_SLEEVE_MIN_COVERAGE)
+            elif coverage == 0.0:
+                # No data at all for this sleeve: explicit missing state,
+                # neutral score (not a penalty, not a signal).
+                adjusted[sleeve] = 0.0
+            else:
+                adjusted[sleeve] = raw
+        candidate["sleeve_data_coverage"] = coverage_by_sleeve
+        return adjusted
 
     def _select_alpha_sleeves(self, scored: list[dict], max_candidates: int) -> list[dict]:
         """Select a diversified council slate from multiple alpha sleeves."""
@@ -947,6 +1129,7 @@ class PromotionFunnel:
                     "industry": m.get("industry", ""),
                     "momentum_score": 0.0,
                     "regime_score": 0.0,
+                    "track": "momentum",
                 })
 
             enriched = self._enrich(thin)

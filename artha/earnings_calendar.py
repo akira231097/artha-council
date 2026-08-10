@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 UTC = timezone.utc
 
+# Process-wide market-calendar cache: {"YYYY-MM-DD": rows}. The full 90-day
+# market calendar is ~4000 rows; it is only a fallback (the symbol-scoped
+# `earnings` endpoint is preferred) and never fetched more than once per day.
+_MARKET_CALENDAR_CACHE: dict[str, list] = {}
+
 
 @dataclass
 class EarningsContext:
@@ -64,6 +69,60 @@ class EarningsCalendar:
             logger.warning(f"[earnings_calendar] FMP fetch failed: {e}")
             return []
 
+    def fetch_symbol_earnings(self, ticker: str, limit: int = 12) -> Optional[list[dict]]:
+        """Fetch the symbol-scoped FMP `earnings` feed (past + next earnings rows).
+
+        This is the cheap per-ticker path: the stable `earnings-calendar`
+        endpoint ignores its symbol param and always returns the whole market,
+        so per-ticker context uses `earnings?symbol=X` instead (verified live
+        2026-07-02: includes the upcoming report date with epsEstimated).
+
+        Returns:
+            List of raw FMP earnings dicts (newest first), or None on failure.
+        """
+        try:
+            url = f"{self.base}/earnings"
+            params = {"apikey": self.key, "symbol": ticker, "limit": str(limit)}
+            data = _safe_get(url, params, "fmp")
+            if isinstance(data, list):
+                return data
+            return None
+        except Exception as e:
+            logger.warning(f"[earnings_calendar] Symbol earnings fetch failed for {ticker}: {e}")
+            return None
+
+    def fetch_market_calendar_cached(self) -> list[dict]:
+        """Market-wide 90-day earnings calendar, fetched at most once per UTC day.
+
+        Shared across all tickers in the process — fallback for when the
+        symbol-scoped `earnings` endpoint fails. FMP hard-caps the response at
+        4000 rows regardless of `limit` (verified live 2026-07-02: a single
+        90-day request silently dropped AAPL), so the window is fetched in
+        7-day chunks and concatenated.
+        """
+        now_utc = datetime.now(UTC)
+        today = now_utc.strftime("%Y-%m-%d")
+        cached = _MARKET_CALENDAR_CACHE.get(today)
+        if cached is not None:
+            return cached
+
+        rows: list[dict] = []
+        chunk_days = 7
+        for offset in range(0, 90, chunk_days):
+            from_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
+            to_str = (now_utc + timedelta(days=offset + chunk_days - 1)).strftime("%Y-%m-%d")
+            chunk = self.fetch_upcoming(from_str, to_str)
+            if len(chunk) >= 4000:
+                logger.warning(
+                    "[earnings_calendar] Calendar chunk %s..%s hit the 4000-row FMP cap; "
+                    "some symbols may be missing", from_str, to_str,
+                )
+            rows.extend(chunk)
+        if rows:
+            _MARKET_CALENDAR_CACHE.clear()
+            _MARKET_CALENDAR_CACHE[today] = rows
+        return rows
+
     def get_earnings_context(self, ticker: str, finnhub_data: list | None = None) -> EarningsContext:
         """Get earnings timing and risk context for a single ticker.
 
@@ -79,13 +138,17 @@ class EarningsCalendar:
             as_of=now_utc.isoformat(),
         )
 
-        # Fetch upcoming earnings (next 90 days)
-        from_str = now_utc.strftime("%Y-%m-%d")
-        to_str = (now_utc + timedelta(days=90)).strftime("%Y-%m-%d")
-        upcoming = self.fetch_upcoming(from_str, to_str)
+        # Preferred: symbol-scoped earnings feed (one small per-ticker call).
+        # Fallback: market-wide calendar cached once per day for the process.
+        today_midnight = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        ticker_upper = ticker.upper()
+        symbol_rows = self.fetch_symbol_earnings(ticker)
+        if symbol_rows is not None:
+            upcoming = symbol_rows
+        else:
+            upcoming = self.fetch_market_calendar_cached()
 
         # Find this ticker's next earnings — collect all matches, pick earliest date
-        ticker_upper = ticker.upper()
         matches = []
         for item in upcoming:
             if not isinstance(item, dict):
@@ -99,6 +162,8 @@ class EarningsCalendar:
                 earnings_dt = datetime.strptime(earnings_date_str, "%Y-%m-%d").replace(tzinfo=UTC)
             except ValueError:
                 continue
+            if earnings_dt < today_midnight:
+                continue  # symbol feed includes past quarters; only future counts
             matches.append((earnings_date_str, earnings_dt, item))
 
         if matches:
@@ -122,15 +187,24 @@ class EarningsCalendar:
             ctx.earnings_risk_flag = ctx.days_to_earnings <= 7
             ctx.earnings_defer_flag = ctx.days_to_earnings <= 2
 
-        # Fetch recent earnings surprises (Finnhub-style or FMP historical)
-        ctx.recent_surprises = self._fetch_recent_surprises(ticker, finnhub_data=finnhub_data)
+        # Fetch recent earnings surprises (Finnhub-style or FMP historical).
+        # Reuse the symbol-scoped rows so no second FMP call is needed.
+        ctx.recent_surprises = self._fetch_recent_surprises(
+            ticker, finnhub_data=finnhub_data, fmp_rows=symbol_rows
+        )
 
         return ctx
 
-    def _fetch_recent_surprises(self, ticker: str, finnhub_data: list | None = None) -> list[dict]:
+    def _fetch_recent_surprises(
+        self,
+        ticker: str,
+        finnhub_data: list | None = None,
+        fmp_rows: list | None = None,
+    ) -> list[dict]:
         """Fetch last 4 quarters of earnings surprises.
 
-        Uses pre-fetched Finnhub data if available, falls back to FMP.
+        Uses pre-fetched Finnhub data if available, then pre-fetched FMP
+        symbol earnings rows, and only calls FMP directly as a last resort.
         """
         # Use Finnhub data if provided (already collected by DataCollector)
         if finnhub_data:
@@ -147,24 +221,28 @@ class EarningsCalendar:
             if surprises:
                 return surprises
 
-        # Fallback to FMP
+        # Fallback to FMP (reuse pre-fetched symbol rows when available)
         try:
-            url = f"{self.base}/earnings"
-            params = {"apikey": self.key, "symbol": ticker}
-            data = _safe_get(url, params, "fmp")
+            data = fmp_rows
+            if data is None:
+                data = self.fetch_symbol_earnings(ticker)
             if isinstance(data, list):
                 surprises = []
-                for item in data[:4]:
+                for item in data:
                     if not isinstance(item, dict):
                         continue
                     actual = item.get("epsActual") or item.get("actualEarningResult") or item.get("actual")
                     estimated = item.get("epsEstimated") or item.get("estimatedEarning") or item.get("estimate")
+                    if actual is None:
+                        continue  # future/unreported quarter — not a surprise row
                     surprises.append({
                         "date": item.get("date", ""),
                         "actual": actual,
                         "estimated": estimated,
                         "surprise_pct": _compute_surprise_pct(actual, estimated),
                     })
+                    if len(surprises) >= 4:
+                        break
                 return surprises
         except Exception as e:
             logger.warning(f"[earnings_calendar] Surprises fetch failed for {ticker}: {e}")

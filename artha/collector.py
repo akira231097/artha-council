@@ -3,7 +3,10 @@
 Handles rate limiting, error handling, and data normalization
 for FMP, Massive, Finnhub, Alpha Vantage, CoinGecko, FRED, and yfinance.
 """
+import os
+import threading
 import time
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -18,22 +21,39 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Wave-1 data-layer tunables (env-overridable; Wave 2 consolidates into config)
+# ---------------------------------------------------------------------------
+
+# Quotes drive sell/monitor decisions and must not share the 15-min
+# fundamentals cache. 60s keeps intra-tick dedupe without acting on stale prices.
+QUOTE_CACHE_TTL_SECONDS: int = int(os.getenv("ARTHA_QUOTE_CACHE_TTL", "60"))
+# Market movers (gainers/losers/actives) refresh faster than fundamentals but
+# do not need quote-level freshness for funnel sourcing.
+MOVERS_CACHE_TTL_SECONDS: int = int(os.getenv("ARTHA_MOVERS_CACHE_TTL", "300"))
+# True YoY quarterly compare requires the same quarter one year back, i.e.
+# at least 5 quarterly statements (Q0 vs Q-4). limit=4 only reached Q-3.
+INCOME_STATEMENT_QUARTERS: int = max(5, int(os.getenv("ARTHA_INCOME_STATEMENT_QUARTERS", "5")))
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
-    """Simple per-source rate limiter."""
+    """Simple per-source rate limiter (thread-safe: the scan worker thread
+    and the event-loop's off-loop tasks share these limiter instances)."""
 
     def __init__(self, calls_per_minute: int):
         self.interval = 60.0 / calls_per_minute
         self.last_call: float = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
-        now = time.monotonic()
-        elapsed = now - self.last_call
-        if elapsed < self.interval:
-            time.sleep(self.interval - elapsed)
-        self.last_call = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_call
+            if elapsed < self.interval:
+                time.sleep(self.interval - elapsed)
+            self.last_call = time.monotonic()
 
 
 # Rate limiters per API
@@ -114,7 +134,31 @@ def _cache_key(url: str, params: dict, source: str) -> tuple[str, str, tuple[tup
     return (source, url, public_params)
 
 
-def _cache_ttl(source: str) -> int:
+# Endpoint-type routing for cache TTLs. Quote/price snapshot endpoints must be
+# fresh for sell/monitor decisions; fundamentals can stay on the long TTL.
+_QUOTE_PATH_SUFFIXES = ("/quote", "/quote-short", "/prev")
+_MOVER_PATH_SUFFIXES = ("/biggest-gainers", "/biggest-losers", "/most-actives")
+
+
+def _endpoint_path(url: str) -> str:
+    return str(url or "").split("?", 1)[0].rstrip("/").lower()
+
+
+def _is_quote_url(url: str) -> bool:
+    """True for real-time quote/price snapshot endpoints (FMP quote, Massive prev/snapshot)."""
+    path = _endpoint_path(url)
+    return path.endswith(_QUOTE_PATH_SUFFIXES) or "/snapshot/" in path
+
+
+def _is_movers_url(url: str) -> bool:
+    return _endpoint_path(url).endswith(_MOVER_PATH_SUFFIXES)
+
+
+def _cache_ttl(source: str, url: str = "") -> int:
+    if source in ("fmp", "massive") and _is_quote_url(url):
+        return QUOTE_CACHE_TTL_SECONDS
+    if source == "fmp" and _is_movers_url(url):
+        return MOVERS_CACHE_TTL_SECONDS
     if source == "fmp":
         return Config.FMP_CACHE_TTL_SECONDS
     if source == "massive":
@@ -134,6 +178,54 @@ def _retry_wait_seconds(resp: requests.Response | None, attempt: int) -> float:
     return min(30.0, Config.FMP_429_BACKOFF_SECONDS * (2 ** attempt))
 
 
+_AUTH_ALERT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "auth_alert_state.json"
+
+
+def _alert_auth_failure(source: str, status_code, url: str) -> None:
+    """Tell the operator immediately when a data provider rejects credentials.
+
+    An expired key or lapsed subscription is outside Artha's control — it
+    needs a human. One alert per provider per ET day, deduplicated through a
+    state file so the daemon AND every short-lived CLI/cron process share the
+    same budget; failures here must never break data collection.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        state: dict = {}
+        try:
+            state = json.loads(_AUTH_ALERT_STATE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                state = {}
+        except Exception:
+            state = {}
+        if state.get(source) == today:
+            return
+        state[source] = today
+        try:
+            _AUTH_ALERT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _AUTH_ALERT_STATE_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+            tmp.replace(_AUTH_ALERT_STATE_FILE)
+        except Exception:
+            pass
+        from .telegram import TelegramSender
+
+        TelegramSender().send_message(
+            f"🔴 Data provider auth failure — needs YOU.\n"
+            f"• **Provider:** {source}\n"
+            f"• **HTTP status:** {status_code} (key rejected / plan issue)\n"
+            f"• **Endpoint:** {_sanitize_url(url)}\n"
+            f"• **Impact:** Artha keeps running on remaining data sources, but "
+            f"{source} signals are dark until the key/subscription is fixed.\n"
+            f"👉 You: check the {source} account/API key.",
+            parse_mode=None,
+        )
+    except Exception as exc:
+        logger.warning("[%s] auth-failure alert could not be sent: %s", source, exc)
+
+
 def _safe_get(
     url: str,
     params: dict,
@@ -143,7 +235,7 @@ def _safe_get(
     use_cache: bool = True,
 ) -> Optional[dict | list]:
     """HTTP GET with rate limiting, success caching, and 429 backoff."""
-    ttl = _cache_ttl(source)
+    ttl = _cache_ttl(source, url)
     key = _cache_key(url, params, source)
     if use_cache and ttl > 0:
         cached = _response_cache.get(key)
@@ -193,6 +285,10 @@ def _safe_get(
             status_code = e.response.status_code if e.response is not None else "unknown"
             response_url = getattr(e.response, "url", url)
             logger.warning(f"[{source}] HTTP {status_code} from {_sanitize_url(response_url)}")
+            # 401/402/403 outside finnhub (whose 403 is free-tier rate limiting)
+            # means a rejected key or lapsed plan — escalate to the human once.
+            if status_code in (401, 402, 403) and source != "finnhub":
+                _alert_auth_failure(source, status_code, str(response_url))
             return None
         except ValueError:
             logger.warning(f"[{source}] Non-JSON response from {_sanitize_url(url)}")
@@ -241,7 +337,7 @@ class FMPCollector:
     - Base URL: /stable/ instead of /api/v3/
     - Symbol passed as query param (?symbol=X) not path param (/X)
     - Some endpoints renamed (stock_news -> news/stock)
-    - Sarath has FMP Premium; use quarterlies plus TTM endpoints for council data
+    - Premium FMP deployments use quarterlies plus TTM endpoints for council data
     - Insider trading and some specialized datasets still use Finnhub/other fallbacks
     """
 
@@ -409,10 +505,41 @@ class FMPCollector:
 
     def stock_news(self, ticker: str, limit: int = 10) -> Optional[list]:
         """Recent news for a stock (stable API: news/stock)."""
-        return _expect_list(
+        rows = _expect_list(
             self._get("news/stock", {"symbol": ticker, "limit": str(limit)}),
             "fmp", f"stock_news:{ticker}",
         )
+        if rows is None:
+            return None
+        symbol = str(ticker or "").upper().strip()
+        if not symbol:
+            return rows
+
+        def _article_symbols(article: dict) -> set[str]:
+            raw_values: list[Any] = []
+            for key in ("symbol", "symbols", "ticker", "tickers"):
+                value = article.get(key)
+                if value:
+                    raw_values.append(value)
+            found: set[str] = set()
+            for value in raw_values:
+                if isinstance(value, list):
+                    parts = value
+                else:
+                    parts = re.split(r"[,;\s|]+", str(value))
+                for part in parts:
+                    item = str(part or "").strip().upper()
+                    if not item:
+                        continue
+                    if ":" in item:
+                        item = item.rsplit(":", 1)[-1]
+                    found.add(item)
+            return found
+
+        return [
+            article for article in rows
+            if isinstance(article, dict) and symbol in _article_symbols(article)
+        ]
 
     def crypto_quote(self, symbol: str = "BTCUSD") -> Optional[dict]:
         """Crypto quote from FMP."""
@@ -483,6 +610,41 @@ class FMPCollector:
         if data and isinstance(data, list):
             return data[:limit]
         return None
+
+
+def _normalize_mover_row(row: Any, kind: str) -> Optional[dict]:
+    """Normalize one FMP movers row to {ticker, changePct, price, volume, ...}.
+
+    The FMP stable movers payload carries symbol/price/name/change/
+    changesPercentage/exchange but NO volume — volume is emitted as None so
+    consumers can backfill from quotes if they need it.
+    """
+    if not isinstance(row, dict):
+        return None
+    ticker = str(row.get("symbol") or "").strip().upper()
+    if not ticker:
+        return None
+
+    def _num(value: Any) -> Optional[float]:
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    volume = _num(row.get("volume"))
+    return {
+        "ticker": ticker,
+        "changePct": _num(row.get("changesPercentage") or row.get("changePct")),
+        "price": _num(row.get("price")),
+        "volume": int(volume) if volume is not None else None,
+        "change": _num(row.get("change")),
+        "name": row.get("name"),
+        "exchange": row.get("exchange"),
+        "kind": kind,
+        "source": "fmp.market_movers",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1472,7 +1634,10 @@ class DataCollector:
         # --- Fundamentals (FMP + yfinance) ---
         data["quote"] = self.fmp.quote(ticker)
         data["profile"] = self.fmp.company_profile(ticker)
-        data["income_statement"] = self.fmp.income_statement(ticker, period="quarter", limit=4)
+        # 5+ quarters so downstream YoY math can reach the same quarter one year back.
+        data["income_statement"] = self.fmp.income_statement(
+            ticker, period="quarter", limit=INCOME_STATEMENT_QUARTERS
+        )
         data["balance_sheet"] = self.fmp.balance_sheet(ticker, period="quarter", limit=4)
         data["cash_flow"] = self.fmp.cash_flow(ticker, period="quarter", limit=4)
         data["ratios"] = self.fmp.ratios(ticker, limit=4)
@@ -1561,6 +1726,22 @@ class DataCollector:
         data["benzinga_news"] = self.benzinga.company_news(ticker, limit=10)
         data["finnhub_sentiment"] = self.finnhub.news_sentiment(ticker)
         data["finnhub_news"] = self.finnhub.company_news(ticker, days_back=7)
+
+        # Per-headline LLM news sentiment (Lopez-Lira & Tang, SSRN 4412788):
+        # daily-cached Finnhub headlines classified GOOD/BAD/UNKNOWN by Gemini
+        # flash. buy_scoring._score_sentiment reads this first when available.
+        try:
+            if Config.NEWS_SENTIMENT_ENABLED:
+                from .news_sentiment import get_daily_sentiment
+
+                profile = data.get("profile") or {}
+                company_name = profile.get("companyName") if isinstance(profile, dict) else None
+                data["news_sentiment"] = get_daily_sentiment(ticker, company_name=company_name)
+            else:
+                data["news_sentiment"] = {"ticker": ticker, "available": False, "reason": "disabled"}
+        except Exception as e:
+            logger.warning(f"[{ticker}] News sentiment error: {e}")
+            data["news_sentiment"] = {"ticker": ticker, "available": False, "reason": str(e)}
 
         # --- Analyst & Insider ---
         data["analyst_recs"] = self.finnhub.analyst_recommendations(ticker)
@@ -1865,6 +2046,107 @@ class DataCollector:
         snapshot["fear_greed"] = get_equity_sentiment_index(snapshot)
         snapshot["fear_greed_crypto"] = get_crypto_fear_greed_index()
         return snapshot
+
+    def get_market_movers(self, kind: str = "all", limit: int = 25) -> list[dict]:
+        """Market-wide movers from FMP biggest-gainers/biggest-losers/most-actives.
+
+        Unlike collect_market_overview() (watchlist-only), this surfaces the
+        whole market — the discovery lane the funnel uses to catch fast movers.
+        Responses are cached for MOVERS_CACHE_TTL_SECONDS (ARTHA_MOVERS_CACHE_TTL).
+
+        Args:
+            kind: "gainers", "losers", "actives", or "all" (concatenated, deduped).
+            limit: max rows per kind.
+
+        Returns:
+            List of normalized rows: {ticker, changePct, price, volume, change,
+            name, exchange, kind, source}. volume is None (FMP movers payload
+            does not include it); backfill from quote() if needed. Empty list
+            on API failure — never None.
+        """
+        kind_normalized = str(kind or "all").strip().lower()
+        fetchers = {
+            "gainers": self.fmp.market_gainers,
+            "losers": self.fmp.market_losers,
+            "actives": self.fmp.market_actives,
+        }
+        if kind_normalized != "all" and kind_normalized not in fetchers:
+            logger.warning(f"[market_movers] Unknown kind '{kind}'; expected gainers|losers|actives|all")
+            return []
+
+        kinds = list(fetchers) if kind_normalized == "all" else [kind_normalized]
+        rows: list[dict] = []
+        seen: set[str] = set()
+        for mover_kind in kinds:
+            try:
+                raw = fetchers[mover_kind](limit=max(1, int(limit)))
+            except Exception as e:
+                logger.warning(f"[market_movers] {mover_kind} fetch failed: {e}")
+                raw = None
+            for item in raw or []:
+                normalized = _normalize_mover_row(item, mover_kind)
+                if normalized is None or normalized["ticker"] in seen:
+                    continue
+                seen.add(normalized["ticker"])
+                rows.append(normalized)
+        return rows
+
+    def get_recent_bars(self, symbol: str, n: int = 20) -> list[dict]:
+        """Return the LAST n daily bars, oldest-first (newest bar is LAST).
+
+        Built for council prompts that need explicit recent price action:
+        every bar carries an explicit ISO date so the LLM cannot misread
+        ordering. Uses FMP history with yfinance fallback.
+
+        Returns:
+            Up to n dicts {date, open, high, low, close, volume}, ascending by
+            date. Empty list if no provider has usable history.
+        """
+        return get_recent_bars(symbol, n, fmp=self.fmp, yf_collector=self.yf)
+
+
+def get_recent_bars(
+    symbol: str,
+    n: int = 20,
+    *,
+    fmp: Optional[FMPCollector] = None,
+    yf_collector: Optional["YFinanceCollector"] = None,
+) -> list[dict]:
+    """Fetch the most recent n daily bars for a symbol, newest-last.
+
+    Module-level helper so prompt builders can use it without wiring a full
+    DataCollector. Bars are sorted ascending by date (the LAST element is the
+    most recent session) and each row has an explicit "date" key.
+    """
+    ticker = str(symbol or "").strip().upper()
+    bar_count = max(1, int(n))
+    if not ticker:
+        return []
+
+    # Request ~2 calendar days per trading bar (weekends/holidays), min 90d.
+    period = f"{max(90, bar_count * 2)}d"
+    fmp = fmp or FMPCollector()
+    rows = fmp.history(ticker, period)
+    if not rows:
+        yf_collector = yf_collector or YFinanceCollector()
+        rows = yf_collector.history(ticker, "1y" if bar_count > 60 else "6mo")
+    if not isinstance(rows, list) or not rows:
+        return []
+
+    bars: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("date"):
+            continue
+        bars.append({
+            "date": str(row.get("date")),
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("volume"),
+        })
+    bars.sort(key=lambda item: item["date"])
+    return bars[-bar_count:]
 
 
 # ---------------------------------------------------------------------------

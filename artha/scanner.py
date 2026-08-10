@@ -4,6 +4,7 @@ Scans multiple sources to find candidates worth a full council analysis.
 This is the "what should we look at today?" layer.
 """
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -17,6 +18,23 @@ from .collector import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Catalyst / Episodic-Pivot lane tunables (env-var overridable; Wave 2
+# consolidates into config.py)
+# ---------------------------------------------------------------------------
+
+# Episodic pivot: gap >= +8% on an earnings/news day with elevated volume.
+CATALYST_EP_MIN_GAP_PCT: float = float(os.getenv("ARTHA_CATALYST_EP_MIN_GAP_PCT", "8.0"))
+CATALYST_EP_VOLUME_RATIO: float = float(os.getenv("ARTHA_CATALYST_EP_VOLUME_RATIO", "1.4"))
+CATALYST_EP_MAX_CANDIDATES: int = int(os.getenv("ARTHA_CATALYST_EP_MAX_CANDIDATES", "8"))
+CATALYST_EP_MIN_MARKET_CAP: float = float(os.getenv("ARTHA_CATALYST_EP_MIN_MARKET_CAP", "500000000"))
+CATALYST_EP_MIN_PRICE: float = float(os.getenv("ARTHA_CATALYST_EP_MIN_PRICE", "5.0"))
+CATALYST_NEWS_WINDOW_HOURS: int = int(os.getenv("ARTHA_CATALYST_NEWS_WINDOW_HOURS", "48"))
+CATALYST_EP_TOP_MOVER_GAP_PCT: float = float(os.getenv("ARTHA_CATALYST_EP_TOP_MOVER_GAP_PCT", "15.0"))
+CATALYST_EP_TOP_MOVER_VOLUME_RATIO: float = float(
+    os.getenv("ARTHA_CATALYST_EP_TOP_MOVER_VOLUME_RATIO", str(CATALYST_EP_VOLUME_RATIO))
+)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +257,251 @@ def _get_news_catalysts() -> list[dict]:
                 })
     
     return catalysts
+
+
+# ---------------------------------------------------------------------------
+# Catalyst / Episodic-Pivot Lane
+# ---------------------------------------------------------------------------
+
+def get_catalyst_candidates(
+    collector: Any = None,
+    max_candidates: Optional[int] = None,
+) -> list[dict]:
+    """Catalyst / episodic-pivot (EP) lane for the promotion funnel.
+
+    Finds stocks gapping >= +8% today on an earnings/news catalyst with
+    elevated volume (>= 1.4x average). It also surfaces very large,
+    high-volume top movers even when the news endpoint fails to attach a clean
+    symbol-specific article. These are Qullamaggie-style episodic pivots —
+    large single-day repricings that momentum ranking (which skips the most
+    recent month) structurally cannot surface.
+
+    Sources, in priority order:
+      1. collector.get_market_movers() when available (data-layer agent adds
+         this in Wave 2 — probed defensively via hasattr)
+      2. Direct FMP biggest-gainers/most-actives endpoints (fallback)
+
+    Candidates are tagged track='catalyst_ep' so downstream scoring (funnel,
+    opportunity scout, council) applies track-consistent logic instead of
+    anti-momentum valuation penalties.
+
+    Args:
+        collector: Optional DataCollector-like object (checked via hasattr)
+        max_candidates: Max candidates to return (default CATALYST_EP_MAX_CANDIDATES)
+
+    Returns:
+        List of candidate dicts shaped for funnel enrichment, each with
+        track='catalyst_ep', gap_pct, volume_ratio, and catalyst_type.
+    """
+    from .earnings_calendar import get_earnings_context
+
+    max_candidates = max_candidates or CATALYST_EP_MAX_CANDIDATES
+
+    # --- Gather movers (defensive: prefer collector.get_market_movers) ---
+    movers: list[dict] = []
+    if collector is not None and hasattr(collector, "get_market_movers"):
+        try:
+            raw = collector.get_market_movers()
+            if isinstance(raw, dict):
+                movers = list(raw.get("gainers") or [])
+            elif isinstance(raw, list):
+                movers = list(raw)
+        except Exception as e:
+            logger.warning(f"[catalyst_ep] collector.get_market_movers failed: {e}")
+    if not movers:
+        try:
+            fmp = FMPCollector()
+            movers = [
+                {
+                    "symbol": g.get("symbol", ""),
+                    "name": g.get("name", ""),
+                    "price": g.get("price", 0),
+                    "change_pct": g.get("changesPercentage", g.get("change_pct", 0)),
+                }
+                for g in (fmp.market_gainers(limit=30) or [])
+            ]
+        except Exception as e:
+            logger.warning(f"[catalyst_ep] FMP gainers fallback failed: {e}")
+            return []
+
+    # --- Filter to episodic-pivot gaps ---
+    def _pct(value) -> float:
+        try:
+            return float(str(value).replace("%", ""))
+        except (TypeError, ValueError):
+            return 0.0
+
+    gappers = [
+        m for m in movers
+        if _pct(m.get("change_pct") or m.get("changesPercentage")) >= CATALYST_EP_MIN_GAP_PCT
+        and _pct(m.get("price")) >= CATALYST_EP_MIN_PRICE
+    ]
+    if not gappers:
+        logger.info("[catalyst_ep] No movers gapping >= %.1f%%", CATALYST_EP_MIN_GAP_PCT)
+        return []
+
+    # Recent Finnhub market news for zero-extra-cost news confirmation
+    news_related: set[str] = set()
+    try:
+        for article in _get_news_catalysts():
+            for related in str(article.get("related") or "").split(","):
+                related = related.strip().upper()
+                if related:
+                    news_related.add(related)
+    except Exception:
+        pass
+
+    fmp = FMPCollector()
+
+    def _article_matches_symbol(article: dict, symbol: str) -> bool:
+        raw_values: list[Any] = []
+        for key in ("symbol", "symbols", "ticker", "tickers"):
+            value = article.get(key) if isinstance(article, dict) else None
+            if value:
+                raw_values.append(value)
+        for value in raw_values:
+            if isinstance(value, list):
+                parts = value
+            else:
+                parts = str(value).replace("|", ",").replace(";", ",").split(",")
+            for part in parts:
+                item = str(part or "").strip().upper()
+                if ":" in item:
+                    item = item.rsplit(":", 1)[-1]
+                if item == symbol:
+                    return True
+        return False
+
+    def _history_avg_volume(symbol: str, lookback_days: int = 30) -> float:
+        try:
+            rows = fmp.history(symbol, period="3mo") or []
+        except Exception as e:
+            logger.info("[catalyst_ep] %s avg-volume history fallback failed: %s", symbol, e)
+            return 0.0
+        volumes: list[float] = []
+        # Prefer excluding the current/latest bar when enough history exists.
+        window = rows[-(lookback_days + 1):-1] if len(rows) > lookback_days else rows[-lookback_days:]
+        for row in window:
+            volume = _pct(row.get("volume"))
+            if volume > 0:
+                volumes.append(volume)
+        if not volumes:
+            return 0.0
+        return sum(volumes) / len(volumes)
+
+    now = datetime.now(timezone.utc)
+    candidates: list[dict] = []
+    for mover in gappers[: max_candidates * 3]:
+        if len(candidates) >= max_candidates:
+            break
+        symbol = str(mover.get("symbol") or "").upper()
+        if not symbol:
+            continue
+
+        # Quote for volume confirmation + market cap gate. Elevated volume is
+        # a HARD requirement for the EP thesis. Some FMP quote rows omit
+        # avgVolume for valid liquid movers, so backfill from history before
+        # deciding the volume gate is unknowable.
+        try:
+            quote = fmp.quote(symbol) or {}
+        except Exception:
+            quote = {}
+        avg_volume = _pct(quote.get("avgVolume") or quote.get("averageVolume") or quote.get("avg_volume"))
+        avg_volume_source = "quote"
+        if avg_volume <= 0:
+            avg_volume = _history_avg_volume(symbol)
+            avg_volume_source = "history" if avg_volume > 0 else "missing"
+        day_volume = _pct(quote.get("volume") or mover.get("volume"))
+        market_cap = _pct(quote.get("marketCap") or mover.get("market_cap"))
+        if market_cap < CATALYST_EP_MIN_MARKET_CAP:
+            continue
+        if avg_volume <= 0 or day_volume <= 0:
+            continue
+        volume_ratio = day_volume / avg_volume
+        if volume_ratio < CATALYST_EP_VOLUME_RATIO:
+            continue
+
+        # Reject ETFs/funds that leak into the movers feed (e.g. leveraged
+        # single-stock ETPs) — episodic pivots are a single-company thesis.
+        try:
+            profile = fmp.company_profile(symbol) or {}
+            if profile.get("isEtf") or profile.get("isFund"):
+                continue
+        except Exception:
+            pass
+
+        # Catalyst confirmation: earnings day, or news within the window
+        catalyst_type = None
+        try:
+            ec = get_earnings_context(symbol)
+            if ec.days_to_earnings is not None and abs(int(ec.days_to_earnings)) <= 1:
+                catalyst_type = "earnings"
+        except Exception:
+            pass
+        if catalyst_type is None and symbol in news_related:
+            catalyst_type = "news"
+        if catalyst_type is None:
+            try:
+                articles = fmp.stock_news(symbol, limit=3) or []
+                for article in articles:
+                    if not _article_matches_symbol(article, symbol):
+                        continue
+                    published = str(article.get("publishedDate") or "")
+                    try:
+                        published_dt = datetime.fromisoformat(published.replace(" ", "T"))
+                        if published_dt.tzinfo is None:
+                            published_dt = published_dt.replace(tzinfo=timezone.utc)
+                        age_hours = (now - published_dt).total_seconds() / 3600
+                        if 0 <= age_hours <= CATALYST_NEWS_WINDOW_HOURS:
+                            catalyst_type = "news"
+                            break
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+        gap_pct = _pct(mover.get("change_pct") or mover.get("changesPercentage"))
+        if (
+            catalyst_type is None
+            and gap_pct >= CATALYST_EP_TOP_MOVER_GAP_PCT
+            and volume_ratio >= CATALYST_EP_TOP_MOVER_VOLUME_RATIO
+        ):
+            catalyst_type = "top_mover_volume"
+        if catalyst_type is None:
+            continue
+
+        price = _pct(quote.get("price") or mover.get("price"))
+        candidates.append({
+            "symbol": symbol,
+            "name": str(quote.get("name") or mover.get("name") or ""),
+            "sector": str(mover.get("sector") or ""),
+            "industry": str(mover.get("industry") or ""),
+            "market_cap": market_cap,
+            "avg_volume": int(avg_volume),
+            "avg_volume_source": avg_volume_source,
+            "price": round(price, 2),
+            "change_pct": round(gap_pct, 2),
+            "gap_pct": round(gap_pct, 2),
+            "volume_ratio": round(volume_ratio, 2) if volume_ratio is not None else None,
+            "catalyst_type": catalyst_type,
+            "track": "catalyst_ep",
+            "momentum_score": 0.0,
+            "regime_score": 0.0,
+            # Modest base so EP names enter enrichment without dominating
+            # z-scored momentum leaders purely on gap size.
+            "combined_score": round(min(30.0, gap_pct), 2),
+            "return_1m": None,
+            "return_3m": None,
+            "return_12m": None,
+            "vol_20d": None,
+            "data_provider_lane": "catalyst_ep_scanner",
+        })
+        logger.info(
+            "[catalyst_ep] %s gap=%.1f%% vol_ratio=%s catalyst=%s",
+            symbol, gap_pct, volume_ratio, catalyst_type,
+        )
+
+    logger.info("[catalyst_ep] %d episodic-pivot candidates surfaced", len(candidates))
+    return candidates
 
 
 # ---------------------------------------------------------------------------

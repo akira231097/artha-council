@@ -71,6 +71,7 @@ _NON_ENTRY_MONEY_WORDS = (
     "net write-off",
     "interest coverage",
 )
+_MAX_AUTOMATED_WATCH_DISTANCE_PCT = 0.45
 _NON_ENTRY_MONEY_PATTERNS = (
     re.compile(
         r"(fractional(?:\s+\w+){0,4}\s+review|market(?:\s+\w+){0,4}\s+review|starter-sized(?:\s+\w+){0,4}\s+review)"
@@ -144,9 +145,9 @@ def _plausible_relative_to_price(zone: EntryZone, current_price: float | None) -
         return True
     low = min(float(zone.low), float(zone.high))
     high = max(float(zone.low), float(zone.high))
-    if high < current_price * 0.35:
+    if high < current_price * (1.0 - _MAX_AUTOMATED_WATCH_DISTANCE_PCT):
         return False
-    if low > current_price * 2.5:
+    if low > current_price * (1.0 + _MAX_AUTOMATED_WATCH_DISTANCE_PCT):
         return False
     return True
 
@@ -260,6 +261,46 @@ def extract_entry_zone(text: str, current_price: float | None = None) -> EntryZo
     return zones[0] if zones else None
 
 
+def entry_zone_from_decision(decision: Any, current_price: float | None = None) -> EntryZone | None:
+    """Read the CIO's machine-readable entry_zone (strategy overhaul Wave 2).
+
+    The council's structured decision block carries
+    cio_decision.entry_zone = {"low": float, "high": float,
+    "valid_until_iso": "YYYY-MM-DD"} | null. This is ground truth and beats
+    regex-scraping the narrative; callers fall back to extract_entry_zones()
+    only when the block is absent.
+    """
+    cio = getattr(decision, "cio_decision", None)
+    if not isinstance(cio, dict):
+        return None
+    zone = cio.get("entry_zone")
+    if not isinstance(zone, dict):
+        return None
+    low = _as_float(zone.get("low"))
+    high = _as_float(zone.get("high"))
+    if low is None or high is None or low <= 0 or high <= 0:
+        return None
+    low, high = sorted((low, high))
+    if current_price and current_price > 0:
+        if high <= current_price * 1.02:
+            trigger_type = "pullback"
+        elif low >= current_price * 0.98:
+            trigger_type = "breakout"
+        else:
+            trigger_type = "zone"
+    else:
+        trigger_type = "zone"
+    return EntryZone(
+        low=low,
+        high=high,
+        trigger_text=(
+            f"CIO structured decision block entry_zone {low:.2f}-{high:.2f}"
+            + (f", valid until {zone.get('valid_until_iso')}" if zone.get("valid_until_iso") else "")
+        ),
+        trigger_type=trigger_type,
+    )
+
+
 def _decision_text(decision: Any) -> str:
     parts = [
         str(getattr(decision, "recommended_action", "") or ""),
@@ -272,6 +313,13 @@ def _default_expiry(decision: Any) -> str:
     value = str(getattr(decision, "entry_valid_until", "") or "").strip()
     if value:
         return value
+    cio = getattr(decision, "cio_decision", None)
+    if isinstance(cio, dict):
+        zone = cio.get("entry_zone")
+        if isinstance(zone, dict):
+            valid_until = str(zone.get("valid_until_iso") or "").strip()
+            if valid_until:
+                return valid_until
     return (_utcnow() + timedelta(days=30)).isoformat()
 
 
@@ -298,7 +346,17 @@ def record_defer_watch(
     if not ticker:
         return None
 
-    zones = extract_entry_zones(_decision_text(decision), current_price=current_price, max_zones=3)
+    structured_zone = entry_zone_from_decision(decision, current_price=current_price)
+    if structured_zone is not None:
+        zones = [structured_zone]
+        logger.info(
+            "[defer_watchlist] Using CIO structured entry_zone for %s: %.2f-%.2f",
+            ticker,
+            structured_zone.low,
+            structured_zone.high,
+        )
+    else:
+        zones = extract_entry_zones(_decision_text(decision), current_price=current_price, max_zones=3)
     if not zones:
         logger.info("[defer_watchlist] No explicit entry zone found for %s; watch not created", ticker)
         return None
