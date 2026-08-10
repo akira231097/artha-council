@@ -1,6 +1,6 @@
 {
   "name": "artha-council-runtime",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Portable runtime dependency for Artha's read-only broker snapshot client",
   "type": "module",
