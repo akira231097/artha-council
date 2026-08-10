@@ -2,7 +2,7 @@
 
 All notable public releases of Artha Council are documented here.
 
-## 1.0.0 - 2026-08-10
+## 1.1.0 - 2026-08-10
 
 - Published the current buy-side funnel, broker-aware router, opportunity scout,
   multi-role Council, CIO synthesis, and execution officer implementation.
