@@ -21,7 +21,10 @@ from .config import Config
 from .diagnostics import run_calibration_diagnosis
 from .execution import build_execution_readiness_report, normalize_robinhood_position_snapshot
 from .execution_learning import build_execution_learning_summary
-from .fill_finalizer import backfill_position_trade_episodes
+from .fill_finalizer import (
+    backfill_position_trade_episodes,
+    reconcile_closed_position_control_state,
+)
 from .journal import DecisionJournal
 from .paths import DATA_DIR
 from .portfolio import PORTFOLIO_FILE, Portfolio
@@ -747,6 +750,50 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
         }
     except Exception as exc:
         return {"name": "position_monitoring", "status": "FAIL", "message": f"Position monitoring check failed: {exc}"}
+
+
+def _check_exit_control_state(
+    journal: DecisionJournal,
+    *,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+) -> dict[str, Any]:
+    """Ensure closed theses cannot remain visible as active exit work."""
+    held_tickers = {
+        str(position.ticker or "").upper()
+        for position in Portfolio.load(Path(portfolio_path)).positions
+    }
+    stale_signals: list[str] = []
+    for signal in journal.get_active_sell_signals():
+        thesis_id = str(signal.get("thesis_id") or "")
+        ticker = str(signal.get("ticker") or "").upper()
+        thesis = journal.get_thesis(thesis_id) if thesis_id else None
+        status = str((thesis or {}).get("status") or "").lower()
+        if status in {"archived", "expired"} or (thesis is None and ticker not in held_tickers):
+            stale_signals.append(str(signal.get("signal_id") or signal.get("ticker") or "unknown"))
+    stale_confirmations: list[str] = []
+    for row in journal.get_pending_exit_confirmations():
+        thesis_id = str(row.get("thesis_id") or "")
+        thesis = journal.get_thesis(thesis_id) if thesis_id else None
+        if not thesis or str(thesis.get("status") or "").lower() not in {"active", "pending_exit"}:
+            stale_confirmations.append(f"{row.get('ticker')}:{thesis_id}")
+    if stale_signals or stale_confirmations:
+        return {
+            "name": "exit_control_state",
+            "status": "FAIL",
+            "message": (
+                f"Closed theses retain {len(stale_signals)} active sell signal(s) and "
+                f"{len(stale_confirmations)} pending exit confirmation(s)."
+            ),
+            "stale_sell_signals": stale_signals,
+            "stale_exit_confirmations": stale_confirmations,
+        }
+    return {
+        "name": "exit_control_state",
+        "status": "PASS",
+        "message": "No closed thesis remains in active sell or exit-confirmation state.",
+        "stale_sell_signals": [],
+        "stale_exit_confirmations": [],
+    }
 
 
 def _check_broker_reconciliation_snapshot() -> dict[str, Any]:
@@ -1496,6 +1543,15 @@ def run_supervisor_check(
     operations.append(op)
 
     op = _timed_operation(
+        "closed_position_control_state_reconciliation",
+        lambda: reconcile_closed_position_control_state(
+            journal,
+            portfolio_path=PORTFOLIO_FILE,
+        ),
+    )
+    operations.append(op)
+
+    op = _timed_operation(
         "trade_action_reconciliation",
         lambda: {
             "reconciled": journal.reconcile_trade_actions_from_execution_orders(),
@@ -1550,6 +1606,7 @@ def run_supervisor_check(
         _timed_check("recent_sessions", lambda: _check_recent_sessions(journal)),
         _timed_check("defer_watchlist", lambda: _check_defer_watches(journal)),
         _timed_check("position_monitoring", lambda: _check_position_monitoring(journal)),
+        _timed_check("exit_control_state", lambda: _check_exit_control_state(journal)),
         _timed_check("broker_fill_accounting", lambda: _check_broker_fill_accounting(journal)),
         _timed_check("position_classification", lambda: _check_position_classification()),
         _timed_check("execution_learning", lambda: _check_execution_learning(journal)),

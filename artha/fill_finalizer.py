@@ -723,6 +723,49 @@ def backfill_position_trade_episodes(
     }
 
 
+def reconcile_closed_position_control_state(
+    journal: DecisionJournal,
+    *,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+) -> dict[str, Any]:
+    """Retire stale sell signals and confirmations for closed theses.
+
+    Older broker-fill paths archived positions without closing these control
+    records. They cannot safely execute without a holding, but leaving them
+    active makes operator state misleading and can pollute retry bookkeeping.
+    Active and pending-exit theses are deliberately preserved.
+    """
+    portfolio = Portfolio.load(Path(portfolio_path))
+    held_tickers = {str(position.ticker or "").upper() for position in portfolio.positions}
+    resolved_signal_ids: list[str] = []
+    for signal in journal.get_active_sell_signals():
+        thesis_id = str(signal.get("thesis_id") or "")
+        ticker = str(signal.get("ticker") or "").upper()
+        thesis = journal.get_thesis(thesis_id) if thesis_id else None
+        status = str((thesis or {}).get("status") or "").lower()
+        if status in {"archived", "expired"} or (thesis is None and ticker not in held_tickers):
+            signal_id = str(signal.get("signal_id") or "")
+            if signal_id:
+                resolved_signal_ids.append(signal_id)
+    resolved_signals = journal.resolve_sell_signals(signal_ids=resolved_signal_ids)
+
+    deleted_confirmations: list[str] = []
+    for row in journal.get_pending_exit_confirmations():
+        thesis_id = str(row.get("thesis_id") or "")
+        thesis = journal.get_thesis(thesis_id) if thesis_id else None
+        status = str((thesis or {}).get("status") or "").lower()
+        if status not in {"active", "pending_exit"}:
+            journal.delete_pending_exit_confirmation(thesis_id)
+            deleted_confirmations.append(thesis_id)
+
+    return {
+        "resolved_sell_signals": resolved_signals,
+        "resolved_signal_ids": sorted(resolved_signal_ids),
+        "deleted_exit_confirmations": len(deleted_confirmations),
+        "deleted_confirmation_thesis_ids": sorted(deleted_confirmations),
+    }
+
+
 def finalize_broker_sell_fill(
     *,
     journal: DecisionJournal,
@@ -1026,6 +1069,29 @@ def finalize_broker_sell_fill(
             "filled_at": timestamp,
         }
     )
+    evidence = _json_object(row.get("evidence_json"))
+    signal_ids = [str(evidence.get("signal_id") or "").strip()]
+    resolved_sell_signals_now = journal.resolve_sell_signals(
+        signal_ids=signal_ids,
+        thesis_id=thesis_id,
+        ticker=ticker,
+        all_for_position=full_exit,
+        actioned_at=timestamp,
+    )
+    exit_confirmation_cleared_now = False
+    if full_exit and thesis_id:
+        exit_confirmation_cleared_now = bool(
+            journal.get_pending_exit_confirmation(thesis_id)
+        )
+        journal.delete_pending_exit_confirmation(thesis_id)
+    resolved_sell_signals = max(
+        int(_number(effect_details.get("resolved_sell_signals")) or 0),
+        resolved_sell_signals_now,
+    )
+    exit_confirmation_cleared = bool(
+        effect_details.get("exit_confirmation_cleared")
+        or exit_confirmation_cleared_now
+    )
     if event_type == "TRIM":
         try:
             from .shadow_rules import record_trim_hold_shadow
@@ -1112,6 +1178,8 @@ def finalize_broker_sell_fill(
                 "data_quality": data_quality,
                 "reconciled_external_event": bool(external_event),
                 "completion_markers": completion_markers if event_type == "TRIM" else [],
+                "resolved_sell_signals": resolved_sell_signals,
+                "exit_confirmation_cleared": exit_confirmation_cleared,
             },
         }
     )
@@ -1134,6 +1202,8 @@ def finalize_broker_sell_fill(
         "thesis_effect": thesis_effect,
         "tracking_effect": tracking_effect,
         "completion_markers": completion_markers if event_type == "TRIM" else [],
+        "resolved_sell_signals": resolved_sell_signals,
+        "exit_confirmation_cleared": exit_confirmation_cleared,
         "episode_id": episode.get("episode_id") if episode else None,
         "source": source,
     }

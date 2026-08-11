@@ -9328,6 +9328,27 @@ class TestSellSideHardening(unittest.TestCase):
         tracker = ThesisTracker(journal=journal)
         thesis = self._active_thesis(journal, ticker="FULL", position_type="STARTER", entry=100)
         tracker.mark_waiting_for_sell(thesis.thesis_id, reason="EXIT")
+        for signal_id in ("old-full-stop", "trigger-full-exit"):
+            journal.save_sell_signal(
+                {
+                    "signal_id": signal_id,
+                    "ticker": "FULL",
+                    "thesis_id": thesis.thesis_id,
+                    "signal_type": "hard_stop",
+                    "severity": "URGENT",
+                    "source": "sell_engine",
+                    "message": "Exit FULL",
+                }
+            )
+        journal.upsert_pending_exit_confirmation(
+            {
+                "thesis_id": thesis.thesis_id,
+                "ticker": "FULL",
+                "first_signal_at": "2026-06-05T14:00:00+00:00",
+                "days_confirmed": 2,
+                "last_counted_date": "2026-06-05",
+            }
+        )
         portfolio_path = self.tmp_dir / "portfolio.json"
         Portfolio(
             positions=[
@@ -9354,7 +9375,8 @@ class TestSellSideHardening(unittest.TestCase):
                 "status": "submitted",
                 "thesis_id": thesis.thesis_id,
                 "evidence_json": {
-                    "sell_council": {"confirmed": True, "action": "EXIT"}
+                    "sell_council": {"confirmed": True, "action": "EXIT"},
+                    "signal_id": "trigger-full-exit",
                 },
                 "request_json": {"symbol": "FULL", "side": "sell", "quantity": "1"},
             }
@@ -9390,6 +9412,11 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertEqual(len(journal.get_broker_fill_effects()), 1)
         self.assertEqual(len(journal.get_sell_trade_events(thesis_id=thesis.thesis_id)), 1)
         self.assertEqual(len(journal.get_pending_post_sell_reviews()), 1)
+        effect_details = json.loads(journal.get_broker_fill_effects()[0]["details_json"])
+        self.assertEqual(effect_details["resolved_sell_signals"], 2)
+        self.assertTrue(effect_details["exit_confirmation_cleared"])
+        self.assertEqual(journal.get_active_sell_signals("FULL"), [])
+        self.assertIsNone(journal.get_pending_exit_confirmation(thesis.thesis_id))
         episodes = journal.get_position_trade_episodes(status="closed")
         self.assertEqual(len(episodes), 1)
         self.assertEqual(episodes[0]["sell_fill_count"], 1)
@@ -9415,6 +9442,68 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertEqual(len(journal.get_broker_fill_effects()), 1)
         self.assertEqual(len(journal.get_sell_trade_events(thesis_id=thesis.thesis_id)), 1)
         self.assertEqual(len(journal.get_pending_post_sell_reviews()), 1)
+
+    def test_closed_position_control_reconciliation_preserves_active_retry_state(self):
+        from artha.fill_finalizer import reconcile_closed_position_control_state
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.supervisor import _check_exit_control_state
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        closed = self._active_thesis(journal, ticker="CLOSED", entry=100)
+        active = self._active_thesis(journal, ticker="ACTIVE", entry=100)
+        tracker.archive_thesis(closed.thesis_id, exit_price=95, exit_reason="done")
+        for signal_id, ticker, thesis_id in (
+            ("closed-signal", "CLOSED", closed.thesis_id),
+            ("active-signal", "ACTIVE", active.thesis_id),
+        ):
+            journal.save_sell_signal(
+                {
+                    "signal_id": signal_id,
+                    "ticker": ticker,
+                    "thesis_id": thesis_id,
+                    "signal_type": "hard_stop",
+                    "severity": "URGENT",
+                    "source": "sell_engine",
+                    "message": ticker,
+                }
+            )
+            journal.upsert_pending_exit_confirmation(
+                {
+                    "thesis_id": thesis_id,
+                    "ticker": ticker,
+                    "first_signal_at": "2026-06-05T14:00:00+00:00",
+                    "days_confirmed": 1,
+                    "last_counted_date": "2026-06-05",
+                }
+            )
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio().save(portfolio_path)
+
+        first = reconcile_closed_position_control_state(
+            journal,
+            portfolio_path=portfolio_path,
+        )
+        second = reconcile_closed_position_control_state(
+            journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertEqual(first["resolved_sell_signals"], 1)
+        self.assertEqual(first["deleted_exit_confirmations"], 1)
+        self.assertEqual(second["resolved_sell_signals"], 0)
+        self.assertEqual(second["deleted_exit_confirmations"], 0)
+        self.assertEqual(
+            [row["signal_id"] for row in journal.get_active_sell_signals()],
+            ["active-signal"],
+        )
+        self.assertIsNotNone(journal.get_pending_exit_confirmation(active.thesis_id))
+        self.assertEqual(
+            _check_exit_control_state(journal, portfolio_path=portfolio_path)["status"],
+            "PASS",
+        )
 
     def test_partial_trim_fill_keeps_thesis_active_and_updates_remaining_value(self):
         from artha.journal import DecisionJournal

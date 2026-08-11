@@ -1360,6 +1360,45 @@ class DecisionJournal:
             rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
+    def resolve_sell_signals(
+        self,
+        *,
+        signal_ids: list[str] | None = None,
+        thesis_id: str | None = None,
+        ticker: str | None = None,
+        all_for_position: bool = False,
+        actioned_at: str | None = None,
+    ) -> int:
+        """Mark sell signals handled after a broker-confirmed sell.
+
+        A trim resolves only explicitly linked signal IDs. A full exit may
+        resolve every remaining signal for the exact thesis (or ticker when a
+        legacy fill has no thesis identity). This is idempotent and never
+        creates an execution action.
+        """
+        ids = sorted({str(value).strip() for value in (signal_ids or []) if str(value).strip()})
+        params: list[Any] = [str(actioned_at or self._utcnow_iso())]
+        selector = ""
+        if all_for_position and str(thesis_id or "").strip():
+            selector = "thesis_id = ?"
+            params.append(str(thesis_id).strip())
+        elif all_for_position and str(ticker or "").strip():
+            selector = "ticker = ?"
+            params.append(str(ticker).upper().strip())
+        elif ids:
+            selector = f"signal_id IN ({','.join('?' for _ in ids)})"
+            params.extend(ids)
+        else:
+            return 0
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE sell_signals SET actioned = 1, actioned_at = ? "
+                f"WHERE actioned = 0 AND ({selector})",
+                params,
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
+
     def save_sell_session(self, session_data: dict[str, Any]) -> None:
         """Insert a sell council session record."""
         ts = self._utcnow_iso()
