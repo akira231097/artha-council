@@ -100,22 +100,41 @@ class PostSellTracker:
         sell_reason: str,
         shares: float,
         position_type: str,
-    ) -> None:
+        *,
+        tracking_id: str | None = None,
+        sell_date: str | None = None,
+        broker_order_id: str | None = None,
+        order_intent_id: str | None = None,
+        sell_event_id: str | None = None,
+        cost_basis: float | None = None,
+        realized_pnl: float | None = None,
+        data_quality: str = "broker_fill",
+    ) -> str:
         """Record a new post-sell tracking entry."""
         import uuid
-        tracking_id = str(uuid.uuid4())
-        self.journal.save_post_sell_tracking({
+        tracking_id = str(tracking_id or uuid.uuid4())
+        existing = self.journal.get_post_sell_review(tracking_id)
+        payload = {
             "tracking_id": tracking_id,
             "ticker": ticker,
             "thesis_id": thesis_id,
-            "sell_date": _utcnow_iso()[:10],
+            "sell_date": str(sell_date or _utcnow_iso())[:10],
             "sell_price": sell_price,
             "sell_reason": sell_reason,
             "position_type": position_type,
             "shares": shares,
-            "status": "tracking",
-        })
+            "broker_order_id": broker_order_id,
+            "order_intent_id": order_intent_id,
+            "sell_event_id": sell_event_id,
+            "cost_basis": cost_basis,
+            "realized_pnl": realized_pnl,
+            "data_quality": data_quality,
+        }
+        if not existing:
+            payload["status"] = "tracking"
+        self.journal.save_post_sell_tracking(payload)
         logger.info("[post_sell] Started shadow tracking for %s @ $%.2f", ticker, sell_price)
+        return tracking_id
 
     def _historical_close_on_or_after(
         self,
@@ -236,7 +255,7 @@ class PostSellTracker:
             ret = (current_price - sell_price) / sell_price if sell_price > 0 else 0
             # Negative regret_score = price fell = selling was correct
             # Positive = price rose = we left money on table
-            regret_score = ret  # same as return; naming is from the investor's perspective
+            regret_score = ret  # same as return; naming is from the operator's perspective
 
             updates: dict[str, Any] = {}
 

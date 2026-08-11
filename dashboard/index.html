@@ -217,9 +217,9 @@ footer{text-align:center;color:var(--dim);font-size:11.5px;margin-top:26px}
     <div class="steps">
       <div class="step"><span class="n">1</span><div><b>Scan</b> — every trading day at 11:30 &amp; 2:15 (CT) it screens the market with proven, research-backed filters (momentum, strength near 52-week highs, quality trends).<div class="sd">Junk and lottery-ticket stocks are excluded automatically.</div></div></div>
       <div class="step"><span class="n">2</span><div><b>Research</b> — promising names get deep diligence: live news, filings, earnings, then a council of 3 AI analysts (bull, technician, skeptic) votes with a score out of 100.</div></div>
-      <div class="step"><span class="n">3</span><div><b>Guardrails</b> — even a “buy” must pass hard limits: max $25/order, $50/day, 2 buys/day, 6 positions. The dashboard shows when a buy is blocked and why.</div></div>
+      <div class="step"><span class="n">3</span><div><b>Guardrails</b> — even a “buy” must pass the configured order, daily, position, sector, account-capacity, and broker-review limits. The dashboard shows when a buy is blocked and why.</div></div>
       <div class="step"><span class="n">4</span><div><b>Execute</b> — approved orders are placed on the real Robinhood account (the $350 pilot), each with an automatic stop-loss safety net from second one.</div></div>
-      <div class="step"><span class="n">5</span><div><b>Protect &amp; review</b> — stops trail up as positions win; the sell council re-examines every holding twice a day. Mechanical stops fire instantly; judgment sells follow the configured approval policy.</div></div>
+      <div class="step"><span class="n">5</span><div><b>Protect &amp; review</b> — stops trail up as positions win; the sell council re-examines every holding twice a day. Mechanical stops and judgment sells follow the configured execution policy.</div></div>
       <div class="step"><span class="n">6</span><div><b>Learn</b> — every night at 9pm it grades its past calls against the market, turns mistakes into lessons, and each Saturday researches the web for ways to improve itself.</div></div>
     </div>
   </details>
@@ -474,7 +474,7 @@ function renderImprovements(){
   $("improvements").innerHTML =
     (briefs ? "<div style='font-size:12px;color:var(--dim);margin-bottom:4px'>SELF-RESEARCH BRIEFS</div>"+briefs : "") +
     `<div style="font-size:12px;color:var(--dim);margin:${briefs?'12px':'0'} 0 4px">RECENT FIXES & UPGRADES</div>` + (commits || "<div class='empty'>—</div>") +
-    `<div class="lesson" style="margin-top:12px">🧪 <b>${shadow.rules??0}</b> candidate rules in paper-trading trials (<b>${shadow.trials??0}</b> practice runs so far) — a rule only touches real money after proving itself (20+ trials, 65%+ win rate) <i>and</i> the operator approves it.` +
+    `<div class="lesson" style="margin-top:12px">🧪 <b>${shadow.rules??0}</b> candidate rules in paper-trading trials (<b>${shadow.trials??0}</b> practice runs so far) — a rule only touches real money after proving itself (20+ trials, 65%+ win rate) <i>and</i> the operator enables it.` +
     ((im.research_briefs||[]).length ? "" : " First weekly self-research brief lands Saturday 10 AM.") + `</div>`;
 }
 

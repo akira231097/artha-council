@@ -49,6 +49,10 @@ It receives structured candidate cards, may collect bounded additional evidence,
 and must cite the reasons for its ordering. Deterministic scores remain visible so
 the agent cannot silently replace the funnel.
 
+`alpha_shadow.py` records experimental signals separately from production
+ranking. Shadow observations can be evaluated later, but cannot promote a stock
+or change a live threshold on their own.
+
 ## 4. Buy Council and CIO Synthesis
 
 Independent roles evaluate the same evidence packet:
@@ -87,6 +91,7 @@ fresh read-only snapshot
   -> deterministic final clearance
   -> exact-argument placement
   -> submission/fill reconciliation
+  -> idempotent fill finalization and execution-quality measurement
 ```
 
 Any unknown decisive check blocks the order.
@@ -106,6 +111,9 @@ Every reconciled holding should have an active thesis containing invalidation,
 review, stop, and target state. The monitor checks price, thesis age, trailing
 stops, adverse evidence, news, earnings, and portfolio constraints.
 
+Broker holdings are also classified by sector and industry so portfolio-level
+concentration checks do not silently operate on missing classifications.
+
 Deterministic emergency rules can create an immediate exit intent when configured.
 Judgment triggers receive a fresh sell-Council review. The sell Council can return
 hold, trim, or exit; an actionable sell still passes through exact broker review,
@@ -114,7 +122,8 @@ execution clearance, placement, and fill reconciliation.
 ## 9. Journals, Dossiers, Calibration, and Supervisor
 
 Runtime deployments record evidence packets, Council decisions, action intents,
-broker reviews, submissions, fills, thesis transitions, and health checks.
+broker reviews, submissions, fills, exact fill accounting, execution-quality
+observations, thesis transitions, and health checks.
 Calibration and shadow rules can observe outcomes, but they cannot silently alter
 live investing rules.
 

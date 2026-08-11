@@ -404,7 +404,11 @@ class ArthaScheduler:
             pending = [t for t in tracker.get_all_monitored() if t.status == "pending_exit"]
             if not pending:
                 return
-            from .robinhood_bridge import _snapshot_held_quantity_for_ticker, _trade_action_expired
+            from .robinhood_bridge import (
+                _snapshot_held_quantity_for_ticker,
+                _trade_action_expired,
+                sync_orders_to_artha,
+            )
 
             actions = journal.get_trade_actions(limit=300)
             snapshot = self._load_robinhood_position_snapshot()
@@ -412,10 +416,23 @@ class ArthaScheduler:
                 if snapshot.get("fresh"):
                     held = _snapshot_held_quantity_for_ticker(snapshot, thesis.ticker)
                     if held <= 0.000001:
-                        tracker.archive_thesis(
-                            thesis.thesis_id,
-                            exit_reason="Broker snapshot confirms the pending exit is fully closed.",
+                        # A zero-share snapshot proves the position is absent,
+                        # but not which fill closed it or at what price. Give
+                        # matching broker orders to the shared finalizer. If
+                        # none is available, the repeated-snapshot external
+                        # reconciliation path owns the closure; never archive
+                        # here without the corresponding accounting event.
+                        sync_orders_to_artha(
+                            snapshot,
+                            journal=journal,
                         )
+                        refreshed = tracker.get(thesis.thesis_id)
+                        if refreshed and refreshed.status != "archived":
+                            logger.warning(
+                                "[exit_watchdog] %s is absent from the broker snapshot, but no "
+                                "broker fill was finalized yet; awaiting reconciliation",
+                                thesis.ticker,
+                            )
                         continue
                 thesis_actions = [
                     a for a in actions
@@ -2438,6 +2455,7 @@ class ArthaScheduler:
         trigger_type: str,
         trim_pct: float | None = None,
         signal_id: str | None = None,
+        completion_markers: list[str] | None = None,
         reason: str = "",
         confirmed_exit: bool = False,
         sell_decision: Any | None = None,
@@ -2506,7 +2524,12 @@ class ArthaScheduler:
                         )
                         return None
             except Exception as dedupe_exc:
-                logger.warning("[sell_review] sell dedupe check failed: %s", dedupe_exc)
+                logger.error(
+                    "[sell_review] sell dedupe check failed for %s; refusing to queue: %s",
+                    ticker,
+                    dedupe_exc,
+                )
+                return None
 
             from .execution import build_order_intent, prepare_and_record_robinhood_review
 
@@ -2531,6 +2554,11 @@ class ArthaScheduler:
                 "action": action_norm,
                 "thesis_id": thesis_id,
                 "signal_id": signal_id,
+                "completion_markers": sorted({
+                    str(marker).strip()
+                    for marker in (completion_markers or [])
+                    if str(marker).strip()
+                }),
                 "confirmed_exit": bool(confirmed_exit),
                 "reason": reason[:1200],
                 "dossier_path": decision_dossier,
@@ -2627,6 +2655,7 @@ class ArthaScheduler:
         stock_data: dict[str, Any],
         trigger_type: str,
         signal_id: str | None = None,
+        completion_markers: list[str] | None = None,
         trigger_reason: str = "",
         fallback_trim_pct: float | None = None,
     ) -> dict[str, Any]:
@@ -2650,6 +2679,7 @@ class ArthaScheduler:
                 trigger_type=trigger_type,
                 trim_pct=trim_pct,
                 signal_id=signal_id,
+                completion_markers=completion_markers,
                 reason=trigger_reason or f"Sell Council issued {action}.",
                 confirmed_exit=True,
                 sell_decision=decision,
@@ -2777,6 +2807,11 @@ class ArthaScheduler:
                 return {"status": "MISSING", "positions": [], "path": str(path), "warnings": ["Snapshot file does not exist."]}
             payload = json.loads(path.read_text(encoding="utf-8"))
             snapshot = normalize_robinhood_position_snapshot(payload)
+            # Position normalization intentionally drops non-position fields.
+            # The pending-exit watchdog also needs the same snapshot's broker
+            # orders so a zero-share position can converge through the shared
+            # fill finalizer rather than waiting for a later reconciliation run.
+            snapshot["orders"] = payload.get("orders") if isinstance(payload, dict) and isinstance(payload.get("orders"), list) else []
             snapshot["path"] = str(path)
             return snapshot
         except Exception as exc:
@@ -3069,11 +3104,27 @@ class ArthaScheduler:
         if not self.telegram.enabled:
             return False
         review_count = min(candidate_count, Config.SCAN_COUNCIL_MAX)
+        coverage_line = ""
+        try:
+            from .rank_candidates import load_latest_rank_coverage_summary
+
+            coverage = load_latest_rank_coverage_summary(max_age_hours=2.0) or {}
+            universe_size = int(coverage.get("universe_size") or 0)
+            history_count = int(coverage.get("history_count") or 0)
+            history_pct = float(coverage.get("history_coverage_pct") or 0.0)
+            if universe_size:
+                coverage_line = (
+                    f"\nRanking coverage: {history_count}/{universe_size} "
+                    f"({history_pct:.1%}, {coverage.get('status') or 'UNKNOWN'})."
+                )
+        except Exception as coverage_e:
+            logger.warning("[scan] Could not load rank coverage for Telegram: %s", coverage_e)
         msg = (
             "🔎 ARTHA SCAN PROGRESS\n"
             "━━━━━━━━━━━━━━━\n"
             f"Funnel found {candidate_count} finalist(s). "
             f"Reviewing up to {review_count} with the council. Reports will arrive one by one."
+            f"{coverage_line}"
         )
         ok = self.telegram.send_message(msg, parse_mode=None)
         if ok:
@@ -3358,6 +3409,7 @@ class ArthaScheduler:
                                     "severity": signal.severity,
                                     "recommended_action": signal.action_recommended,
                                     "trim_pct": signal.trim_pct,
+                                    "completion_markers": list(signal.completion_markers or []),
                                     "message": signal.message,
                                 }
                                 for signal in ticker_signals
@@ -3387,6 +3439,12 @@ class ArthaScheduler:
                             stock_data=stock_data,
                             trigger_type=primary.signal_type,
                             signal_id=primary.signal_id,
+                            completion_markers=sorted({
+                                marker
+                                for signal in ticker_signals
+                                for marker in (signal.completion_markers or [])
+                                if marker
+                            }),
                             trigger_reason=" | ".join(s.message for s in ticker_signals)[:1600],
                             fallback_trim_pct=primary.trim_pct,
                         )
@@ -4153,6 +4211,7 @@ class ArthaScheduler:
                         continue
                     try:
                         stock_data = self.collector.collect_stock(ticker)
+                        stock_data["funnel_candidate"] = dict(candidate)
                         decision = self.council.analyze_stock(
                             stock_data,
                             macro_data,
@@ -5241,8 +5300,6 @@ class ArthaScheduler:
                 if self._defer_watch_skip_decision(candidate, active_defer_watches).get("skip"):
                     continue
                 filtered.append(candidate)
-                if len(filtered) >= max(1, int(Config.AFTERNOON_SCAN_MAX_CANDIDATES)):
-                    break
             if not filtered:
                 logger.info("[afternoon_scan] All candidates filtered (held/ETF/defer-zone)")
                 return
@@ -5265,11 +5322,16 @@ class ArthaScheduler:
 
             session_id = f"afternoon-scan-{_utcnow().strftime('%Y%m%d_%H%M%S')}-{uuid4().hex[:8]}"
             logger.info(
-                "[afternoon_scan] Reviewing %d candidate(s): %s",
+                "[afternoon_scan] Preflighting %d candidate(s) for up to %d Council slot(s): %s",
                 len(filtered),
+                max(1, int(Config.AFTERNOON_SCAN_MAX_CANDIDATES)),
                 ", ".join(c["symbol"] for c in filtered),
             )
+            analyzed_tickers: list[str] = []
+            max_council = max(1, int(Config.AFTERNOON_SCAN_MAX_CANDIDATES))
             for candidate in filtered:
+                if len(analyzed_tickers) >= max_council:
+                    break
                 if self._stop_flag.is_set():
                     logger.warning(
                         "[afternoon_scan] Stop requested; aborting pass before next candidate"
@@ -5278,6 +5340,85 @@ class ArthaScheduler:
                 ticker = candidate["symbol"]
                 try:
                     stock_data = self.collector.collect_stock(ticker)
+                    stock_data["funnel_candidate"] = dict(candidate)
+                    from .liquidity import evaluate_buy_now_eligibility
+
+                    eligibility = evaluate_buy_now_eligibility(
+                        stock_data,
+                        require_average_volume=True,
+                    )
+                    lane = str(candidate.get("afternoon_source") or "afternoon")
+                    catalyst_live_eligible = bool(candidate.get("live_eligible"))
+                    if lane == "market_movers" or not catalyst_live_eligible:
+                        reason = (
+                            str(candidate.get("routing_reason") or "")
+                            or "afternoon_mover_has_no_identified_earnings_or_news_catalyst"
+                        )
+                        logger.info(
+                            "[afternoon_scan] %s routed to research-only before Council: %s",
+                            ticker,
+                            reason,
+                        )
+                        journal.save_scan_routing_decisions(
+                            [
+                                {
+                                    "session_id": session_id,
+                                    "ticker": ticker,
+                                    "lane": f"afternoon_{lane}",
+                                    "bucket": "research_watch",
+                                    "reason_code": "unverified_catalyst",
+                                    "reason": reason,
+                                    "price": eligibility.get("price"),
+                                    "avg_volume": eligibility.get("average_volume"),
+                                    "dollar_volume": eligibility.get("average_dollar_volume"),
+                                    "liquidity_source": eligibility.get("average_volume_source"),
+                                    "evidence_json": {"candidate": candidate, "eligibility": eligibility},
+                                }
+                            ]
+                        )
+                        continue
+                    if not eligibility.get("passed"):
+                        logger.info(
+                            "[afternoon_scan] %s routed to research-only before Council: %s",
+                            ticker,
+                            ",".join(eligibility.get("reasons") or []),
+                        )
+                        journal.save_scan_routing_decisions(
+                            [
+                                {
+                                    "session_id": session_id,
+                                    "ticker": ticker,
+                                    "lane": f"afternoon_{lane}",
+                                    "bucket": "research_watch",
+                                    "reason_code": (eligibility.get("reasons") or ["eligibility_failed"])[0],
+                                    "reason": "; ".join(eligibility.get("reasons") or []),
+                                    "price": eligibility.get("price"),
+                                    "avg_volume": eligibility.get("average_volume"),
+                                    "dollar_volume": eligibility.get("average_dollar_volume"),
+                                    "liquidity_source": eligibility.get("average_volume_source"),
+                                    "evidence_json": eligibility,
+                                }
+                            ]
+                        )
+                        continue
+                    journal.save_scan_routing_decisions(
+                        [
+                            {
+                                "session_id": session_id,
+                                "ticker": ticker,
+                                "lane": f"afternoon_{lane}",
+                                "bucket": "execution_ready",
+                                "reason_code": "common_eligibility_pass",
+                                "reason": "Common market-cap, price, and average-dollar-liquidity eligibility passed.",
+                                "price": eligibility.get("price"),
+                                "avg_volume": eligibility.get("average_volume"),
+                                "dollar_volume": eligibility.get("average_dollar_volume"),
+                                "liquidity_source": eligibility.get("average_volume_source"),
+                                "evidence_json": eligibility,
+                            }
+                        ]
+                    )
+                    analyzed_tickers.append(ticker)
                     decision = self.council.analyze_stock(
                         stock_data,
                         macro_data,
@@ -5334,7 +5475,7 @@ class ArthaScheduler:
             try:
                 journal.save_session(
                     session_type="afternoon_scan",
-                    tickers_analyzed=",".join(str(c.get("symbol") or "") for c in filtered),
+                    tickers_analyzed=",".join(analyzed_tickers),
                     report_path="telegram",
                     timestamp=_utcnow().isoformat(),
                 )

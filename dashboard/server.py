@@ -682,7 +682,7 @@ def build_system() -> list[dict]:
         raw_until = str(control.get("buying_paused_until") or "")[:10]
         paused = bool(raw_until) and _now_utc().astimezone(ET).date().isoformat() <= raw_until
         add("Trading switch", "ok" if not paused else "warn",
-            "Fully enabled (within guardrails: $25/order, $50/day, 2 buys/day)" if not paused
+            "Fully enabled within configured order, daily, position, and capacity guardrails" if not paused
             else "Buys paused for today (auto-resumes next trading day); sells & stops fully active")
 
     strat_cron = crons.get("Artha Weekly Strategy Research", {})
@@ -798,7 +798,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if not self._authed():
             self._send(401, b'{"error":"unauthorized"}' if parsed.path.startswith("/api") else
-                       "<h3 style='font-family:sans-serif'>ARTHA dashboard: open the link sent to the operator on Telegram (it contains the access key).</h3>".encode(),
+                       "<h3 style='font-family:sans-serif'>ARTHA dashboard: open the operator link from Telegram (it contains the access key).</h3>".encode(),
                        "application/json" if parsed.path.startswith("/api") else "text/html")
             return
         if parsed.path in ("/", "/index.html"):

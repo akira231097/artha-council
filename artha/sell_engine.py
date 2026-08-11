@@ -24,7 +24,10 @@ from .journal import DecisionJournal
 from .thesis_tracker import (
     ThesisTracker,
     PositionThesis,
+    CONDITION_EFFECT_INVALIDATE,
+    CONDITION_EFFECT_REVIEW,
     evaluate_invalidation_conditions,
+    review_condition_already_acknowledged,
 )
 from .trailing_stop import TrailingStopManager, TRAIL_MANAGED_POSITION_TYPES
 
@@ -39,6 +42,7 @@ SIGNAL_DEAD_MONEY_TIME_STOP = "dead_money_time_stop"   # rule 4.5
 SIGNAL_PROFIT_TAKE = "profit_take"                     # rule 4.3
 SIGNAL_EARNINGS_RISK = "earnings_risk"                 # rule 4.6
 SIGNAL_THESIS_BREAK = "thesis_break"                   # rule 4.7
+SIGNAL_THESIS_REVIEW = "thesis_review"                 # scheduled re-underwrite
 SIGNAL_REGIME_EXIT = "regime_exit"                     # rule 4.7/regime
 SIGNAL_REVIEW_EXIT = "review_exit"                     # rule 4.7 material news
 
@@ -101,6 +105,7 @@ class SellSignal:
     sell_score: Optional[float] = None
     action_recommended: Optional[str] = None
     trim_pct: Optional[float] = None
+    completion_markers: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=_utcnow_iso)
 
 
@@ -573,7 +578,6 @@ class SellEngine:
         if _MARKER_PROFIT_TAKE in completed:
             return signals
 
-        self.tracker.record_scale_out(thesis.thesis_id, _MARKER_PROFIT_TAKE)
         signal = SellSignal(
             ticker=thesis.ticker,
             thesis_id=thesis.thesis_id,
@@ -587,6 +591,7 @@ class SellEngine:
             ),
             action_recommended="TRIM",
             sell_score=float(Config.SELL_SCORE_TRIM_THRESHOLD),
+            completion_markers=[_MARKER_PROFIT_TAKE],
         )
         signals.append(signal)
         self.aggregator.record(signal)
@@ -771,32 +776,71 @@ class SellEngine:
 
         results = evaluate_invalidation_conditions(structured, metrics)
         triggered = [r for r in results if r["status"] == "triggered"]
-        if not triggered:
+        invalidations = [
+            result for result in triggered
+            if result.get("effect") == CONDITION_EFFECT_INVALIDATE
+        ]
+        reviews = [
+            result for result in triggered
+            if result.get("effect") == CONDITION_EFFECT_REVIEW
+            and not review_condition_already_acknowledged(
+                result.get("condition"),
+                entry_date=thesis.entry_date,
+                last_review_date=thesis.last_review_date,
+            )
+        ]
+        if not invalidations and not reviews:
+            return signals
+
+        if invalidations:
+            details = "; ".join(
+                f"{r['metric']} {r['condition'].get('op')} {r['threshold']} "
+                f"(observed {r['observed']})"
+                for r in invalidations
+            )
+            signal = SellSignal(
+                ticker=thesis.ticker,
+                thesis_id=thesis.thesis_id,
+                signal_type=SIGNAL_THESIS_BREAK,
+                severity="HIGH",
+                source="invalidation_checker",
+                message=(
+                    f"🧨 THESIS BREAK (rule 4.7): {thesis.ticker} triggered "
+                    f"{len(invalidations)} machine-checked invalidation condition(s): {details}. "
+                    "Exit review required."
+                ),
+                action_recommended="EXIT",
+                sell_score=float(Config.SELL_SCORE_EXIT_TACTICAL),
+            )
+            signals.append(signal)
+            self.aggregator.record(signal)
+            logger.info(
+                "[sell_engine] Thesis-break signal for %s: %s", thesis.ticker, details
+            )
             return signals
 
         details = "; ".join(
             f"{r['metric']} {r['condition'].get('op')} {r['threshold']} "
             f"(observed {r['observed']})"
-            for r in triggered
+            for r in reviews
         )
         signal = SellSignal(
             ticker=thesis.ticker,
             thesis_id=thesis.thesis_id,
-            signal_type=SIGNAL_THESIS_BREAK,
-            severity="HIGH",
-            source="invalidation_checker",
+            signal_type=SIGNAL_THESIS_REVIEW,
+            severity="MEDIUM",
+            source="review_schedule",
             message=(
-                f"🧨 THESIS BREAK (rule 4.7): {thesis.ticker} triggered "
-                f"{len(triggered)} machine-checked invalidation condition(s): {details}. "
-                "Exit review required."
+                f"🗓 THESIS REVIEW DUE: {thesis.ticker} reached "
+                f"{len(reviews)} scheduled review checkpoint(s): {details}. "
+                "This is not evidence that the thesis failed; fresh Council review is required."
             ),
-            action_recommended="EXIT",
-            sell_score=float(Config.SELL_SCORE_EXIT_TACTICAL),
+            action_recommended="HOLD",
         )
         signals.append(signal)
         self.aggregator.record(signal)
         logger.info(
-            "[sell_engine] Thesis-break signal for %s: %s", thesis.ticker, details
+            "[sell_engine] Thesis-review checkpoint for %s: %s", thesis.ticker, details
         )
         return signals
 
@@ -967,13 +1011,16 @@ class SellEngine:
                     ),
                     action_recommended="TRIM",
                     sell_score=Config.SELL_SCORE_TRIM_THRESHOLD,
+                    trim_pct=float(trim_pct),
+                    completion_markers=[milestone_key],
                 )
                 signals.append(signal)
                 self.aggregator.record(signal)
-                # Record milestone to prevent re-alerting
-                self.tracker.record_scale_out(thesis.thesis_id, milestone_key)
                 logger.info(
-                    "[sell_engine] Scale-out milestone %s hit for %s", milestone_key, thesis.ticker
+                    "[sell_engine] Scale-out milestone %s detected for %s; "
+                    "completion waits for a broker-confirmed trim",
+                    milestone_key,
+                    thesis.ticker,
                 )
 
         return signals

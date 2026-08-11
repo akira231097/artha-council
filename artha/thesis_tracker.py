@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -88,6 +89,115 @@ _CONDITION_OPS = {
     "gte": lambda observed, threshold: observed >= threshold,
     "eq": lambda observed, threshold: observed == threshold,
 }
+
+CONDITION_EFFECT_INVALIDATE = "invalidate"
+CONDITION_EFFECT_REVIEW = "review"
+_CONDITION_EFFECTS = {CONDITION_EFFECT_INVALIDATE, CONDITION_EFFECT_REVIEW}
+_TIME_REVIEW_METRICS = {"days_held", "trading_days_held"}
+
+
+def condition_effect(condition: Any) -> str:
+    """Return whether a structured condition invalidates or schedules review.
+
+    Older rows predate the explicit ``effect`` field. Time-based conditions
+    are conservatively treated as review checkpoints; price/P&L conditions
+    remain true invalidations. This keeps historical theses safe without a
+    destructive migration.
+    """
+    if not isinstance(condition, dict):
+        return CONDITION_EFFECT_INVALIDATE
+    explicit = str(condition.get("effect") or "").lower().strip()
+    if explicit in _CONDITION_EFFECTS:
+        return explicit
+    metric = str(condition.get("metric") or "").lower().strip()
+    return (
+        CONDITION_EFFECT_REVIEW
+        if metric in _TIME_REVIEW_METRICS
+        else CONDITION_EFFECT_INVALIDATE
+    )
+
+
+def normalize_invalidation_conditions(conditions: list[Any] | None) -> list[Any]:
+    """Persist explicit effects while preserving legacy free-text evidence."""
+    normalized: list[Any] = []
+    for condition in conditions or []:
+        if is_structured_condition(condition):
+            item = dict(condition)
+            item["effect"] = condition_effect(item)
+            normalized.append(item)
+        else:
+            normalized.append(condition)
+    return normalized
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def review_condition_due_at(condition: Any, entry_date: Any) -> datetime | None:
+    """Return the one-time due timestamp for a time-based review condition."""
+    if (
+        not is_structured_condition(condition)
+        or condition_effect(condition) != CONDITION_EFFECT_REVIEW
+    ):
+        return None
+    metric = str(condition.get("metric") or "").lower().strip()
+    if metric not in _TIME_REVIEW_METRICS:
+        return None
+    entry = _parse_utc(entry_date)
+    if entry is None:
+        return None
+    try:
+        threshold = max(0.0, float(condition.get("value")))
+    except (TypeError, ValueError):
+        return None
+    op = str(condition.get("op") or "").lower().strip()
+    units = math.floor(threshold) + 1 if op in {"gt", ">"} else math.ceil(threshold)
+    if metric == "days_held":
+        return entry + timedelta(days=units)
+
+    due = entry
+    remaining = units
+    while remaining > 0:
+        due += timedelta(days=1)
+        if due.weekday() < 5:
+            remaining -= 1
+    return due
+
+
+def review_condition_already_acknowledged(
+    condition: Any,
+    *,
+    entry_date: Any,
+    last_review_date: Any,
+) -> bool:
+    """True once a Council review occurred at or after the checkpoint."""
+    due = review_condition_due_at(condition, entry_date)
+    reviewed = _parse_utc(last_review_date)
+    return bool(due and reviewed and reviewed >= due)
+
+
+def earliest_review_due_at(
+    conditions: list[Any] | None,
+    entry_date: Any,
+) -> datetime | None:
+    due_dates = [
+        due
+        for due in (
+            review_condition_due_at(condition, entry_date)
+            for condition in conditions or []
+        )
+        if due is not None
+    ]
+    return min(due_dates) if due_dates else None
 
 
 def is_structured_condition(condition: Any) -> bool:
@@ -161,6 +271,7 @@ def evaluate_invalidation_conditions(
             "metric": metric,
             "observed": observed,
             "threshold": threshold,
+            "effect": condition_effect(condition),
         })
     return results
 
@@ -329,7 +440,9 @@ class ThesisTracker:
             status="pending",
             position_type=position_type,
             thesis_summary=thesis_summary,
-            invalidation_conditions=invalidation_conditions or [],
+            invalidation_conditions=normalize_invalidation_conditions(
+                invalidation_conditions
+            ),
             price_target=price_target,
             stop_loss_pct=stop_pct,
             recommended_allocation_pct=recommended_allocation_pct,
@@ -382,13 +495,24 @@ class ThesisTracker:
                 atr = None
         hard_stop = compute_initial_stop(entry_price, atr=atr) if entry_price else None
 
-        # Compute first review date
+        # Compute first review date. A time condition is a mandatory review
+        # checkpoint, not proof that the thesis failed, and it may be earlier
+        # than the normal position-type review cadence.
         review_days = _REVIEW_DAYS.get(position_type, 30)
-        next_review = _add_days(review_days)
+        activated_at = entry_date or _utcnow_iso()
+        default_review = _utcnow() + timedelta(days=review_days)
+        condition_review = earliest_review_due_at(
+            thesis.invalidation_conditions,
+            activated_at,
+        )
+        next_review = min(
+            default_review,
+            condition_review or default_review,
+        ).isoformat()
 
         thesis.status = "active"
         thesis.entry_price = entry_price
-        thesis.entry_date = entry_date or _utcnow_iso()
+        thesis.entry_date = activated_at
         thesis.hard_stop_price = hard_stop
         thesis.thesis_health_score = 100
         thesis.last_review_date = _utcnow_iso()
@@ -443,6 +567,21 @@ class ThesisTracker:
         except Exception as e:
             logger.error("[thesis] Failed to deserialize active thesis for %s: %s", ticker, e)
             return None
+
+    def get_sell_monitored(self, ticker: str) -> Optional[PositionThesis]:
+        """Get the thesis protecting a held ticker, including ``pending_exit``.
+
+        Execution reconciliation must keep ownership of a thesis after Council
+        has decided to sell but before the broker-confirmed fill is finalized.
+        Normal buy/review code should continue to use :meth:`get_active`.
+        """
+        symbol = str(ticker or "").upper().strip()
+        if not symbol:
+            return None
+        for thesis in self.get_all_monitored():
+            if str(thesis.ticker or "").upper() == symbol:
+                return thesis
+        return None
 
     def get_all_active(self) -> list[PositionThesis]:
         """Get all active theses."""
@@ -594,6 +733,8 @@ class ThesisTracker:
                         continue
                 except (TypeError, ValueError):
                     pass
+            if key == "invalidation_conditions":
+                value = normalize_invalidation_conditions(value)
             setattr(thesis, key, value)
         self._save(thesis)
 

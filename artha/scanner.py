@@ -31,6 +31,13 @@ CATALYST_EP_MAX_CANDIDATES: int = int(os.getenv("ARTHA_CATALYST_EP_MAX_CANDIDATE
 CATALYST_EP_MIN_MARKET_CAP: float = float(os.getenv("ARTHA_CATALYST_EP_MIN_MARKET_CAP", "500000000"))
 CATALYST_EP_MIN_PRICE: float = float(os.getenv("ARTHA_CATALYST_EP_MIN_PRICE", "5.0"))
 CATALYST_NEWS_WINDOW_HOURS: int = int(os.getenv("ARTHA_CATALYST_NEWS_WINDOW_HOURS", "48"))
+CATALYST_EP_EARNINGS_WINDOW_DAYS: int = int(
+    os.getenv("ARTHA_CATALYST_EP_EARNINGS_WINDOW_DAYS", "2")
+)
+CATALYST_EP_REQUIRE_IDENTIFIED_CATALYST: bool = os.getenv(
+    "ARTHA_CATALYST_EP_REQUIRE_IDENTIFIED_CATALYST",
+    "true",
+).strip().lower() in ("1", "true", "yes")
 CATALYST_EP_TOP_MOVER_GAP_PCT: float = float(os.getenv("ARTHA_CATALYST_EP_TOP_MOVER_GAP_PCT", "15.0"))
 CATALYST_EP_TOP_MOVER_VOLUME_RATIO: float = float(
     os.getenv("ARTHA_CATALYST_EP_TOP_MOVER_VOLUME_RATIO", str(CATALYST_EP_VOLUME_RATIO))
@@ -269,12 +276,12 @@ def get_catalyst_candidates(
 ) -> list[dict]:
     """Catalyst / episodic-pivot (EP) lane for the promotion funnel.
 
-    Finds stocks gapping >= +8% today on an earnings/news catalyst with
-    elevated volume (>= 1.4x average). It also surfaces very large,
-    high-volume top movers even when the news endpoint fails to attach a clean
-    symbol-specific article. These are Qullamaggie-style episodic pivots —
-    large single-day repricings that momentum ranking (which skips the most
-    recent month) structurally cannot surface.
+    Finds stocks gapping >= +8% today on an identified earnings/news catalyst
+    with elevated volume (>= 1.4x average). Very large high-volume movers with
+    no identifiable event are retained as research/shadow candidates, but are
+    not eligible for a guaranteed live catalyst slot by default. These are
+    Qullamaggie-style episodic pivots: large single-day repricings that the
+    skip-month momentum ranker structurally cannot surface.
 
     Sources, in priority order:
       1. collector.get_market_movers() when available (data-layer agent adds
@@ -333,7 +340,7 @@ def get_catalyst_candidates(
 
     gappers = [
         m for m in movers
-        if _pct(m.get("change_pct") or m.get("changesPercentage")) >= CATALYST_EP_MIN_GAP_PCT
+        if _pct(m.get("change_pct") or m.get("changePct") or m.get("changesPercentage")) >= CATALYST_EP_MIN_GAP_PCT
         and _pct(m.get("price")) >= CATALYST_EP_MIN_PRICE
     ]
     if not gappers:
@@ -390,11 +397,34 @@ def get_catalyst_candidates(
         return sum(volumes) / len(volumes)
 
     now = datetime.now(timezone.utc)
+
+    def _latest_positive_earnings(surprises: list[dict]) -> tuple[Optional[str], Optional[float]]:
+        """Return a recent, already-reported positive EPS surprise.
+
+        EarningsContext.days_to_earnings describes the next report, so it must
+        never be used as proof that today's gap followed a completed report.
+        """
+        matches: list[tuple[datetime, float]] = []
+        for row in surprises or []:
+            raw_date = str((row or {}).get("date") or "")[:10]
+            try:
+                report_dt = datetime.strptime(raw_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            age_days = (now.date() - report_dt.date()).days
+            surprise_pct = _pct((row or {}).get("surprise_pct"))
+            if 0 <= age_days <= CATALYST_EP_EARNINGS_WINDOW_DAYS and surprise_pct > 0:
+                matches.append((report_dt, surprise_pct))
+        if not matches:
+            return None, None
+        report_dt, surprise_pct = max(matches, key=lambda item: item[0])
+        return report_dt.date().isoformat(), surprise_pct
+
     candidates: list[dict] = []
     for mover in gappers[: max_candidates * 3]:
         if len(candidates) >= max_candidates:
             break
-        symbol = str(mover.get("symbol") or "").upper()
+        symbol = str(mover.get("symbol") or mover.get("ticker") or "").upper()
         if not symbol:
             continue
 
@@ -432,9 +462,14 @@ def get_catalyst_candidates(
 
         # Catalyst confirmation: earnings day, or news within the window
         catalyst_type = None
+        earnings_surprise_pct = None
+        earnings_report_date = None
         try:
             ec = get_earnings_context(symbol)
-            if ec.days_to_earnings is not None and abs(int(ec.days_to_earnings)) <= 1:
+            earnings_report_date, earnings_surprise_pct = _latest_positive_earnings(
+                ec.recent_surprises
+            )
+            if earnings_report_date:
                 catalyst_type = "earnings"
         except Exception:
             pass
@@ -459,7 +494,9 @@ def get_catalyst_candidates(
                         continue
             except Exception:
                 pass
-        gap_pct = _pct(mover.get("change_pct") or mover.get("changesPercentage"))
+        gap_pct = _pct(
+            mover.get("change_pct") or mover.get("changePct") or mover.get("changesPercentage")
+        )
         if (
             catalyst_type is None
             and gap_pct >= CATALYST_EP_TOP_MOVER_GAP_PCT
@@ -469,7 +506,15 @@ def get_catalyst_candidates(
         if catalyst_type is None:
             continue
 
+        catalyst_confirmed = catalyst_type in {"earnings", "news"}
+        live_eligible = catalyst_confirmed or not CATALYST_EP_REQUIRE_IDENTIFIED_CATALYST
+
         price = _pct(quote.get("price") or mover.get("price"))
+        shadow_quality_score = min(40.0, gap_pct * 2.0) + min(30.0, volume_ratio * 10.0)
+        if catalyst_type == "earnings":
+            shadow_quality_score += 10.0
+            if earnings_surprise_pct is not None and earnings_surprise_pct > 0:
+                shadow_quality_score += min(20.0, earnings_surprise_pct / 2.0)
         candidates.append({
             "symbol": symbol,
             "name": str(quote.get("name") or mover.get("name") or ""),
@@ -483,6 +528,26 @@ def get_catalyst_candidates(
             "gap_pct": round(gap_pct, 2),
             "volume_ratio": round(volume_ratio, 2) if volume_ratio is not None else None,
             "catalyst_type": catalyst_type,
+            "catalyst_confirmed": catalyst_confirmed,
+            "live_eligible": live_eligible,
+            "routing_status": "execution_candidate" if live_eligible else "research_watch",
+            "routing_reason": (
+                "identified_catalyst"
+                if live_eligible
+                else "large_move_without_identified_earnings_or_news_catalyst"
+            ),
+            "earnings_report_date": earnings_report_date,
+            "earnings_surprise_pct": earnings_surprise_pct,
+            "episodic_pivot_shadow": {
+                "quality_score": round(min(100.0, shadow_quality_score), 2),
+                "gap_pct": round(gap_pct, 2),
+                "volume_ratio": round(volume_ratio, 2),
+                "catalyst_type": catalyst_type,
+                "catalyst_confirmed": catalyst_confirmed,
+                "earnings_surprise_pct": earnings_surprise_pct,
+                "guidance_confirmation": "unavailable",
+                "live_score_impact": 0.0,
+            },
             "track": "catalyst_ep",
             "momentum_score": 0.0,
             "regime_score": 0.0,
@@ -646,17 +711,21 @@ class MarketScanner:
             List of enriched candidate dicts for council analysis.
         """
         funnel = self._get_funnel()
+        strict_coverage = bool(getattr(Config, "SCAN_REQUIRE_MIN_RANK_COVERAGE", True))
         if funnel is None:
-            logger.warning("[scanner] Funnel unavailable — falling back to key ticker scan")
-            return self._legacy_candidates(max_candidates)
+            logger.warning("[scanner] Funnel unavailable")
+            return [] if strict_coverage else self._legacy_candidates(max_candidates)
 
         candidates = funnel.run(
             regime_packet=regime_packet,
             max_council_candidates=max_candidates,
-            fallback_on_failure=True,
+            fallback_on_failure=not strict_coverage,
         )
 
         if not candidates:
+            if strict_coverage:
+                logger.warning("[scanner] Funnel returned no coverage-proven candidates; buy scan remains closed")
+                return []
             logger.warning("[scanner] Funnel returned no candidates — using legacy scan")
             return self._legacy_candidates(max_candidates)
 

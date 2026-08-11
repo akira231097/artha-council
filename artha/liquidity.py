@@ -140,6 +140,86 @@ def passes_liquidity_gate(ticker_data: dict) -> bool:
     return True
 
 
+def evaluate_buy_now_eligibility(
+    ticker_data: dict,
+    *,
+    require_average_volume: bool = True,
+) -> dict[str, Any]:
+    """Return an auditable pre-Council eligibility decision.
+
+    This is the common front-door check for lanes that did not originate in
+    the normal FMP universe builder, especially raw afternoon movers. It only
+    judges data quality and execution feasibility; company quality remains a
+    Council responsibility.
+    """
+    quote = ticker_data.get("quote") if isinstance(ticker_data.get("quote"), dict) else {}
+    yf_quote = ticker_data.get("yf_quote") if isinstance(ticker_data.get("yf_quote"), dict) else {}
+    profile = ticker_data.get("profile") if isinstance(ticker_data.get("profile"), dict) else {}
+    min_market_cap = float(getattr(Config, "LIQUIDITY_MIN_MARKET_CAP", 1_000_000_000) or 0)
+    min_adv = float(getattr(Config, "LIQUIDITY_MIN_ADV", 10_000_000) or 0)
+    min_price = float(getattr(Config, "LIQUIDITY_MIN_PRICE", 5.0) or 0)
+
+    market_cap = _num(
+        quote.get("marketCap")
+        or yf_quote.get("marketCap")
+        or profile.get("mktCap")
+        or profile.get("marketCap")
+        or ticker_data.get("market_cap")
+    )
+    price = _num(
+        quote.get("price")
+        or yf_quote.get("price")
+        or yf_quote.get("currentPrice")
+        or ticker_data.get("price")
+    )
+    volume_info = resolve_average_volume(ticker_data)
+    average_volume = _num(volume_info.get("volume"))
+    dollar_volume = (
+        float(price) * float(average_volume)
+        if price is not None and average_volume is not None
+        else None
+    )
+    is_etf_or_fund = bool(
+        profile.get("isEtf")
+        or profile.get("isFund")
+        or quote.get("isEtf")
+        or quote.get("isFund")
+    )
+
+    reasons: list[str] = []
+    if is_etf_or_fund:
+        reasons.append("etf_or_fund_not_single_company")
+    if market_cap is None:
+        reasons.append("market_cap_missing")
+    elif market_cap < min_market_cap:
+        reasons.append("market_cap_below_buy_now_floor")
+    if price is None:
+        reasons.append("price_missing")
+    elif price < min_price:
+        reasons.append("price_below_buy_now_floor")
+    if average_volume is None:
+        reasons.append("average_volume_missing")
+    elif require_average_volume and not volume_info.get("is_average"):
+        reasons.append("average_volume_unproven")
+    elif dollar_volume is None or dollar_volume < min_adv:
+        reasons.append("average_dollar_volume_below_buy_now_floor")
+
+    return {
+        "passed": not reasons,
+        "status": "PASS" if not reasons else "RESEARCH_ONLY",
+        "reasons": reasons,
+        "market_cap": market_cap,
+        "minimum_market_cap": min_market_cap,
+        "price": price,
+        "minimum_price": min_price,
+        "average_volume": average_volume,
+        "average_volume_source": volume_info.get("source"),
+        "average_volume_proven": bool(volume_info.get("is_average")),
+        "average_dollar_volume": dollar_volume,
+        "minimum_average_dollar_volume": min_adv,
+    }
+
+
 def compute_liquidity_score(ticker_data: dict) -> float:
     """Compute a 0–100 liquidity score.
 

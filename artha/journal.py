@@ -269,6 +269,134 @@ class DecisionJournal:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_post_sell_tracking_ticker ON post_sell_tracking(ticker)"
             )
+            self._ensure_columns(
+                conn,
+                "post_sell_tracking",
+                {
+                    "broker_order_id": "TEXT",
+                    "order_intent_id": "TEXT",
+                    "sell_event_id": "TEXT",
+                    "cost_basis": "REAL",
+                    "realized_pnl": "REAL",
+                    "data_quality": "TEXT",
+                },
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_post_sell_tracking_sell_event "
+                "ON post_sell_tracking(sell_event_id) WHERE sell_event_id IS NOT NULL"
+            )
+            # ---------------------------------------------------------------
+            # Broker fill accounting. One row represents the cumulative state
+            # of one broker order. The row is deliberately separate from the
+            # execution request so a crash between the broker fill, portfolio
+            # JSON update, thesis update, and learning intake can be repaired
+            # idempotently on the next reconciliation pass.
+            # ---------------------------------------------------------------
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS broker_fill_effects (
+                    event_key TEXT PRIMARY KEY,
+                    broker_order_id TEXT,
+                    order_intent_id TEXT,
+                    ticker TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    cumulative_quantity REAL NOT NULL,
+                    average_price REAL NOT NULL,
+                    applied_quantity REAL NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL,
+                    portfolio_effect_status TEXT NOT NULL,
+                    thesis_effect_status TEXT NOT NULL,
+                    tracking_effect_status TEXT NOT NULL,
+                    details_json TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_broker_fill_effects_order "
+                "ON broker_fill_effects(broker_order_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_broker_fill_effects_ticker "
+                "ON broker_fill_effects(ticker)"
+            )
+            # Every sell order is also retained as a trim/exit event. These
+            # rows are the source for turnover and realized-P&L learning; they
+            # are not investing signals and cannot place orders.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sell_trade_events (
+                    event_id TEXT PRIMARY KEY,
+                    broker_order_id TEXT,
+                    order_intent_id TEXT,
+                    ticker TEXT NOT NULL,
+                    thesis_id TEXT,
+                    event_type TEXT NOT NULL,
+                    shares REAL NOT NULL,
+                    average_price REAL NOT NULL,
+                    cost_basis_per_share REAL,
+                    proceeds REAL NOT NULL,
+                    realized_pnl REAL,
+                    position_shares_before REAL,
+                    position_shares_after REAL,
+                    sell_reason TEXT,
+                    position_type TEXT,
+                    source TEXT NOT NULL,
+                    data_quality TEXT NOT NULL DEFAULT 'broker_fill',
+                    filled_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sell_trade_events_ticker "
+                "ON sell_trade_events(ticker)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sell_trade_events_thesis "
+                "ON sell_trade_events(thesis_id)"
+            )
+            # Position episodes aggregate all fills belonging to one thesis.
+            # They let Artha measure complete ideas instead of incorrectly
+            # counting several small trims as several independent trades.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS position_trade_episodes (
+                    episode_id TEXT PRIMARY KEY,
+                    thesis_id TEXT,
+                    ticker TEXT NOT NULL,
+                    position_type TEXT,
+                    status TEXT NOT NULL,
+                    opened_at TEXT,
+                    closed_at TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    shares_bought REAL NOT NULL DEFAULT 0,
+                    shares_sold REAL NOT NULL DEFAULT 0,
+                    buy_notional REAL NOT NULL DEFAULT 0,
+                    sell_notional REAL NOT NULL DEFAULT 0,
+                    realized_pnl REAL,
+                    return_pct REAL,
+                    buy_fill_count INTEGER NOT NULL DEFAULT 0,
+                    sell_fill_count INTEGER NOT NULL DEFAULT 0,
+                    trim_count INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_position_trade_episodes_thesis "
+                "ON position_trade_episodes(thesis_id) WHERE thesis_id IS NOT NULL"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_position_trade_episodes_status "
+                "ON position_trade_episodes(status)"
+            )
             # ---------------------------------------------------------------
             # Entry watchlist tables
             # ---------------------------------------------------------------
@@ -1282,6 +1410,151 @@ class DecisionJournal:
             conn.execute(sql, [tracking_data[c] for c in cols])
             conn.commit()
 
+    def save_broker_fill_effect(self, effect_data: dict[str, Any]) -> None:
+        """Upsert the cumulative side-effect state for one broker order."""
+        import json
+
+        ts = self._utcnow_iso()
+        payload = dict(effect_data)
+        payload.setdefault("first_seen_at", ts)
+        payload["updated_at"] = ts
+        details = payload.get("details_json", payload.get("details") or {})
+        if isinstance(details, (dict, list)):
+            details = json.dumps(details, sort_keys=True, ensure_ascii=True)
+        payload["details_json"] = str(details or "{}")
+        payload.pop("details", None)
+        cols = list(payload.keys())
+        placeholders = ", ".join(["?"] * len(cols))
+        updates = ", ".join(
+            f"{c} = excluded.{c}" for c in cols if c not in {"event_key", "first_seen_at"}
+        )
+        sql = (
+            f"INSERT INTO broker_fill_effects ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(event_key) DO UPDATE SET {updates}"
+        )
+        with self._connect() as conn:
+            conn.execute(sql, [payload[c] for c in cols])
+
+    def get_broker_fill_effect(self, event_key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM broker_fill_effects WHERE event_key = ? LIMIT 1",
+                (str(event_key),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_broker_fill_effect_by_order_id(self, broker_order_id: str) -> dict[str, Any] | None:
+        """Return the cumulative effect already assigned to a broker order.
+
+        The stable event key normally embeds the broker order ID. A rare late
+        broker confirmation can replace an earlier synthetic external-close
+        identity, so order-ID lookup is also required for replay idempotency.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM broker_fill_effects WHERE broker_order_id = ? "
+                "ORDER BY datetime(updated_at) DESC LIMIT 1",
+                (str(broker_order_id or ""),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_broker_fill_effects(self, limit: int = 500) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM broker_fill_effects ORDER BY datetime(updated_at) DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_sell_trade_event(self, event_data: dict[str, Any]) -> None:
+        """Upsert one cumulative broker sell event (trim or complete exit)."""
+        ts = self._utcnow_iso()
+        payload = dict(event_data)
+        payload.setdefault("created_at", ts)
+        payload["updated_at"] = ts
+        cols = list(payload.keys())
+        placeholders = ", ".join(["?"] * len(cols))
+        updates = ", ".join(
+            f"{c} = excluded.{c}" for c in cols if c not in {"event_id", "created_at"}
+        )
+        with self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO sell_trade_events ({', '.join(cols)}) VALUES ({placeholders}) "
+                f"ON CONFLICT(event_id) DO UPDATE SET {updates}",
+                [payload[c] for c in cols],
+            )
+
+    def get_sell_trade_events(
+        self,
+        *,
+        thesis_id: str | None = None,
+        ticker: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if thesis_id:
+            clauses.append("thesis_id = ?")
+            params.append(str(thesis_id))
+        if ticker:
+            clauses.append("ticker = ?")
+            params.append(str(ticker).upper())
+        params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sell_trade_events WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY datetime(filled_at) ASC, rowid ASC LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_sell_trade_event(self, event_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sell_trade_events WHERE event_id = ? LIMIT 1",
+                (str(event_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_position_trade_episode(self, episode_data: dict[str, Any]) -> None:
+        """Upsert one thesis-level position episode."""
+        ts = self._utcnow_iso()
+        payload = dict(episode_data)
+        payload.setdefault("created_at", ts)
+        payload["updated_at"] = ts
+        cols = list(payload.keys())
+        placeholders = ", ".join(["?"] * len(cols))
+        updates = ", ".join(
+            f"{c} = excluded.{c}" for c in cols if c not in {"episode_id", "created_at"}
+        )
+        with self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO position_trade_episodes ({', '.join(cols)}) VALUES ({placeholders}) "
+                f"ON CONFLICT(episode_id) DO UPDATE SET {updates}",
+                [payload[c] for c in cols],
+            )
+
+    def get_position_trade_episodes(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params.append(str(status))
+        params.append(int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM position_trade_episodes {where} "
+                "ORDER BY datetime(COALESCE(closed_at, opened_at, created_at)) DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_pending_post_sell_reviews(self) -> list[dict[str, Any]]:
         """Get post-sell records that still have remaining tracking days (status='tracking')."""
         with self._connect() as conn:
@@ -1303,6 +1576,15 @@ class DecisionJournal:
                 "ORDER BY datetime(sell_date) ASC"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_post_sell_review(self, tracking_id: str) -> dict[str, Any] | None:
+        """Return one post-sell review by its stable tracking identifier."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM post_sell_tracking WHERE tracking_id = ? LIMIT 1",
+                (str(tracking_id or ""),),
+            ).fetchone()
+        return dict(row) if row else None
 
     # -----------------------------------------------------------------------
     # Entry Watchlist Methods
@@ -1742,6 +2024,31 @@ class DecisionJournal:
                 (int(limit),),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_latest_decision_feature(
+        self,
+        ticker: str,
+        *,
+        dossier_path: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the best point-in-time classification row for a ticker."""
+        ticker = str(ticker or "").upper().strip()
+        if not ticker:
+            return None
+        with self._connect() as conn:
+            row = None
+            if dossier_path:
+                row = conn.execute(
+                    "SELECT * FROM decision_features WHERE ticker = ? AND dossier_path = ? LIMIT 1",
+                    (ticker, str(dossier_path)),
+                ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT * FROM decision_features WHERE ticker = ? "
+                    "ORDER BY datetime(generated_at) DESC, id DESC LIMIT 1",
+                    (ticker,),
+                ).fetchone()
+        return dict(row) if row else None
 
     def save_calibration_diagnostic(self, diagnostic: dict[str, Any]) -> int:
         """Persist a calibration diagnosis report and return row id."""

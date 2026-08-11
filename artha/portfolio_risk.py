@@ -66,6 +66,63 @@ def _candidate_weight_pct(portfolio_state: dict[str, Any], config: Any, proposed
     return max(0.0, min(max_position_pct, exploration_pct, budget_pct))
 
 
+def evaluate_projected_sector_limit(
+    *,
+    ticker: str,
+    sector: str,
+    portfolio_state: dict[str, Any],
+    proposed_notional: float,
+    max_sector_pct: float,
+) -> dict[str, Any]:
+    """Evaluate exact post-order sector exposure for new buys and ADDs."""
+    positions = portfolio_state.get("positions") or []
+    total_nav = _num(portfolio_state.get("total_value"), 0.0)
+    normalized_sector = str(sector or "").strip()
+    notional = max(0.0, _num(proposed_notional, 0.0))
+    reasons: list[str] = []
+    if not normalized_sector:
+        reasons.append("Candidate sector classification is missing.")
+    if total_nav <= 0:
+        reasons.append("Current portfolio NAV is unavailable for sector-limit calculation.")
+    if notional <= 0:
+        reasons.append("Proposed buy notional is unavailable for sector-limit calculation.")
+
+    current_sector_value = sum(
+        _num(position.get("market_value"), 0.0)
+        for position in positions
+        if isinstance(position, dict)
+        and str(position.get("sector") or "").strip() == normalized_sector
+    )
+    current_pct = current_sector_value / total_nav if total_nav > 0 else None
+    projected_value = current_sector_value + notional
+    projected_pct = projected_value / total_nav if total_nav > 0 else None
+    headroom = max(0.0, max_sector_pct * total_nav - current_sector_value) if total_nav > 0 else 0.0
+    if projected_pct is not None and projected_pct > max_sector_pct + 0.000001:
+        reasons.append(
+            f"Proposed {ticker.upper()} buy would raise {normalized_sector} exposure to "
+            f"{projected_pct:.1%}, above the {max_sector_pct:.0%} hard limit."
+        )
+    return {
+        "passed": not reasons,
+        "status": "PASS" if not reasons else "BLOCKED",
+        "ticker": str(ticker or "").upper(),
+        "sector": normalized_sector,
+        "proposed_notional": round(notional, 4),
+        "current_sector_value": round(current_sector_value, 4),
+        "projected_sector_value": round(projected_value, 4),
+        "current_sector_pct": round(current_pct, 6) if current_pct is not None else None,
+        "projected_sector_pct": round(projected_pct, 6) if projected_pct is not None else None,
+        "max_sector_pct": max_sector_pct,
+        "headroom_dollars": round(headroom, 4),
+        "is_add": any(
+            isinstance(position, dict)
+            and str(position.get("ticker") or "").upper() == str(ticker or "").upper()
+            for position in positions
+        ),
+        "reasons": reasons,
+    }
+
+
 def build_portfolio_factor_risk(
     ticker: str,
     stock_data: dict[str, Any],
@@ -87,24 +144,54 @@ def build_portfolio_factor_risk(
     if not isinstance(positions, list):
         positions = []
     total_nav = _num(portfolio_state.get("total_value"), 0.0)
+    total_invested = _num(portfolio_state.get("total_holdings_value"), 0.0)
+    if total_invested <= 0:
+        total_invested = sum(
+            _num(pos.get("market_value"), 0.0)
+            for pos in positions
+            if isinstance(pos, dict)
+        )
     candidate_weight = _candidate_weight_pct(portfolio_state, config, proposed_weight_pct)
+    candidate_notional = total_nav * candidate_weight / 100.0 if total_nav > 0 else 0.0
     held_tickers = {str(p.get("ticker", "")).upper() for p in positions if isinstance(p, dict)}
     is_existing_position = str(ticker or "").upper() in held_tickers
+    existing_ticker_value = sum(
+        _num(pos.get("market_value"), 0.0)
+        for pos in positions
+        if isinstance(pos, dict) and str(pos.get("ticker") or "").upper() == str(ticker or "").upper()
+    )
 
     sector_value = 0.0
     sector_weights: dict[str, float] = {}
+    sector_values: dict[str, float] = {}
     for pos in positions:
         if not isinstance(pos, dict):
             continue
-        pos_sector = str(pos.get("sector") or pos.get("asset_type") or "unknown").strip()
+        pos_sector = str(pos.get("sector") or "unknown").strip()
         weight = _num(pos.get("weight_pct"), 0.0)
+        market_value = _num(pos.get("market_value"), 0.0)
         sector_weights[pos_sector] = sector_weights.get(pos_sector, 0.0) + weight
+        sector_values[pos_sector] = sector_values.get(pos_sector, 0.0) + market_value
         if sector and pos_sector == sector:
-            sector_value += _num(pos.get("market_value"), 0.0)
+            sector_value += market_value
 
     current_sector_pct = (sector_value / total_nav * 100.0) if total_nav > 0 else 0.0
-    after_sector_pct = current_sector_pct if is_existing_position else current_sector_pct + candidate_weight
-    concentration_after_pct = max(_num(portfolio_state.get("concentration_pct"), 0.0), candidate_weight)
+    after_sector_pct = current_sector_pct + candidate_weight
+    current_sector_invested_pct = (
+        sector_value / total_invested * 100.0 if total_invested > 0 else 0.0
+    )
+    projected_invested = total_invested + candidate_notional
+    projected_sector_value = sector_value + candidate_notional
+    sector_after_invested_pct = (
+        projected_sector_value / projected_invested * 100.0
+        if projected_invested > 0
+        else 0.0
+    )
+    existing_ticker_pct = existing_ticker_value / total_nav * 100.0 if total_nav > 0 else 0.0
+    concentration_after_pct = max(
+        _num(portfolio_state.get("concentration_pct"), 0.0),
+        existing_ticker_pct + candidate_weight,
+    )
     available_slots = max(0, int(_num(getattr(config, "MAX_CONCURRENT_POSITIONS", 20), 20)) - len(positions))
     max_sector_pct = _num(getattr(config, "MAX_SECTOR_PCT", 0.30), 0.30) * 100.0
     max_position_pct = _num(getattr(config, "MAX_POSITION_PCT", 0.20), 0.20) * 100.0
@@ -162,10 +249,16 @@ def build_portfolio_factor_risk(
         "candidate_weight_pct": round(candidate_weight, 2),
         "current_sector_pct": round(current_sector_pct, 2),
         "sector_after_candidate_pct": round(after_sector_pct, 2),
+        "current_sector_invested_pct": round(current_sector_invested_pct, 2),
+        "sector_after_candidate_invested_pct": round(sector_after_invested_pct, 2),
         "concentration_after_candidate_pct": round(concentration_after_pct, 2),
         "available_slots": available_slots,
         "is_existing_position": is_existing_position,
         "sector_weights": {k: round(v, 2) for k, v in sorted(sector_weights.items())},
+        "sector_weights_invested": {
+            key: round(value / total_invested * 100.0, 2) if total_invested > 0 else 0.0
+            for key, value in sorted(sector_values.items())
+        },
         "market_benchmark_ticker": market_benchmark,
         "sector_benchmark_ticker": sector_benchmark,
         "risk_flags": flags[:8],
@@ -183,7 +276,8 @@ def format_portfolio_factor_risk(payload: dict[str, Any] | None) -> str:
         (
             f"Candidate sector: {payload.get('sector') or 'unknown'} | "
             f"candidate weight: {payload.get('candidate_weight_pct', 0):.1f}% | "
-            f"sector after candidate: {payload.get('sector_after_candidate_pct', 0):.1f}%"
+            f"sector after candidate: {payload.get('sector_after_candidate_pct', 0):.1f}% NAV / "
+            f"{payload.get('sector_after_candidate_invested_pct', 0):.1f}% invested"
         ),
         (
             f"Benchmarks: market={payload.get('market_benchmark_ticker', 'SPY')} | "

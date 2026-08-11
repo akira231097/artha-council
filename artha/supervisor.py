@@ -20,6 +20,7 @@ from .calibration import backfill_decision_features, build_calibration_report
 from .config import Config
 from .diagnostics import run_calibration_diagnosis
 from .execution import build_execution_readiness_report, normalize_robinhood_position_snapshot
+from .execution_learning import build_execution_learning_summary
 from .journal import DecisionJournal
 from .portfolio import PORTFOLIO_FILE, Portfolio
 from .shadow_rules import (
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SUPERVISOR_DIR = DATA_DIR / "supervisor"
 LOG_DIR = DATA_DIR / "logs"
+RANK_COVERAGE_DIR = DATA_DIR / "rank_coverage"
 
 LOG_ERROR_RE = re.compile(
     r"(?:^|[\s\[])(?:ERROR|CRITICAL)(?:[\s\]:-]|$)|Traceback|Exception",
@@ -215,6 +217,62 @@ def _check_latest_decision_artifacts(journal: DecisionJournal) -> dict[str, Any]
         "ticker": latest.get("ticker"),
         "dossier_path": str(path),
         "age_hours": round(age, 2) if age is not None else None,
+    }
+
+
+def _check_rank_coverage() -> dict[str, Any]:
+    """Verify that a recent full-universe rank run examined enough symbols."""
+    paths = sorted(RANK_COVERAGE_DIR.glob("*/*.json"), reverse=True)[:100]
+    candidates: list[tuple[datetime, int, Path, dict[str, Any]]] = []
+    for path in paths:
+        payload = _read_json_file(path)
+        if not payload:
+            continue
+        generated = _parse_dt(payload.get("generated_at"))
+        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+        try:
+            universe_size = int(summary.get("universe_size") or 0)
+        except (TypeError, ValueError):
+            universe_size = 0
+        if generated and universe_size:
+            candidates.append((generated, universe_size, path, summary))
+    if not candidates:
+        return {
+            "name": "rank_coverage",
+            "status": "WARN",
+            "message": "No immutable ranking-coverage audit exists yet.",
+        }
+
+    now = datetime.now(timezone.utc)
+    max_age_hours = 84.0  # Covers the Friday-to-Monday market closure.
+    recent = [
+        row
+        for row in candidates
+        if 0 <= (now - row[0]).total_seconds() <= max_age_hours * 3600
+    ]
+    if recent:
+        generated, universe_size, path, summary = max(recent, key=lambda row: (row[1], row[0]))
+    else:
+        generated, universe_size, path, summary = max(candidates, key=lambda row: row[0])
+    coverage = float(summary.get("history_coverage_pct") or 0.0)
+    minimum = float(getattr(Config, "RANK_MIN_HISTORY_COVERAGE_PCT", 0.90) or 0.90)
+    age_hours = max(0.0, (now - generated).total_seconds() / 3600.0)
+    status = "PASS" if coverage >= minimum and age_hours <= max_age_hours else "WARN"
+    return {
+        "name": "rank_coverage",
+        "status": status,
+        "message": (
+            f"Latest full ranking run obtained usable history for "
+            f"{int(summary.get('history_count') or 0)}/{universe_size} stocks "
+            f"({coverage:.1%}); required {minimum:.0%}; age {age_hours:.1f}h."
+        ),
+        "artifact_path": str(path),
+        "generated_at": generated.isoformat(),
+        "coverage_pct": coverage,
+        "minimum_coverage_pct": minimum,
+        "age_hours": round(age_hours, 2),
+        "maximum_age_hours": max_age_hours,
+        "status_counts": summary.get("status_counts") or {},
     }
 
 
@@ -540,6 +598,32 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
         duplicate_live_sells = sorted(
             ticker for ticker, rows in live_by_ticker.items() if ticker and len(rows) > 1
         )
+        malformed_thesis_metadata: list[str] = []
+        for row in monitoring_rows:
+            ticker = str(row.get("ticker") or "").upper()
+            summary = str(row.get("thesis_summary") or "").strip()
+            summary_upper = summary.upper()
+            if (
+                not summary
+                or summary.startswith("```")
+                or summary in {"---", "***"}
+                or summary_upper.startswith("PRIMARY DRIVER:")
+            ):
+                malformed_thesis_metadata.append(f"{ticker}:missing_or_malformed_summary")
+            raw_conditions = row.get("invalidation_conditions") or "[]"
+            try:
+                conditions = (
+                    json.loads(raw_conditions)
+                    if isinstance(raw_conditions, str)
+                    else raw_conditions
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                conditions = []
+            if not any(
+                isinstance(condition, str) and condition.strip()
+                for condition in (conditions if isinstance(conditions, list) else [])
+            ):
+                malformed_thesis_metadata.append(f"{ticker}:missing_business_invalidation")
 
         if unmonitored_positions:
             return {
@@ -602,6 +686,20 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
                 "orphan_active_theses": orphan_active_theses,
             }
 
+        if malformed_thesis_metadata:
+            return {
+                "name": "position_monitoring",
+                "status": "WARN",
+                "message": (
+                    "Held thesis metadata is incomplete for Sell Council: "
+                    f"{', '.join(malformed_thesis_metadata[:8])}."
+                ),
+                "portfolio_positions": sorted(position_tickers),
+                "active_theses": sorted(active_tickers),
+                "pending_exit_theses": pending_exit_tickers,
+                "malformed_thesis_metadata": malformed_thesis_metadata,
+            }
+
         if not position_tickers and pending_tickers:
             return {
                 "name": "position_monitoring",
@@ -635,6 +733,7 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
             "orphan_active_theses": [],
             "pending_exit_without_auto_sell": [],
             "duplicate_live_sells": [],
+            "malformed_thesis_metadata": [],
         }
     except Exception as exc:
         return {"name": "position_monitoring", "status": "FAIL", "message": f"Position monitoring check failed: {exc}"}
@@ -932,6 +1031,260 @@ def _check_recent_logs(
     }
 
 
+def _check_broker_fill_accounting(
+    journal: DecisionJournal,
+    *,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+) -> dict[str, Any]:
+    """Verify every broker sell fill reached the shared accounting contract."""
+    sell_orders = [
+        row
+        for row in journal.get_execution_orders(limit=5000)
+        if str(row.get("side") or "").lower() == "sell"
+        and str(row.get("status") or "").lower() == "filled"
+    ]
+    effects = journal.get_broker_fill_effects(limit=5000)
+    events = journal.get_sell_trade_events(limit=5000)
+    tracking = journal.get_all_post_sell_reviews()
+    episodes = journal.get_position_trade_episodes(limit=5000)
+
+    effects_by_order = {
+        str(row.get("broker_order_id") or ""): row
+        for row in effects
+        if row.get("broker_order_id")
+    }
+    effects_by_intent = {
+        str(row.get("order_intent_id") or ""): row
+        for row in effects
+        if row.get("order_intent_id")
+    }
+    events_by_order = {
+        str(row.get("broker_order_id") or ""): row
+        for row in events
+        if row.get("broker_order_id")
+    }
+    events_by_intent = {
+        str(row.get("order_intent_id") or ""): row
+        for row in events
+        if row.get("order_intent_id")
+    }
+    missing_effects: list[str] = []
+    missing_events: list[str] = []
+    for row in sell_orders:
+        broker_id = str(row.get("broker_order_id") or "")
+        intent_id = str(row.get("order_intent_id") or "")
+        label = broker_id or intent_id or f"row:{row.get('id')}"
+        if not (effects_by_order.get(broker_id) or effects_by_intent.get(intent_id)):
+            missing_effects.append(label)
+        if not (events_by_order.get(broker_id) or events_by_intent.get(intent_id)):
+            missing_events.append(label)
+
+    tracking_event_ids = {
+        str(row.get("sell_event_id") or "")
+        for row in tracking
+        if row.get("sell_event_id")
+    }
+    missing_exit_tracking = [
+        str(row.get("event_id") or "")
+        for row in events
+        if str(row.get("event_type") or "").upper() == "EXIT"
+        and row.get("thesis_id")
+        and str(row.get("event_id") or "") not in tracking_event_ids
+    ]
+    episode_theses = {
+        str(row.get("thesis_id") or "")
+        for row in episodes
+        if row.get("thesis_id")
+    }
+    missing_episodes = sorted(
+        {
+            str(row.get("thesis_id") or "")
+            for row in events
+            if row.get("thesis_id")
+            and str(row.get("thesis_id") or "") not in episode_theses
+        }
+    )
+
+    held = {position.ticker.upper() for position in Portfolio.load(Path(portfolio_path)).positions}
+    trim_cooldown_missing: list[str] = []
+    for event in events:
+        if str(event.get("event_type") or "").upper() != "TRIM":
+            continue
+        if str(event.get("source") or "").startswith("historical_"):
+            continue
+        ticker = str(event.get("ticker") or "").upper()
+        thesis_id = str(event.get("thesis_id") or "")
+        if ticker not in held or not thesis_id:
+            continue
+        thesis = journal.get_thesis(thesis_id) or {}
+        if str(thesis.get("status") or "") == "archived":
+            continue
+        if not thesis.get("sell_cooldown_until"):
+            trim_cooldown_missing.append(str(event.get("event_id") or ticker))
+
+    hard_failures = (
+        missing_effects + missing_events + missing_exit_tracking + trim_cooldown_missing
+    )
+    if hard_failures:
+        status = "FAIL"
+        message = (
+            f"Sell-fill contract is incomplete: {len(missing_effects)} missing effect(s), "
+            f"{len(missing_events)} missing event(s), {len(missing_exit_tracking)} missing "
+            f"post-sell tracker(s), {len(trim_cooldown_missing)} missing trim cooldown(s)."
+        )
+    elif missing_episodes:
+        status = "WARN"
+        message = f"Sell fills are accounted for, but {len(missing_episodes)} thesis episode(s) are missing."
+    else:
+        status = "PASS"
+        message = (
+            f"{len(sell_orders)} filled sell order(s) have durable effects/events; "
+            f"{len(episodes)} position episode(s) and {len(tracking)} post-sell tracker(s) are recorded."
+        )
+    return {
+        "name": "broker_fill_accounting",
+        "status": status,
+        "message": message,
+        "filled_sell_orders": len(sell_orders),
+        "fill_effects": len(effects),
+        "sell_events": len(events),
+        "position_episodes": len(episodes),
+        "post_sell_tracking": len(tracking),
+        "missing_effects": missing_effects[:20],
+        "missing_events": missing_events[:20],
+        "missing_exit_tracking": missing_exit_tracking[:20],
+        "missing_episodes": missing_episodes[:20],
+        "trim_cooldown_missing": trim_cooldown_missing[:20],
+    }
+
+
+def _check_position_classification(
+    *,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+) -> dict[str, Any]:
+    """Ensure held positions can participate in the intended sector gate."""
+    portfolio = Portfolio.load(Path(portfolio_path))
+    unknown = sorted(
+        position.ticker.upper()
+        for position in portfolio.positions
+        if not str(position.sector or "").strip()
+    )
+    sector_values: dict[str, float] = {}
+    invested = 0.0
+    for position in portfolio.positions:
+        market_value = float(
+            position.market_value
+            or (float(position.shares or 0.0) * float(position.current_price or position.avg_cost or 0.0))
+        )
+        invested += market_value
+        sector = str(position.sector or "unknown").strip() or "unknown"
+        sector_values[sector] = sector_values.get(sector, 0.0) + market_value
+    nav = portfolio.total_nav()
+    exposures = [
+        {
+            "sector": sector,
+            "market_value": round(value, 2),
+            "pct_nav": round(value / nav * 100.0, 2) if nav > 0 else 0.0,
+            "pct_invested": round(value / invested * 100.0, 2) if invested > 0 else 0.0,
+        }
+        for sector, value in sorted(
+            sector_values.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+    if unknown:
+        status = "FAIL"
+        message = (
+            f"{len(unknown)} held position(s) have no sector, so the concentration gate "
+            "cannot evaluate them."
+        )
+    elif portfolio.positions:
+        status = "PASS"
+        top = exposures[0] if exposures else {}
+        message = (
+            f"All {len(portfolio.positions)} held position(s) are classified. "
+            f"Largest sector is {top.get('sector')} at {top.get('pct_nav', 0):.1f}% NAV / "
+            f"{top.get('pct_invested', 0):.1f}% invested."
+        )
+    else:
+        status = "PASS"
+        message = "No held positions require sector classification."
+    return {
+        "name": "position_classification",
+        "status": status,
+        "message": message,
+        "positions": len(portfolio.positions),
+        "unknown_tickers": unknown,
+        "sector_exposures": exposures,
+    }
+
+
+def _check_execution_learning(
+    journal: DecisionJournal,
+    *,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+) -> dict[str, Any]:
+    """Expose balanced execution measurements without changing strategy."""
+    summary = build_execution_learning_summary(
+        journal,
+        portfolio_path=portfolio_path,
+    )
+    episodes = summary["episodes"]
+    quality = summary["data_quality"]
+    post_sell = summary["post_sell"]
+    if episodes["closed"] == 0:
+        status = "WARN"
+        message = "No completed position episodes are available for execution learning yet."
+    elif quality["missing_realized_pnl_events"]:
+        status = "WARN"
+        message = (
+            f"Execution learning has {quality['missing_realized_pnl_events']} sell event(s) "
+            "without realized P&L."
+        )
+    elif quality["uncertain_events"]:
+        status = "WARN"
+        message = (
+            f"Execution learning is provisional: {quality['uncertain_events']} of "
+            f"{summary['sell_events']['total']} sell event(s) have explicitly "
+            f"uncertain accounting ({quality['inferred_cost_events']} inferred-cost, "
+            f"{quality['quantity_conflict_events']} legacy quantity-conflict)."
+        )
+    elif post_sell["overdue_60d_reviews"]:
+        status = "WARN"
+        message = (
+            f"Post-sell learning has {post_sell['overdue_60d_reviews']} review(s) "
+            "more than five days past the 60-day checkpoint without a recorded price."
+        )
+    elif not post_sell["council_learning_ready"]:
+        status = "PASS"
+        next_due = post_sell.get("next_60d_due_date") or "none scheduled"
+        message = (
+            f"Sell accounting is operational across {episodes['closed']} completed episode(s). "
+            "Outcome-based Council learning is intentionally inactive: "
+            f"{post_sell['completed']}/{post_sell['minimum_completed_for_council']} "
+            f"completed 60-day post-sell reviews; next maturity={next_due}; do_not_adjust."
+        )
+    else:
+        status = "PASS"
+        expectancy = episodes["expectancy_dollars"]
+        expectancy_text = "unknown" if expectancy is None else f"${expectancy:+.2f}"
+        message = (
+            f"Execution learning covers {episodes['closed']} completed episode(s); "
+            f"episode win rate={episodes['win_rate_pct']:.1f}%, "
+            f"expectancy={expectancy_text}, sell events={summary['sell_events']['total']}, "
+            f"post-sell reviews={summary['post_sell']['total']}."
+        )
+    return {
+        "name": "execution_learning",
+        "status": status,
+        "message": message,
+        "observational_only": True,
+        "council_learning_ready": post_sell["council_learning_ready"],
+        "summary": summary,
+    }
+
+
 def _check_telegram(sender: TelegramSender) -> dict[str, Any]:
     if sender.enabled:
         return {"name": "telegram", "status": "PASS", "message": "Telegram is configured."}
@@ -1118,12 +1471,16 @@ def run_supervisor_check(
         operation_check,
         _timed_check("database", lambda: _check_database(journal)),
         _timed_check("decision_artifacts", lambda: _check_latest_decision_artifacts(journal)),
+        _timed_check("rank_coverage", _check_rank_coverage),
         _timed_check("latest_report", lambda: _check_latest_report_artifact(journal)),
         _timed_check("agentic_trace", lambda: _check_agentic_trace_artifact(journal)),
         _timed_check("intelligence_routing", lambda: _check_intelligence_routing(journal)),
         _timed_check("recent_sessions", lambda: _check_recent_sessions(journal)),
         _timed_check("defer_watchlist", lambda: _check_defer_watches(journal)),
         _timed_check("position_monitoring", lambda: _check_position_monitoring(journal)),
+        _timed_check("broker_fill_accounting", lambda: _check_broker_fill_accounting(journal)),
+        _timed_check("position_classification", lambda: _check_position_classification()),
+        _timed_check("execution_learning", lambda: _check_execution_learning(journal)),
         _timed_check("broker_reconciliation", lambda: _check_broker_reconciliation_snapshot()),
         _timed_check("calibration_diagnosis", lambda: _check_calibration_and_diagnosis(journal)),
         _timed_check("shadow_rules", lambda: _check_shadow_rules(journal)),

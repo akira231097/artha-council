@@ -1,7 +1,11 @@
 """Portfolio state engine for context injection and journaling.
 
-Loads manual portfolio JSON, computes compact portfolio metrics,
-and produces both prompt-ready text plus database snapshot payloads.
+``portfolio.json`` is Artha's derived operational cache for position-level sell
+metadata and offline reporting. A fresh Robinhood snapshot is authoritative for
+live shares, cash, and buying power; SQLite execution/event tables are
+authoritative for execution learning. This module computes compact portfolio
+metrics and prompt/database payloads without promoting the legacy transaction
+array to broker truth.
 """
 from __future__ import annotations
 
@@ -95,6 +99,8 @@ class PositionState:
 
     ticker: str
     asset_type: str
+    sector: str
+    industry: str
     shares: float
     avg_cost: float
     current_price: float
@@ -110,8 +116,10 @@ class PositionState:
 class PortfolioStateEngine:
     """Compute normalized portfolio state from manual JSON input."""
 
-    def __init__(self, portfolio_path: Path = PORTFOLIO_JSON_PATH) -> None:
-        self.portfolio_path = portfolio_path
+    def __init__(self, portfolio_path: Path | None = None) -> None:
+        # Resolve the default at construction time so tests and alternate
+        # deployments can safely substitute an isolated portfolio source.
+        self.portfolio_path = portfolio_path or PORTFOLIO_JSON_PATH
 
     @staticmethod
     def _now_iso() -> str:
@@ -189,6 +197,8 @@ class PortfolioStateEngine:
                 PositionState(
                     ticker=ticker,
                     asset_type=str(raw.get("asset_type", "stock")),
+                    sector=str(raw.get("sector") or "").strip(),
+                    industry=str(raw.get("industry") or "").strip(),
                     shares=shares,
                     avg_cost=avg_cost,
                     current_price=current_price,

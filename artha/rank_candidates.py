@@ -109,6 +109,13 @@ SCAN_SIGNALS_DIR: Path = Path(
     )
 )
 SCAN_SIGNALS_SCHEMA_VERSION = 1
+RANK_COVERAGE_DIR: Path = Path(
+    os.getenv(
+        "ARTHA_RANK_COVERAGE_DIR",
+        str(Path(__file__).resolve().parent.parent / "data" / "rank_coverage"),
+    )
+)
+RANK_COVERAGE_SCHEMA_VERSION = 1
 
 # Momentum score weights (legacy formula — kept for backward compatibility;
 # compute_momentum_score is still exercised by verify_data_layer.py).
@@ -397,6 +404,7 @@ def persist_scan_signals(
     regime_type: Optional[str] = None,
     overlays: Optional[list[str]] = None,
     universe_size: Optional[int] = None,
+    coverage_summary: Optional[dict] = None,
 ) -> Optional[str]:
     """Persist per-ticker scan-time signals to data/scan_signals/YYYY-MM-DD.json.
 
@@ -446,6 +454,7 @@ def persist_scan_signals(
             "regime_type": regime_type,
             "overlays": overlays or [],
             "universe_size": universe_size,
+            "coverage_summary": coverage_summary or {},
             "signals": {},
         }
         if path.exists():
@@ -455,7 +464,23 @@ def persist_scan_signals(
                     payload["signals"] = existing.get("signals", {}) or {}
                     payload["regime_type"] = regime_type or existing.get("regime_type")
                     payload["overlays"] = overlays or existing.get("overlays") or []
-                    payload["universe_size"] = universe_size or existing.get("universe_size")
+                    def _safe_int(value: object) -> int:
+                        try:
+                            return int(value or 0)
+                        except (TypeError, ValueError):
+                            return 0
+
+                    existing_size = _safe_int(existing.get("universe_size"))
+                    incoming_size = _safe_int(universe_size)
+                    payload["universe_size"] = max(existing_size, incoming_size) or None
+                    existing_coverage = existing.get("coverage_summary") or {}
+                    existing_coverage_size = _safe_int(existing_coverage.get("universe_size"))
+                    incoming_coverage_size = _safe_int((coverage_summary or {}).get("universe_size"))
+                    payload["coverage_summary"] = (
+                        coverage_summary
+                        if coverage_summary and incoming_coverage_size >= existing_coverage_size
+                        else existing_coverage
+                    )
             except Exception:
                 pass
         for symbol, row in signals_by_symbol.items():
@@ -486,6 +511,132 @@ def update_scan_signals(updates: dict[str, dict], scan_date: Optional[str] = Non
     """Merge per-ticker signal updates (e.g. deceleration flags, track changes)
     into today's scan-signals file. Convenience wrapper for the funnel."""
     return persist_scan_signals(updates, scan_date=scan_date)
+
+
+def persist_rank_coverage_audit(
+    *,
+    universe: list,
+    symbol_status: dict[str, str],
+    history_count: int,
+    signal_count: int,
+    ranked_count: int,
+    lottery_excluded_count: int,
+    regime_type: Optional[str],
+    overlays: Optional[list[str]],
+    elapsed_seconds: float,
+    timeout_seconds: int,
+) -> Optional[dict]:
+    """Persist one immutable, run-level ranking coverage audit.
+
+    Daily scan-signal files merge warm scans, full scans, and later point
+    updates. They cannot prove how much of one specific universe was actually
+    evaluated. This artifact records one status for every symbol in this run.
+    """
+    if not getattr(Config, "RANK_COVERAGE_AUDIT_ENABLED", True):
+        return None
+    try:
+        generated = datetime.now(UTC)
+        universe_size = len(universe)
+        history_pct = history_count / universe_size if universe_size else 0.0
+        signal_pct = signal_count / universe_size if universe_size else 0.0
+        required_pct = float(getattr(Config, "RANK_MIN_HISTORY_COVERAGE_PCT", 0.90) or 0.90)
+        status_counts: dict[str, int] = {}
+        rows: list[dict] = []
+        for candidate in universe:
+            symbol = str(getattr(candidate, "symbol", "") or "").upper()
+            status = symbol_status.get(symbol, "not_attempted")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "status": status,
+                    "market_cap": getattr(candidate, "market_cap", None),
+                    "sector": getattr(candidate, "sector", ""),
+                    "industry": getattr(candidate, "industry", ""),
+                }
+            )
+        summary = {
+            "status": "PASS" if history_pct >= required_pct else "WARN",
+            "universe_size": universe_size,
+            "history_count": history_count,
+            "history_coverage_pct": round(history_pct, 4),
+            "signal_count": signal_count,
+            "signal_coverage_pct": round(signal_pct, 4),
+            "ranked_count": ranked_count,
+            "lottery_excluded_count": lottery_excluded_count,
+            "minimum_history_coverage_pct": required_pct,
+            "elapsed_seconds": round(elapsed_seconds, 2),
+            "timeout_seconds": timeout_seconds,
+            "status_counts": status_counts,
+        }
+        payload = {
+            "schema_version": RANK_COVERAGE_SCHEMA_VERSION,
+            "generated_at": generated.isoformat(),
+            "regime_type": regime_type,
+            "overlays": overlays or [],
+            "summary": summary,
+            "symbols": rows,
+        }
+        out_dir = RANK_COVERAGE_DIR / generated.strftime("%Y-%m-%d")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"rank_{generated.strftime('%Y%m%d_%H%M%S_%f')}.json"
+        fd, tmp_path = tempfile.mkstemp(dir=str(out_dir), suffix=".tmp", prefix=".rank_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, default=str)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, out_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        logger.info(
+            "[rank] Coverage audit %s: histories=%d/%d (%.1f%%), signals=%d, artifact=%s",
+            summary["status"],
+            history_count,
+            universe_size,
+            history_pct * 100.0,
+            signal_count,
+            out_path,
+        )
+        return {**summary, "artifact_path": str(out_path)}
+    except Exception as exc:
+        logger.warning("[rank] Could not persist coverage audit: %s", exc)
+        return None
+
+
+def load_latest_rank_coverage_summary(max_age_hours: float = 2.0) -> Optional[dict]:
+    """Load the largest recent immutable coverage summary.
+
+    Warmups and diagnostics can run after the full scan with a much smaller
+    universe. Prefer coverage breadth first, then recency, so a 2-symbol probe
+    cannot overwrite the operator's view of a 1,900-symbol rank run.
+    """
+    now = datetime.now(UTC)
+    candidates: list[tuple[int, datetime, dict]] = []
+    for path in sorted(RANK_COVERAGE_DIR.glob("*/*.json"), reverse=True)[:100]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            generated = datetime.fromisoformat(str(payload.get("generated_at") or "").replace("Z", "+00:00"))
+            if generated.tzinfo is None:
+                generated = generated.replace(tzinfo=UTC)
+            age_hours = (now - generated).total_seconds() / 3600.0
+            if age_hours < 0 or age_hours > max_age_hours:
+                continue
+            summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else None
+            if not summary:
+                continue
+            universe_size = int(summary.get("universe_size") or 0)
+            if universe_size > 0:
+                candidates.append(
+                    (universe_size, generated, {**summary, "artifact_path": str(path)})
+                )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return max(candidates, key=lambda row: (row[0], row[1]))[2] if candidates else None
 
 
 def load_active_lottery_exclusions(as_of: Optional[datetime] = None) -> dict[str, str]:
@@ -547,6 +698,7 @@ def rank_universe(
     regime_type: Optional[str] = None,
     overlays: Optional[list[str]] = None,
     top_n: int = 50,
+    coverage_out: Optional[dict] = None,
 ) -> list[dict]:
     """Rank universe candidates by a z-scored composite of rulebook signals.
 
@@ -596,11 +748,85 @@ def rank_universe(
     # Batch download — ONE daily-bars fetch per symbol (Close + Volume together)
     prices: dict[str, "np.ndarray"] = {}
     volumes: dict[str, "np.ndarray"] = {}
+    symbol_status: dict[str, str] = {symbol: "not_attempted" for symbol in symbols}
+    started = time.monotonic()
+    last_elapsed = 0.0
+
+    def _elapsed() -> float:
+        nonlocal last_elapsed
+        try:
+            last_elapsed = max(last_elapsed, time.monotonic() - started)
+        except StopIteration:
+            # Unit tests may intentionally provide a finite monotonic clock.
+            # The audit should not consume an extra synthetic timestamp.
+            pass
+        return last_elapsed
+
+    def _download_chunk(chunk: list[str], timeout_seconds: int) -> None:
+        """Download and normalize one chunk, retaining per-symbol audit state."""
+        for symbol in chunk:
+            symbol_status[symbol] = "history_requested"
+        tickers_str = " ".join(chunk)
+        df = None
+        try:
+            df = yf.download(
+                tickers_str,
+                period="1y",
+                progress=False,
+                group_by="ticker",
+                threads=Config.YFINANCE_THREADS,
+                timeout=max(1, int(timeout_seconds)),
+            )
+            if df is None or df.empty:
+                for symbol in chunk:
+                    symbol_status[symbol] = "price_history_missing"
+                return
+
+            cols = df.columns
+            is_multi = getattr(cols, "nlevels", 1) == 2
+            for symbol in chunk:
+                try:
+                    series = None
+                    vol_series = None
+                    if is_multi:
+                        lv0 = set(cols.get_level_values(0))
+                        lv1 = set(cols.get_level_values(1))
+                        if symbol in lv0 and "Close" in lv1:
+                            series = df[(symbol, "Close")].dropna()
+                            if "Volume" in lv1 and (symbol, "Volume") in cols:
+                                vol_series = df[(symbol, "Volume")].reindex(series.index)
+                        elif "Close" in lv0 and symbol in lv1:
+                            series = df[("Close", symbol)].dropna()
+                            if "Volume" in lv0 and ("Volume", symbol) in cols:
+                                vol_series = df[("Volume", symbol)].reindex(series.index)
+                    else:
+                        series = df["Close"].dropna() if "Close" in df.columns else None
+                        if series is not None and "Volume" in df.columns:
+                            vol_series = df["Volume"].reindex(series.index)
+
+                    if series is not None and len(series) >= 10:
+                        prices[symbol] = series.values.astype(float)
+                        if vol_series is not None:
+                            volumes[symbol] = vol_series.fillna(0).values.astype(float)
+                        symbol_status[symbol] = "history_downloaded"
+                    else:
+                        symbol_status[symbol] = "price_history_missing"
+                except Exception:
+                    symbol_status[symbol] = "history_parse_failed"
+        except Exception as chunk_exc:
+            for symbol in chunk:
+                symbol_status[symbol] = "history_download_failed"
+            raise chunk_exc
+        finally:
+            if df is not None:
+                del df
+            YFinanceCollector.cleanup_caches()
+            gc.collect()
+
     try:
         batch_size = max(1, int(getattr(Config, "YFINANCE_BATCH_SIZE", 100) or 100))
-        started = time.monotonic()
         for i in range(0, len(symbols), batch_size):
-            elapsed = time.monotonic() - started
+            elapsed = _elapsed()
             if elapsed >= total_timeout:
                 logger.warning(
                     "[rank] yfinance ranking budget exhausted after %.1fs; ranked with %d/%d downloaded price histories (cap-bucket interleaved, so drops spread across cap buckets)",
@@ -610,51 +836,9 @@ def rank_universe(
                 )
                 break
             chunk = symbols[i: i + batch_size]
-            tickers_str = " ".join(chunk)
-            df = None
             try:
                 remaining_timeout = max(1, int(min(Config.YFINANCE_DOWNLOAD_TIMEOUT_SECONDS, total_timeout - elapsed)))
-                df = yf.download(
-                    tickers_str,
-                    period="1y",
-                    progress=False,
-                    group_by="ticker",
-                    threads=Config.YFINANCE_THREADS,
-                    timeout=remaining_timeout,
-                )
-
-                if df is None or df.empty:
-                    continue
-
-                cols = df.columns
-                is_multi = getattr(cols, "nlevels", 1) == 2
-
-                for sym in chunk:
-                    try:
-                        series = None
-                        vol_series = None
-                        if is_multi:
-                            lv0 = set(cols.get_level_values(0))
-                            lv1 = set(cols.get_level_values(1))
-                            if sym in lv0 and "Close" in lv1:
-                                series = df[(sym, "Close")].dropna()
-                                if "Volume" in lv1 and (sym, "Volume") in cols:
-                                    vol_series = df[(sym, "Volume")].reindex(series.index)
-                            elif "Close" in lv0 and sym in lv1:
-                                series = df[("Close", sym)].dropna()
-                                if "Volume" in lv0 and ("Volume", sym) in cols:
-                                    vol_series = df[("Volume", sym)].reindex(series.index)
-                        else:
-                            series = df["Close"].dropna() if "Close" in df.columns else None
-                            if series is not None and "Volume" in df.columns:
-                                vol_series = df["Volume"].reindex(series.index)
-
-                        if series is not None and len(series) >= 10:
-                            prices[sym] = series.values.astype(float)
-                            if vol_series is not None:
-                                volumes[sym] = vol_series.fillna(0).values.astype(float)
-                    except Exception:
-                        pass
+                _download_chunk(chunk, remaining_timeout)
             except Exception as chunk_e:
                 logger.warning(
                     "[rank] yfinance chunk failed for %d ticker(s) starting at %s: %s",
@@ -662,14 +846,39 @@ def rank_universe(
                     chunk[0] if chunk else "?",
                     chunk_e,
                 )
-            finally:
-                if df is not None:
-                    del df
-                YFinanceCollector.cleanup_caches()
-                gc.collect()
+
+        # Retry transiently missing histories in smaller chunks while the same
+        # hard wall-clock budget still has room. This does not hide provider
+        # failures; every final status remains in the run-level audit.
+        target_pct = float(getattr(Config, "RANK_MIN_HISTORY_COVERAGE_PCT", 0.90) or 0.90)
+        missing = [symbol for symbol in symbols if symbol not in prices]
+        if missing and len(prices) / len(symbols) < target_pct:
+            retry_size = max(10, min(50, batch_size // 2 or 10))
+            for i in range(0, len(missing), retry_size):
+                elapsed = _elapsed()
+                if elapsed >= total_timeout:
+                    break
+                chunk = missing[i: i + retry_size]
+                try:
+                    remaining_timeout = max(
+                        1,
+                        int(min(Config.YFINANCE_DOWNLOAD_TIMEOUT_SECONDS, total_timeout - elapsed)),
+                    )
+                    _download_chunk(chunk, remaining_timeout)
+                except Exception as retry_exc:
+                    logger.info(
+                        "[rank] Retry chunk failed for %d ticker(s) starting at %s: %s",
+                        len(chunk),
+                        chunk[0] if chunk else "?",
+                        retry_exc,
+                    )
 
     except Exception as e:
         logger.error(f"[rank] yfinance batch download failed: {e}")
+
+    for symbol in symbols:
+        if symbol_status.get(symbol) in {"not_attempted", "history_requested"}:
+            symbol_status[symbol] = "ranking_budget_exhausted"
 
     logger.info(f"[rank] Got price data for {len(prices)}/{len(symbols)} tickers")
 
@@ -681,18 +890,37 @@ def rank_universe(
     for sym, price_arr in prices.items():
         candidate = candidate_map.get(sym)
         if not candidate:
+            symbol_status[sym] = "universe_mapping_missing"
             continue
         try:
             row = compute_signal_row(price_arr, volumes.get(sym))
         except Exception as sig_e:
             logger.debug("[rank] Signal computation failed for %s: %s", sym, sig_e)
+            symbol_status[sym] = "signal_computation_failed"
             continue
         row["symbol"] = sym
         row["_candidate"] = candidate
         rows.append(row)
+        symbol_status[sym] = "signal_ready"
 
     if not rows:
         logger.warning("[rank] No signal rows computed — nothing to rank")
+        coverage_summary = persist_rank_coverage_audit(
+            universe=universe,
+            symbol_status=symbol_status,
+            history_count=len(prices),
+            signal_count=0,
+            ranked_count=0,
+            lottery_excluded_count=0,
+            regime_type=regime_type,
+            overlays=overlays,
+            elapsed_seconds=_elapsed(),
+            timeout_seconds=total_timeout,
+        )
+        if coverage_out is not None:
+            coverage_out.clear()
+            if coverage_summary:
+                coverage_out.update(coverage_summary)
         return []
 
     # --- Cross-sectional z-scores ---
@@ -723,6 +951,26 @@ def rank_universe(
     z_consistency = _zscore(consistency_raw)
     z_template = _zscore(_col("trend_template"))
     z_regime = _zscore(np.asarray([float(r["_candidate"].regime_score) for r in rows]))
+
+    # Shadow-only industry momentum. The value is persisted and outcome-tested
+    # but deliberately excluded from the live composite until governance says
+    # enough point-in-time observations have accumulated.
+    industry_values: dict[str, list[float]] = {}
+    for row in rows:
+        industry = str(getattr(row["_candidate"], "industry", "") or "unknown")
+        value = row.get("ret_12_1")
+        if value is not None:
+            industry_values.setdefault(industry, []).append(float(value))
+    industry_medians = {
+        industry: float(np.median(values))
+        for industry, values in industry_values.items()
+        if values
+    }
+    industry_raw = np.asarray(
+        [industry_medians.get(str(getattr(row["_candidate"], "industry", "") or "unknown"), np.nan) for row in rows],
+        dtype=float,
+    )
+    z_industry_shadow = _zscore(industry_raw)
 
     # --- Lottery exclusion (MAX effect): top decile of MAX5, exclude 30 days ---
     max5 = _col("max5_avg_1m")
@@ -763,6 +1011,15 @@ def rank_universe(
         prior_until = prior_exclusions.get(sym)
         lottery_excluded = lottery_flag or prior_until is not None
         track = _assign_track(row, regime_score, momentum_z)
+        industry = str(getattr(candidate, "industry", "") or "unknown")
+        industry_shadow = {
+            "enabled": bool(getattr(Config, "ALPHA_SHADOW_SIGNALS_ENABLED", True)),
+            "industry": industry,
+            "peer_count": len(industry_values.get(industry) or []),
+            "median_ret_12_1": round(industry_medians[industry], 2) if industry in industry_medians else None,
+            "z_score": round(float(z_industry_shadow[idx]), 4),
+            "live_score_impact": 0.0,
+        }
 
         entry = {
             "symbol": sym,
@@ -796,6 +1053,7 @@ def rank_universe(
             "extension_flag": row.get("extension_flag"),
             "ret_recent_1m": row.get("ret_recent_1m"),
             "track": track,
+            "industry_momentum_shadow": industry_shadow,
         }
 
         signals_payload[sym] = {
@@ -819,9 +1077,11 @@ def rank_universe(
             "regime_score": round(regime_score, 2),
             "vol_20d": row.get("vol_20d"),
             "price": round(row["price"], 2),
+            "industry_momentum_shadow": industry_shadow,
         }
 
         if lottery_excluded:
+            symbol_status[sym] = "lottery_excluded"
             excluded_count += 1
             logger.info(
                 "[rank] Lottery exclusion (MAX effect): %s max5_avg=%.2f%% excluded until %s",
@@ -831,6 +1091,7 @@ def rank_universe(
             )
             continue
 
+        symbol_status[sym] = "ranked"
         ranked.append(entry)
 
     # Sort by combined score descending; assign composite percentiles
@@ -843,12 +1104,29 @@ def rank_universe(
         if payload_row is not None:
             payload_row["composite_percentile"] = percentile
 
+    coverage_summary = persist_rank_coverage_audit(
+        universe=universe,
+        symbol_status=symbol_status,
+        history_count=len(prices),
+        signal_count=len(rows),
+        ranked_count=len(ranked),
+        lottery_excluded_count=excluded_count,
+        regime_type=regime_type,
+        overlays=overlays,
+        elapsed_seconds=_elapsed(),
+        timeout_seconds=total_timeout,
+    )
+    if coverage_out is not None:
+        coverage_out.clear()
+        if coverage_summary:
+            coverage_out.update(coverage_summary)
     persist_scan_signals(
         signals_payload,
         scan_date=scan_date,
         regime_type=regime_type,
         overlays=overlays,
         universe_size=len(universe),
+        coverage_summary=coverage_summary,
     )
 
     top = ranked[:top_n]

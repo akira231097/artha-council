@@ -88,10 +88,14 @@ sell review, reconciliation, health checks, and alerts continue running.
 - `artha/opportunity_scout.py` - agentic pre-Council evidence review and ranking.
 - `artha/council.py` - analyst roles, score audit, and CIO synthesis.
 - `artha/execution_officer.py` - Stage A and Stage B execution reasoning.
+- `artha/alpha_shadow.py` - non-authoritative alpha experiments and outcome tracking.
 - `artha/broker_capacity.py` - portfolio and daily buy-capacity calculations.
 - `artha/stand_down.py` - buy-only pause and next-session reset behavior.
 - `artha/sell_engine.py` - position triggers and sell-side orchestration.
 - `artha/sell_council.py` - hold, trim, and exit review.
+- `artha/position_classification.py` - broker-position sector and industry repair.
+- `artha/execution_learning.py` - post-trade execution-quality measurements.
+- `artha/fill_finalizer.py` - broker-fill accounting and idempotent state finalization.
 - `artha/robinhood_bridge.py` - broker handoff, review, clearance, and reconciliation.
 - `artha/scheduler.py` - scheduled scans and lifecycle orchestration.
 - `artha/supervisor.py` - production health and readiness checks.
@@ -129,6 +133,7 @@ python run.py supervise
 ```bash
 python -m compileall -q artha dashboard run.py
 python -m artha.test_enhancements
+python -m artha.test_alpha_pipeline_hardening
 python -m artha.test_production_hardening
 ```
 

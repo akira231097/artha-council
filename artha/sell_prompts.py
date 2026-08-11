@@ -160,7 +160,11 @@ After your analysis, assign a FUNDAMENTAL SELL SCORE from 0-100:
 [1-2 sentences: what should happen to this position and why]
 """
 
-SELL_CONDITION_REVIEW_FORMAT = """For each invalidation condition, state: INTACT / THREATENED / TRIGGERED
+SELL_CONDITION_REVIEW_FORMAT = """For each [INVALIDATE] condition, state: INTACT / THREATENED / TRIGGERED.
+For each [REVIEW] checkpoint, state: NOT_DUE / DUE / COMPLETED. A due review
+checkpoint is not a broken thesis; decide from current business and market evidence.
+For each [QUALITATIVE] condition, require current fundamental evidence before
+calling it triggered; wording or elapsed time alone is not proof of failure.
 - [Condition 1]: [STATUS] — [Evidence from data]
 - [Condition 2]: [STATUS] — [Evidence from data]"""
 
@@ -322,6 +326,14 @@ sell-side analyst reports for {ticker} ({position_type} position).
 
 ---
 
+## SELL-OUTCOME CALIBRATION
+{sell_learning_context}
+
+This historical context is advisory only. Never use it to override current
+filings, live market evidence, thesis conditions, or deterministic safety rules.
+
+---
+
 ## YOUR TASK: SELL SCORE COMPUTATION
 
 Calculate the final sell score (0-100) by combining the three analyst components with these weights:
@@ -439,12 +451,29 @@ adjustments are rejected by code.
 """
 
 
+def format_sell_condition(condition) -> str:
+    """Render machine conditions in unambiguous language for Sell Council."""
+    if not isinstance(condition, dict):
+        return f"[QUALITATIVE] {condition}"
+    from .thesis_tracker import condition_effect
+
+    effect = condition_effect(condition).upper()
+    metric = str(condition.get("metric") or "unknown")
+    op = str(condition.get("op") or "?")
+    value = condition.get("value")
+    description = str(condition.get("description") or "").strip()
+    rule = f"{metric} {op} {value}"
+    return f"[{effect}] {rule}" + (f" — {description}" if description else "")
+
+
 def build_sell_context(
     thesis: Any,
     stock_data: dict,
     current_regime: str = "unknown",
 ) -> str:
     """Build the shared context header for all sell-side analysts."""
+    from typing import Any as _Any
+
     ticker = thesis.ticker if hasattr(thesis, "ticker") else str(thesis.get("ticker", "?"))
     position_type = thesis.position_type if hasattr(thesis, "position_type") else str(thesis.get("position_type", "BUY"))
     entry_price = float(thesis.entry_price or 0) if hasattr(thesis, "entry_price") else float(thesis.get("entry_price") or 0)
@@ -490,7 +519,9 @@ def build_sell_context(
             invalidation_conds = _j.loads(str(invalidation_conds))
         except Exception:
             invalidation_conds = []
-    conditions_str = "\n".join(f"• {c}" for c in invalidation_conds) if invalidation_conds else "(none recorded)"
+    conditions_str = "\n".join(
+        f"• {format_sell_condition(c)}" for c in invalidation_conds
+    ) if invalidation_conds else "(none recorded)"
 
     health_score = getattr(thesis, "thesis_health_score", 100) or 100
     entry_regime = getattr(thesis, "entry_regime", "unknown") or "unknown"
@@ -571,7 +602,9 @@ def build_blind_sell_context(
             invalidation_conds = _j.loads(str(invalidation_conds))
         except Exception:
             invalidation_conds = []
-    conditions_str = "\n".join(f"• {c}" for c in invalidation_conds) if invalidation_conds else "(none recorded)"
+    conditions_str = "\n".join(
+        f"• {format_sell_condition(c)}" for c in invalidation_conds
+    ) if invalidation_conds else "(none recorded)"
 
     return SELL_BLIND_CONTEXT_HEADER.format(
         ticker=ticker,
@@ -593,6 +626,7 @@ def build_sell_synthesis_prompt(
     technical_report: str,
     contrarian_report: str,
     sell_score_adjustments: str = "",
+    sell_learning_context: str = "SELL-OUTCOME CALIBRATION: unavailable; do not adjust.",
 ) -> str:
     """Build the CIO synthesis prompt with position-type-specific thresholds."""
     from .config import Config
@@ -635,6 +669,7 @@ def build_sell_synthesis_prompt(
         fundamental_report=fundamental_report[:3000],
         technical_report=technical_report[:2000],
         contrarian_report=contrarian_report[:2000],
+        sell_learning_context=sell_learning_context[:1800],
         score_adjustments=adjustments_text,
         hold_max=hold_max,
         trim_min=trim_min,
