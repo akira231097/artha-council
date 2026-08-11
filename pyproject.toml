@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "artha-council"
+version = "1.3.0"
+description = "Auditable multi-agent equity research and portfolio automation with an MCP interface"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [
+  { name = "Sarath", email = "akira231097@users.noreply.github.com" },
+]
+keywords = ["mcp", "investing", "portfolio", "agents", "market-data"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+  "anthropic>=0.42.0",
+  "google-generativeai>=0.8.0",
+  "httpx>=0.28.1",
+  "mcp==2.0.0",
+  "pandas>=2.2.0",
+  "platformdirs>=4.0.0",
+  "PyJWT[crypto]>=2.10.1",
+  "python-dotenv>=1.2.2",
+  "requests>=2.34.2",
+  "yfinance>=0.2.36",
+]
+
+[project.urls]
+Homepage = "https://github.com/akira231097/artha-council"
+Documentation = "https://github.com/akira231097/artha-council/tree/main/docs"
+Issues = "https://github.com/akira231097/artha-council/issues"
+Source = "https://github.com/akira231097/artha-council"
+
+[project.scripts]
+artha-mcp = "artha_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["artha*", "artha_mcp*"]
+
+[tool.setuptools]
+py-modules = ["run"]
+
+[tool.setuptools.data-files]
+"share/artha-council" = ["package.json", "package-lock.json"]
+"share/artha-council/scripts" = [
+  "scripts/robinhood_auto_trade_runner.mjs",
+  "scripts/robinhood_manual_review_runner.mjs",
+  "scripts/robinhood_snapshot_sync.mjs",
+]

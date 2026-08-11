@@ -10,10 +10,10 @@ from typing import Any
 
 from .dossier import extract_decision_feature_row
 from .journal import DecisionJournal
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DOSSIER_DIR = DATA_DIR / "decision_dossiers"
 
 

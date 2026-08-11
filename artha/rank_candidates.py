@@ -34,6 +34,7 @@ from typing import Optional
 
 from .config import Config
 from .collector import YFinanceCollector
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -105,14 +106,14 @@ def _rank_total_budget_seconds() -> int:
 SCAN_SIGNALS_DIR: Path = Path(
     os.getenv(
         "ARTHA_SCAN_SIGNALS_DIR",
-        str(Path(__file__).resolve().parent.parent / "data" / "scan_signals"),
+        str(DATA_DIR / "scan_signals"),
     )
 )
 SCAN_SIGNALS_SCHEMA_VERSION = 1
 RANK_COVERAGE_DIR: Path = Path(
     os.getenv(
         "ARTHA_RANK_COVERAGE_DIR",
-        str(Path(__file__).resolve().parent.parent / "data" / "rank_coverage"),
+        str(DATA_DIR / "rank_coverage"),
     )
 )
 RANK_COVERAGE_SCHEMA_VERSION = 1

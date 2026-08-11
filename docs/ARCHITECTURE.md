@@ -128,6 +128,25 @@ Calibration and shadow rules can observe outcomes, but they cannot silently alte
 live investing rules.
 
 Runtime artifacts are private state and are excluded from this repository.
+Runtime paths are centralized in `artha.paths`: a source checkout keeps the
+historical repository-local `data/` tree, while an installed wheel uses the
+operating system's per-user application-data directory. `ARTHA_DATA_DIR`
+provides one explicit persistent-volume override shared by core Artha and all
+MCP-launched workflows.
+
+## 10. MCP Boundary
+
+`artha_mcp/` is an interface over these services, not a second investment
+engine. It exposes bounded tools, resources, prompts, and persisted workflow
+handles. Local stdio is read-only by default; remote Streamable HTTP requires
+OAuth when bound beyond loopback.
+
+Direct broker adapters use immutable preview receipts and a separate local
+SQLite execution journal. Robinhood remains behind its deterministic snapshot
+and OpenClaw-owned MCP review/place bridge. Upstox and Zerodha implement Indian
+cash-equity account, portfolio, quote, preview, order, and reconciliation
+boundaries. The US-native Council is blocked in India mode so market portability
+cannot silently corrupt research assumptions.
 
 ## Trust Boundaries
 

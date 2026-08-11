@@ -17,6 +17,7 @@ import requests
 import yfinance as yf
 
 from .config import Config
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,7 @@ def _retry_wait_seconds(resp: requests.Response | None, attempt: int) -> float:
     return min(30.0, Config.FMP_429_BACKOFF_SECONDS * (2 ** attempt))
 
 
-_AUTH_ALERT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "auth_alert_state.json"
+_AUTH_ALERT_STATE_FILE = DATA_DIR / "auth_alert_state.json"
 
 
 def _alert_auth_failure(source: str, status_code, url: str) -> None:

@@ -15,8 +15,9 @@ from pathlib import Path
 from .council import CouncilDecision
 from .portfolio import Position
 from .config import Config
+from .paths import DATA_DIR
 
-_PORTFOLIO_JSON = Path(__file__).resolve().parent.parent / "data" / "portfolio.json"
+_PORTFOLIO_JSON = DATA_DIR / "portfolio.json"
 
 
 def _get_held_tickers() -> set[str]:

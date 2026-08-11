@@ -15,6 +15,7 @@ from typing import Any, Optional
 from .collector import DataCollector, get_fear_greed_index
 from .config import Config
 from .portfolio import Decimal, PORTFOLIO_FILE, Portfolio, _to_decimal
+from .paths import DATA_DIR
 from .sentinel import NewsSentinel
 from .crisis import CrisisState, CrisisStateManager, CrisisFingerprint
 
@@ -25,7 +26,7 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-ALERT_HISTORY_FILE = Path(__file__).resolve().parent.parent / "data" / "alert_history.json"
+ALERT_HISTORY_FILE = DATA_DIR / "alert_history.json"
 NEWS_TRIGGER_WORDS = (
     "lawsuit",
     "recall",

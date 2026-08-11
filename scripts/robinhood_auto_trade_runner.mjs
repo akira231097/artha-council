@@ -10,11 +10,13 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
-const DEFAULT_PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const SNAPSHOT_SCRIPT = path.join(SCRIPT_DIR, "robinhood_snapshot_sync.mjs");
+const DEFAULT_PROJECT_DIR = path.resolve(SCRIPT_DIR, "..");
 const DEFAULT_STATE_DIR = path.join(os.homedir(), ".openclaw");
 const DEFAULT_TMP_DIR = process.env.ARTHA_OPENCLAW_TMP_DIR || path.join(DEFAULT_STATE_DIR, "workspace", "tmp");
 const DEFAULT_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const DEFAULT_LOCK_FILE = "/tmp/artha-robinhood-auto-trade.lock";
+const DEFAULT_LOCK_FILE = path.join(os.tmpdir(), "artha-robinhood-auto-trade.lock");
 const DEFAULT_TIMEOUT_MS = 120000;
 
 function parseArgs(argv) {
@@ -33,6 +35,7 @@ function parseArgs(argv) {
     mcpUrl: null,
     accountNumber: null,
     accountSuffix: null,
+    python: null,
     quiet: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -55,6 +58,7 @@ function parseArgs(argv) {
     else if (arg === "--mcp-url") args.mcpUrl = next();
     else if (arg === "--account-number") args.accountNumber = next();
     else if (arg === "--account-suffix") args.accountSuffix = next();
+    else if (arg === "--python") args.python = next();
     else if (arg === "--market-hours-only") args.marketHoursOnly = true;
     else if (arg === "--quiet") args.quiet = true;
     else if (arg === "--help" || arg === "-h") {
@@ -68,7 +72,7 @@ function parseArgs(argv) {
   args.stateDir = path.resolve(expandHome(args.stateDir));
   args.openclawConfig = path.resolve(expandHome(args.openclawConfig));
   args.tmpDir = path.resolve(expandHome(args.tmpDir));
-  args.python = path.join(args.projectDir, ".venv", "bin", "python");
+  args.python = args.python || defaultPython(args.projectDir);
   return args;
 }
 
@@ -93,6 +97,15 @@ function expandHome(value) {
   return value;
 }
 
+function defaultPython(projectDir) {
+  if (process.env.ARTHA_PYTHON) return process.env.ARTHA_PYTHON;
+  const unixPython = path.join(projectDir, ".venv", "bin", "python");
+  const windowsPython = path.join(projectDir, ".venv", "Scripts", "python.exe");
+  if (fs.existsSync(unixPython)) return unixPython;
+  if (fs.existsSync(windowsPython)) return windowsPython;
+  return process.platform === "win32" ? "python" : "python3";
+}
+
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
@@ -100,7 +113,10 @@ function readJson(file) {
 function atomicWriteJson(file, payload) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   fs.renameSync(tmp, file);
 }
 
@@ -128,7 +144,10 @@ function resolveConfig(args) {
   const server = openclaw?.mcp?.servers?.["robinhood-trading"] || {};
   const mcpUrl = args.mcpUrl || server.url || "https://agent.robinhood.com/mcp/trading";
   const accountNumber = args.accountNumber || process.env.ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER || env.ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER || "";
-  const accountSuffix = args.accountSuffix || (accountNumber ? accountNumber.slice(-4) : "0195");
+  const accountSuffix = args.accountSuffix || (accountNumber ? accountNumber.slice(-4) : "");
+  if (!accountNumber && !accountSuffix) {
+    throw new Error("Configure ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER or pass --account-suffix; account selection is never guessed.");
+  }
   const oauthFile = args.oauthFile || findOauthFile(args.stateDir);
   return { mcpUrl, accountNumber, accountSuffix, oauthFile };
 }
@@ -308,19 +327,19 @@ function parseJsonOutput(proc, label) {
 }
 
 async function runArtha(args, commandArgs, options = {}) {
-  const proc = await runProcess(args.python, ["run.py", ...commandArgs], {
+  const proc = await runProcess(args.python, ["-m", "run", ...commandArgs], {
     cwd: args.projectDir,
     timeoutMs: options.timeoutMs || 180000,
   });
-  const parsed = parseJsonOutput(proc, `run.py ${commandArgs.join(" ")}`);
+  const parsed = parseJsonOutput(proc, `python -m run ${commandArgs.join(" ")}`);
   if (options.requireZero !== false && proc.code !== 0) {
-    throw new Error(`run.py ${commandArgs.join(" ")} failed rc=${proc.code} stdout=${proc.stdout.slice(0, 1200)} stderr=${proc.stderr.slice(0, 1000)}`);
+    throw new Error(`python -m run ${commandArgs.join(" ")} failed rc=${proc.code} stdout=${proc.stdout.slice(0, 1200)} stderr=${proc.stderr.slice(0, 1000)}`);
   }
   return { proc, parsed };
 }
 
 async function runSnapshotSync(args) {
-  const proc = await runProcess("/opt/homebrew/bin/node", ["scripts/robinhood_snapshot_sync.mjs", "--market-hours-only", "--quiet"], {
+  const proc = await runProcess(process.execPath, [SNAPSHOT_SCRIPT, "--project-dir", args.projectDir, "--python", args.python, "--market-hours-only", "--quiet"], {
     cwd: args.projectDir,
     timeoutMs: 180000,
   });

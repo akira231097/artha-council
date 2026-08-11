@@ -12,9 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .paths import DATA_DIR
+
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "artha.db"
+DB_PATH = DATA_DIR / "artha.db"
 
 
 class DecisionJournal:

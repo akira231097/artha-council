@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 from .config import Config
 from .journal import DecisionJournal
+from .paths import DATA_DIR
 from .thesis_tracker import (
     ThesisTracker,
     PositionThesis,
@@ -912,7 +913,7 @@ class SellEngine:
         from pathlib import Path
 
         history_path = (
-            Path(__file__).resolve().parent.parent / "data" / "fy1_consensus_history.json"
+            DATA_DIR / "fy1_consensus_history.json"
         )
         try:
             history = {}
@@ -1044,9 +1045,7 @@ class SellEngine:
             from .regime import RegimePacket
             # Load latest regime from journal or a cached state — this is best-effort
             # The full regime council is expensive; we check the entry regime vs stored state
-            regime_state_path = __import__("pathlib").Path(
-                __file__
-            ).resolve().parent.parent / "data" / "regime_state.json"
+            regime_state_path = DATA_DIR / "regime_state.json"
             if not regime_state_path.exists():
                 return signals
 

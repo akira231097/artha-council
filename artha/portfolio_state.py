@@ -17,15 +17,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .paths import DATA_DIR
+
 logger = logging.getLogger(__name__)
 
-PORTFOLIO_JSON_PATH = Path(__file__).resolve().parent.parent / "data" / "portfolio.json"
+PORTFOLIO_JSON_PATH = DATA_DIR / "portfolio.json"
 
 # --- Broker cash reconciliation tunables (env-overridable; Wave 2 consolidates into Config) ---
 BROKER_SNAPSHOT_PATH = Path(
     os.getenv(
         "ARTHA_BROKER_SNAPSHOT_PATH",
-        str(Path(__file__).resolve().parent.parent / "data" / "robinhood" / "latest_snapshot.json"),
+        str(DATA_DIR / "robinhood" / "latest_snapshot.json"),
     )
 )
 # Snapshot older than this is considered stale and ignored (fall back to portfolio.json cash).

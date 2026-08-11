@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -689,7 +690,7 @@ def _write_trace(result: AgenticDiligenceResult) -> str:
     try:
         date = datetime.now(UTC).strftime("%Y-%m-%d")
         stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        trace_dir = Path(__file__).resolve().parent.parent / "data" / "agentic_traces" / date
+        trace_dir = DATA_DIR / "agentic_traces" / date
         trace_dir.mkdir(parents=True, exist_ok=True)
         path = trace_dir / f"{result.ticker}_{stamp}.json"
         tmp = path.with_suffix(".tmp")

@@ -48,6 +48,20 @@ The checked-in configuration is intentionally incapable of live trading:
 Do not weaken fail-closed behavior. Missing, stale, malformed, or contradictory
 broker evidence must block placement.
 
+## MCP Deployments
+
+- Keep stdio local unless a remote deployment is required.
+- Terminate remote HTTP with TLS and configure issuer-, audience-, and
+  resource-bound OAuth/JWKS validation.
+- Treat `artha:trade` as a privileged money-moving scope.
+- Keep local access mode, operations flag, trading flag, limits, and kill switch
+  as the final permission ceiling; remote scopes must never widen it.
+- Supply credentials through the process environment or a secret manager, never
+  in MCP tool arguments, prompts, repository files, or container layers.
+- Pin OCI releases by version or digest for live deployments.
+- Audit custom broker and research plugins as trusted in-process code.
+- Reconcile any `UNKNOWN` placement at the broker before retrying.
+
 ## Dependency and Supply-Chain Controls
 
 The repository uses pinned GitHub Actions, Dependabot, dependency review, CodeQL,

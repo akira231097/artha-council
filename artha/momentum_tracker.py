@@ -10,9 +10,9 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from .paths import DATA_DIR
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+logger = logging.getLogger(__name__)
 
 _ACCEL_THRESHOLD = 2.0   # minimum delta to be considered "accelerating"
 _DECEL_THRESHOLD = -2.0  # maximum delta to be considered "decelerating"

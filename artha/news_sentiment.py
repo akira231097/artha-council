@@ -40,10 +40,11 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 from .config import Config
 from .gemini_client import gemini_generate
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "news_sentiment"
+_DATA_DIR = DATA_DIR / "news_sentiment"
 _LOCK_PATH = _DATA_DIR / ".news_sentiment.lock"
 
 _VALID_LABELS = {"GOOD", "BAD", "UNKNOWN"}

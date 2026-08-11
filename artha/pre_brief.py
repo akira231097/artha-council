@@ -10,9 +10,9 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from .paths import DATA_DIR
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+logger = logging.getLogger(__name__)
 
 _SEVERITY_ICONS = {
     "CRITICAL": "🚨",

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import Config
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def _recent_scan_penalties(limit: int = 5) -> dict[str, float]:
     """
     penalties: dict[str, float] = {}
     try:
-        db_path = Path(__file__).resolve().parent.parent / "data" / "artha.db"
+        db_path = DATA_DIR / "artha.db"
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()

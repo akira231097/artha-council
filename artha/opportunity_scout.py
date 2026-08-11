@@ -17,6 +17,7 @@ from typing import Any
 
 from .chatgpt_backend import ChatGPTBackendClient
 from .config import Config
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,7 @@ class OpportunityScoutResult:
         }
 
     def save_artifact(self, root: Path | None = None) -> str:
-        base = root or (Path(__file__).resolve().parent.parent / "data" / "opportunity_scout")
+        base = root or (DATA_DIR / "opportunity_scout")
         day = self.created_at[:10]
         out_dir = base / day
         out_dir.mkdir(parents=True, exist_ok=True)

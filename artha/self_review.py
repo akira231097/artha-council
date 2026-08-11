@@ -28,12 +28,13 @@ import yfinance as yf
 from .accuracy import AccuracyTracker
 from .config import Config
 from .monitor import ALERT_HISTORY_FILE
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-LEARNINGS_DIR = Path(__file__).resolve().parent.parent / "data" / "learnings"
+LEARNINGS_DIR = DATA_DIR / "learnings"
 LESSONS_FILE = LEARNINGS_DIR / "lessons.json"
-REVIEW_LOG = Path(__file__).resolve().parent.parent / "data" / "review_log.json"
+REVIEW_LOG = DATA_DIR / "review_log.json"
 
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)

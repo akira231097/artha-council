@@ -10,6 +10,9 @@ import json
 import logging
 import re
 import secrets
+import shlex
+import sys
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +31,7 @@ from .portfolio import PORTFOLIO_FILE, Portfolio, Position
 from .position_classification import attach_position_classification
 from .portfolio_risk import evaluate_projected_sector_limit
 from .portfolio_state import PortfolioStateEngine
+from .paths import DATA_DIR
 from .stand_down import (
     buying_paused,
     control_file_lock,
@@ -543,8 +547,8 @@ def _position_already_reflects_fill(
     return shares >= quantity - 0.000001
 
 
-EXTERNAL_SELL_TRACKER_FILE = Path(__file__).resolve().parent.parent / "data" / "robinhood" / "external_sell_tracker.json"
-CONTRIBUTIONS_FILE = Path(__file__).resolve().parent.parent / "data" / "contributions.jsonl"
+EXTERNAL_SELL_TRACKER_FILE = DATA_DIR / "robinhood" / "external_sell_tracker.json"
+CONTRIBUTIONS_FILE = DATA_DIR / "contributions.jsonl"
 TRANSFER_DETECT_THRESHOLD = 10.0
 EXTERNAL_SELL_CONFIRMATIONS = 3
 TRANSFER_ORDER_EFFECT_LOOKBACK = timedelta(hours=36)
@@ -760,7 +764,7 @@ def sync_snapshot_to_artha(
     # tracker, Telegram) only run against the production portfolio — or when a
     # test has explicitly redirected the module target files elsewhere.
     _default_targets = (
-        CONTRIBUTIONS_FILE == Path(__file__).resolve().parent.parent / "data" / "contributions.jsonl"
+        CONTRIBUTIONS_FILE == DATA_DIR / "contributions.jsonl"
     )
     side_effects_allowed = (Path(portfolio_path).resolve() == Path(PORTFOLIO_FILE).resolve()) or not _default_targets
 
@@ -1118,22 +1122,30 @@ def build_trade_action_notice(action: dict[str, Any]) -> str:
 
 def build_snapshot_refresh_operation() -> dict[str, Any]:
     """Return the exact read-only MCP sequence OpenClaw should run for a fresh snapshot."""
+    account_number = str(Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER or "").strip()
+    if not account_number:
+        return {
+            "success": False,
+            "operation": "blocked",
+            "reason": "ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER is not configured; account selection is never guessed.",
+        }
     tmp_dir = Path(Config.OPENCLAW_TMP_DIR).expanduser()
     handoff_path = str(tmp_dir / "artha_robinhood_snapshot.json")
-    lock_file = "/tmp/artha-robinhood-snapshot-sync.lock"
+    lock_file = str(Path(tempfile.gettempdir()) / "artha-robinhood-snapshot-sync.lock")
+    run_command = f"{shlex.quote(sys.executable)} -m run"
     return {
         "success": True,
         "operation": "refresh_robinhood_snapshot",
         "account_selector": {
             "agentic_allowed": True,
-            "account_number_suffix": Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER[-4:],
-            "account_number_masked": mask_account_number(Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER),
+            "account_number_suffix": account_number[-4:],
+            "account_number_masked": mask_account_number(account_number),
         },
         "mcp_sequence": [
             {"tool": "get_accounts", "args": {}},
-            {"tool": "get_portfolio", "args": {"account_number": Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}},
-            {"tool": "get_equity_positions", "args": {"account_number": Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}},
-            {"tool": "get_equity_orders", "args": {"account_number": Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}},
+            {"tool": "get_portfolio", "args": {"account_number": account_number}},
+            {"tool": "get_equity_positions", "args": {"account_number": account_number}},
+            {"tool": "get_equity_orders", "args": {"account_number": account_number}},
         ],
         "handoff_path": handoff_path,
         "handoff_write": {
@@ -1142,7 +1154,7 @@ def build_snapshot_refresh_operation() -> dict[str, Any]:
         },
         "handoff_required_fields": ["run_id", "generated_at", "source", "account", "accounts", "portfolio", "positions", "orders"],
         "import_command": (
-            "python run.py robinhood-snapshot-import --strict "
+            f"{run_command} robinhood-snapshot-import --strict "
             f"--lock-file {lock_file} "
             "--expect-run-id <RUN_ID> --min-generated-at <SYNC_STARTED_AT> "
             f"--file {handoff_path} --control-center"
@@ -1163,7 +1175,14 @@ def build_snapshot_refresh_operation() -> dict[str, Any]:
 
 def build_auto_buy_runner_operation() -> dict[str, Any]:
     """Return the durable OpenClaw cron contract for unattended auto-buy drain."""
-    project_dir = str(Path(__file__).resolve().parent.parent)
+    account_number = str(Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER or "").strip()
+    if not account_number:
+        return {
+            "success": False,
+            "operation": "blocked",
+            "reason": "ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER is not configured; account selection is never guessed.",
+        }
+    run_command = f"{shlex.quote(sys.executable)} -m run"
     tmp_dir = str(Path(Config.OPENCLAW_TMP_DIR).expanduser())
     telegram_chat = Config.TELEGRAM_CHAT_ID or "<TELEGRAM_CHAT_ID>"
     bootstrap_message = f"""ARTHA ROBINHOOD AUTO-TRADE RUNNER BOOTSTRAP
@@ -1171,7 +1190,7 @@ def build_auto_buy_runner_operation() -> dict[str, Any]:
 Goal: make the idle path fast and only load the full money-moving contract when Artha has queued auto_buy or auto_sell work.
 
 Run exactly:
-cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-queue-status
+{run_command} robinhood-auto-buy-queue-status
 
 If operation_count is 0:
 - Do not call any Robinhood MCP tools.
@@ -1181,7 +1200,7 @@ If operation_count is 0:
 
 If operation_count is greater than 0:
 - Run exactly:
-  cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-runner-operation --message-only
+  {run_command} robinhood-auto-buy-runner-operation --message-only
 - Follow the returned instructions exactly.
 - Never call place_equity_order unless those returned instructions and Artha commands explicitly allow it.
 """
@@ -1191,7 +1210,7 @@ Goal: drain Artha's queued auto_buy AND auto_sell actions during regular market 
 
 Hard boundaries:
 - Long US equities only. No options, margin, shorts, crypto, watchlist writes, cancel_order, or manual order edits.
-- Use the Agentic cash account ending {Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER[-4:]} only.
+- Use the Agentic cash account ending {account_number[-4:]} only.
 - Never invent order parameters. place_equity_order must use the exact place_mcp_args returned by Artha. Every operation carries a side field (buy or sell); the side inside place_mcp_args is authoritative and must never be edited.
 - Sell orders sell ONLY the exact quantity in place_mcp_args (never more than Artha's thesis quantity; Artha already caps it at the held quantity).
 - Max two auto actions per cron turn (sells count first). If more are queued, leave them for the next turn.
@@ -1200,22 +1219,22 @@ Hard boundaries:
 - Do not use shell heredocs. Use bash only for date/run_id generation, atomic base64 JSON writes, and Artha commands.
 
 Market-time gate:
-1. Run /bin/zsh -lc 'TZ=America/Chicago date +%u:%H:%M'
+1. Run `TZ=America/Chicago date +%u:%H:%M`.
 2. If it is weekend, before 08:30 CT, or at/after 15:00 CT, do not call review_equity_order or place_equity_order. Final reply exactly: AUTO_BUY_MARKET_CLOSED
 
 Cheap queue preflight:
 3. Run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-queue-status
+   {run_command} robinhood-auto-buy-queue-status
 4. If operation_count is 0, final reply exactly: AUTO_BUY_IDLE. Do not refresh Robinhood and do not call review_equity_order/place_equity_order. (The status output lists both auto_buy and auto_sell actions with their side.)
 
 Fresh snapshot gate:
 5. Run the deterministic read-only MCP snapshot sync:
-   cd {project_dir} && .venv/bin/python run.py robinhood-snapshot-sync-direct
+   {run_command} robinhood-snapshot-sync-direct
 6. If that command does not return success=true/status PASS, stop before review/place and alert Telegram.
 
 Queue drain:
 7. Run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-action
+   {run_command} robinhood-auto-buy-action
 8. If operation_count is 0, final reply exactly: AUTO_BUY_IDLE
 9. For each returned operation, process at most two successful/blocked actions in the order Artha returned them (sells first) and never skip ahead to manual buy/sell actions.
 
@@ -1226,27 +1245,27 @@ Per-action agentic clearance (identical commands for buy and sell operations):
 13. Call review_equity_order with exactly review_mcp_args. This is still preview only.
 14. Atomically write quote, tradability, and review responses to JSON files under {tmp_dir}/artha_auto_trade_<ACTION_ID>_quote.json, _tradability.json, and _review.json.
 15. Run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-agentic-clearance ACTION_ID --quote-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_quote.json --tradability-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_tradability.json --review-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_review.json
+   {run_command} robinhood-auto-buy-agentic-clearance ACTION_ID --quote-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_quote.json --tradability-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_tradability.json --review-file {tmp_dir}/artha_auto_trade_<ACTION_ID>_review.json
    Both buys and sells run deterministic gates plus the agentic Execution Officer; the command and outputs are identical.
 16. If that command does not return allow_place=true/status PASS, do not place. Alert Telegram with ticker/action_id/side and the block reason.
 
 Final broker review immediately before place:
 17. Run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-action ACTION_ID
+   {run_command} robinhood-auto-buy-action ACTION_ID
 18. Require operation=tradability_then_review_then_place_equity_order and place_mcp_args.
 19. Repeat get_equity_tradability and review_equity_order with exactly the returned args.
 20. Write those second responses to JSON files and run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-record-review ACTION_ID --tradability-file SECOND_TRADABILITY_FILE --review-file SECOND_REVIEW_FILE
+   {run_command} robinhood-record-review ACTION_ID --tradability-file SECOND_TRADABILITY_FILE --review-file SECOND_REVIEW_FILE
 21. Run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-final-clearance ACTION_ID
+   {run_command} robinhood-final-clearance ACTION_ID
 22. If final clearance is not allow_place=true/status PASS, do not place. Alert Telegram with the block reason.
 23. Run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-auto-buy-action ACTION_ID
+   {run_command} robinhood-auto-buy-action ACTION_ID
 24. Require place_mcp_args still exists and exactly matches the reviewed order (same symbol, side, quantity/dollar_amount). Then call place_equity_order with exactly place_mcp_args.
 25. Write the place response JSON and run:
-   cd {project_dir} && .venv/bin/python run.py robinhood-record-submission ACTION_ID --file PLACE_RESPONSE_FILE
+   {run_command} robinhood-record-submission ACTION_ID --file PLACE_RESPONSE_FILE
 26. Run the deterministic snapshot sync again:
-   cd {project_dir} && .venv/bin/python run.py robinhood-snapshot-sync-direct
+   {run_command} robinhood-snapshot-sync-direct
 27. Send Telegram success/failure with ticker, side, notional/quantity, order id/state, and action_id.
 
 Sell-specific notes:

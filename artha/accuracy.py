@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import Config
+from .paths import DATA_DIR
 
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ except ImportError:
     fcntl = None
 
 CENTS = Decimal("0.01")
-ACCURACY_FILE = Path(__file__).resolve().parent.parent / "data" / "accuracy.json"
+ACCURACY_FILE = DATA_DIR / "accuracy.json"
 
 
 def _env_float(name: str, default: float) -> float:

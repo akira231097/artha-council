@@ -1,0 +1,190 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.akira231097/artha-council",
+  "title": "Artha Council",
+  "description": "Auditable equity research and fail-closed broker execution for US and Indian cash equities.",
+  "repository": {
+    "url": "https://github.com/akira231097/artha-council",
+    "source": "github"
+  },
+  "version": "1.3.0",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/akira231097/artha-council-mcp:1.3.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ARTHA_MCP_MARKET",
+          "description": "Market profile: US or IN.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_BROKER",
+          "description": "Broker adapter: snapshot, upstox, zerodha, none, or plugin.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_RESEARCH_MODE",
+          "description": "Research boundary: embedded, host_orchestrated, or plugin. India should use host_orchestrated or a market-native plugin.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_DATA_DIR",
+          "description": "Persistent directory for journals, receipts, jobs, portfolio state, and audit artifacts.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_ACCESS_MODE",
+          "description": "Capability mode: read_only, operator, or trading. Defaults to read_only.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_OPERATIONS_ENABLED",
+          "description": "Explicit operations switch. Defaults to false.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_TRADING_ENABLED",
+          "description": "Explicit live-trading switch. Defaults to false.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_KILL_SWITCH",
+          "description": "Final MCP placement kill switch. Defaults to true.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_MAX_ORDER_VALUE",
+          "description": "Maximum value of one order in the selected market currency. Defaults to 25 USD or 2500 INR.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_MAX_DAILY_ORDER_VALUE",
+          "description": "Maximum total daily order value in the selected market currency. Defaults to 50 USD or 5000 INR.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_MAX_DAILY_ORDERS",
+          "description": "Maximum number of broker placements per market day. Defaults to 2.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_MCP_MAX_PENDING_JOBS",
+          "description": "Maximum queued or running allowlisted workflows. Defaults to 8 and prevents an unbounded work queue.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "FMP_API_KEY",
+          "description": "Optional Financial Modeling Prep key for embedded US research.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "FINNHUB_API_KEY",
+          "description": "Optional Finnhub key for embedded US research enrichment.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "GOOGLE_API_KEY",
+          "description": "Optional Google Gemini key for embedded Council roles and web-grounded research.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "TELEGRAM_BOT_TOKEN",
+          "description": "Optional Telegram bot token for Artha notifications.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "TELEGRAM_CHAT_ID",
+          "description": "Optional Telegram destination used with TELEGRAM_BOT_TOKEN.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "UPSTOX_ACCESS_TOKEN",
+          "description": "Upstox live account/read token used for portfolio, quote, margin, and fee proof.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "UPSTOX_SANDBOX_ACCESS_TOKEN",
+          "description": "Separate Upstox sandbox token, required only when ARTHA_UPSTOX_SANDBOX=true.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "ARTHA_INDIA_STATIC_IP_REGISTERED",
+          "description": "Operator attestation that this deployment IP is registered with the selected Indian broker.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_INDIA_DEMAT_SELL_AUTHORIZED",
+          "description": "Operator attestation that required demat authorization is valid for Indian delivery sells.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "ARTHA_UPSTOX_ALGO_NAME",
+          "description": "Optional exchange-approved algo name configured in the Upstox app.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KITE_API_KEY",
+          "description": "Required only for the Zerodha adapter.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "KITE_ACCESS_TOKEN",
+          "description": "Required only for the Zerodha adapter.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

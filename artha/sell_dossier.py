@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from .dossier import _json_safe
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SELL_DOSSIER_DIR = DATA_DIR / "sell_dossiers"
 
 
