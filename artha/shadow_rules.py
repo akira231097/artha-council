@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from .journal import DecisionJournal
 from .config import Config
+from .paths import DATA_DIR
 from .portfolio_risk import primary_market_benchmark_for, sector_benchmark_for
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,6 @@ RULE_VERSION = "v1"
 BUY_LIKE = {"BUY", "STARTER", "TACTICAL_BUY", "ACCUMULATE", "ADD", "STRONG BUY"}
 NO_BUY = {"WATCH", "DEFER", "AVOID", "HOLD", "SELL", "TRIM", "STRONG SELL"}
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
 SELL_RULES_FILE = DATA_DIR / "shadow_sell_rules.json"
 

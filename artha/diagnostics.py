@@ -16,11 +16,11 @@ from typing import Any
 
 from .calibration import build_calibration_report
 from .journal import DecisionJournal
+from .paths import DATA_DIR
 from .telegram import TelegramSender
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DIAGNOSTIC_DIR = DATA_DIR / "calibration_diagnostics"
 
 

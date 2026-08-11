@@ -2,6 +2,42 @@
 
 All notable public releases of Artha Council are documented here.
 
+## 1.3.0 - 2026-08-11
+
+- Added an MCP server built with the Python SDK 2.0, with structured tools,
+  resources, prompts, persisted workflow jobs, local stdio, and stateless
+  Streamable HTTP.
+- Added fail-closed capability policy, OAuth/JWKS validation, recursive secret
+  redaction, DNS-rebinding controls, and safe read-only defaults.
+- Added immutable exact-order preview receipts, atomic daily caps, final broker
+  rechecks, duplicate-order detection, broker-order status tools, and
+  no-retry ambiguous-outcome reconciliation.
+- Added direct Upstox and Zerodha cash-equity adapters plus a broker and research
+  plugin boundary for portable deployments.
+- Added explicit US/India market profiles, whole-share Indian delivery rules,
+  sell-holdings proof, and a hard block against reusing the US Council as an
+  India-native analysis engine.
+- Added broker-verified Indian instrument lookup, explicit static-IP readiness,
+  limit-only India API execution, official Upstox/Kite response parsing, and
+  netting of settled holdings with same-day positions.
+- Added exact-order Upstox margin proof, explicit broker business-status
+  validation, market-aware USD/INR trading caps, crossed/stale quote rejection,
+  bounded broker/snapshot payloads, and serialized workflow startup.
+- Removed workstation-specific Node and account fallbacks from the OpenClaw
+  runners, packaged their locked assets with wheels, and made account selection
+  explicit and fail-closed.
+- Added OCI packaging, MCP Registry metadata, automated GHCR builds, deployment
+  documentation, and MCP protocol/security/adapter regression tests.
+- Made Upstox BSE equity-series handling exchange-native, separated live and
+  sandbox credentials, and labeled sandbox placement as submission-only because
+  the broker sandbox does not expose fill reconciliation.
+- Required duplicate/status capability for every live direct broker adapter,
+  made missing India live credentials a startup error, and restricted portable
+  Robinhood runner handoffs and OAuth state to owner-only files.
+- Bounded the MCP workflow queue, stored MCP-generated state in owner-only
+  paths, and stopped Upstox sandbox reads from calling its unavailable order
+  book while retaining explicit submission-only warnings.
+
 ## 1.2.0 - 2026-08-11
 
 - Synchronized the public source with the current buy, sell, Council, scheduler,

@@ -33,10 +33,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import Config
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_DATA_DIR = DATA_DIR
 REGIME_GATE_PATH = _DATA_DIR / "regime_gate.json"
 REGIME_STATE_PATH = _DATA_DIR / "regime_state.json"
 

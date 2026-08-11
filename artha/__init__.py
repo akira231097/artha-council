@@ -1,2 +1,3 @@
-"""Artha — AI-Powered Financial Analysis Agent"""
-__version__ = "0.1.0"
+"""Artha - AI-powered financial analysis agent."""
+
+__version__ = "1.3.0"

@@ -1,11 +1,8 @@
 """Configuration and API key management."""
 import os
 from pathlib import Path
-from dotenv import load_dotenv
 
-# Load .env from project root
-_env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(_env_path, override=True)
+from .paths import DATA_DIR
 
 
 def _env_float(name: str, default: float) -> float:
@@ -280,18 +277,18 @@ class Config:
     ).lower() in ("1", "true", "yes")
     ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE: str = os.getenv(
         "ARTHA_ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE",
-        str(_env_path.parent / "data" / "robinhood" / "latest_snapshot.json"),
+        str(DATA_DIR / "robinhood" / "latest_snapshot.json"),
     )
     ROBINHOOD_CONTROL_FILE: str = os.getenv(
         "ARTHA_ROBINHOOD_CONTROL_FILE",
-        str(_env_path.parent / "data" / "robinhood" / "control.json"),
+        str(DATA_DIR / "robinhood" / "control.json"),
     )
     ROBINHOOD_RECONCILIATION_SNAPSHOT_MAX_AGE_MINUTES: int = int(
         os.getenv("ARTHA_ROBINHOOD_RECONCILIATION_SNAPSHOT_MAX_AGE_MINUTES", "10")
     )
     ROBINHOOD_WARNING_STATE_FILE: str = os.getenv(
         "ARTHA_ROBINHOOD_WARNING_STATE_FILE",
-        str(_env_path.parent / "data" / "robinhood" / "warning_state.json"),
+        str(DATA_DIR / "robinhood" / "warning_state.json"),
     )
     ROBINHOOD_STALE_SNAPSHOT_TELEGRAM_MIN_MINUTES: int = int(
         os.getenv("ARTHA_ROBINHOOD_STALE_SNAPSHOT_TELEGRAM_MIN_MINUTES", "30")

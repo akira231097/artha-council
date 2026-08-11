@@ -22,6 +22,7 @@ from .diagnostics import run_calibration_diagnosis
 from .execution import build_execution_readiness_report, normalize_robinhood_position_snapshot
 from .execution_learning import build_execution_learning_summary
 from .journal import DecisionJournal
+from .paths import DATA_DIR
 from .portfolio import PORTFOLIO_FILE, Portfolio
 from .shadow_rules import (
     backfill_shadow_rules_from_features,
@@ -32,7 +33,6 @@ from .telegram import TelegramSender
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SUPERVISOR_DIR = DATA_DIR / "supervisor"
 LOG_DIR = DATA_DIR / "logs"
 RANK_COVERAGE_DIR = DATA_DIR / "rank_coverage"

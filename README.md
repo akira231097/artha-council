@@ -1,5 +1,7 @@
 # Artha Council
 
+<!-- mcp-name: io.github.akira231097/artha-council -->
+
 [![Artha CI](https://github.com/akira231097/artha-council/actions/workflows/artha-ci.yml/badge.svg)](https://github.com/akira231097/artha-council/actions/workflows/artha-ci.yml)
 [![CodeQL](https://github.com/akira231097/artha-council/actions/workflows/codeql.yml/badge.svg)](https://github.com/akira231097/artha-council/actions/workflows/codeql.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/akira231097/artha-council/badge)](https://securityscorecards.dev/viewer/?uri=github.com/akira231097/artha-council)
@@ -9,6 +11,12 @@ Artha is an AI-assisted equity research and portfolio automation system. It
 narrows a broad US-stock universe, ranks opportunities, asks independent analyst
 roles to debate the strongest candidates, monitors active investment theses, and
 uses deterministic broker gates before an order can proceed.
+
+Version 1.3 adds a first-class MCP server for portable local or OAuth-protected
+remote access. It supports the existing US workflow and market-aware broker
+adapters for Indian cash equities without treating US research as India data.
+India adapters provide broker-verified instrument lookup and fail-closed,
+whole-share delivery limit execution with current static-IP requirements.
 
 Created and maintained by **Sarath** ([@akira231097](https://github.com/akira231097)).
 
@@ -99,6 +107,8 @@ sell review, reconciliation, health checks, and alerts continue running.
 - `artha/robinhood_bridge.py` - broker handoff, review, clearance, and reconciliation.
 - `artha/scheduler.py` - scheduled scans and lifecycle orchestration.
 - `artha/supervisor.py` - production health and readiness checks.
+- `artha_mcp/` - MCP tools, resources, prompts, authorization, jobs,
+  redaction, research adapters, exact-order receipts, and broker reconciliation.
 - `dashboard/` - local operator dashboard.
 
 See [Architecture](docs/ARCHITECTURE.md) for the complete component map.
@@ -113,7 +123,7 @@ cd artha-council
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -e .
 npm ci
 cp .env.example .env
 ```
@@ -126,12 +136,29 @@ python run.py overview
 python run.py analyze AAPL MSFT V
 python run.py broker-router-preview --assume-market-open --no-persist
 python run.py supervise
+artha-mcp --check
 ```
+
+### MCP
+
+Connect any MCP-compatible host through local stdio using
+[`.mcp.json.example`](.mcp.json.example), or deploy stateless Streamable HTTP
+behind OAuth and TLS. The server starts read-only with its kill switch engaged.
+
+```bash
+artha-mcp
+```
+
+The user supplies their own model subscriptions, data subscriptions, broker
+credentials, and notification credentials. The MCP server never provides or
+shares the maintainer's accounts. See [Artha MCP](docs/MCP.md) and
+[India Support](docs/MCP_INDIA.md) for the exact capability and safety boundary.
 
 ## Verification
 
 ```bash
-python -m compileall -q artha dashboard run.py
+python -m compileall -q artha artha_mcp dashboard run.py
+python -m unittest discover -s tests -t . -v
 python -m artha.test_enhancements
 python -m artha.test_alpha_pipeline_hardening
 python -m artha.test_production_hardening
@@ -150,6 +177,9 @@ docker run --rm --env-file .env artha-council overview
 
 The broker snapshot helper is intentionally outside this minimal Python image;
 it requires a separately configured Node.js MCP runtime and broker access.
+
+`Dockerfile.mcp` builds the non-root MCP image. The `main` image tag is refreshed
+after each tested default-branch update; release versions remain immutable.
 
 ## Public Release Boundary
 
@@ -173,6 +203,8 @@ The Apache license covers Artha's source code, not provider data or broker acces
 - [Architecture](docs/ARCHITECTURE.md)
 - [Design notes and diagram](docs/DESIGN.md)
 - [Public release and data boundary](docs/PUBLIC_RELEASE.md)
+- [Artha MCP](docs/MCP.md)
+- [India support](docs/MCP_INDIA.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 - [Authors](AUTHORS.md)

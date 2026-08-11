@@ -16,11 +16,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .paths import DATA_DIR
+
 logger = logging.getLogger(__name__)
 
 _CIO_CATEGORIES = {"none", "evidence_backed", "logic_backed", "risk_override", "data_dispute"}
 
-_SCAN_SIGNALS_DIR = Path(__file__).resolve().parent.parent / "data" / "scan_signals"
+_SCAN_SIGNALS_DIR = DATA_DIR / "scan_signals"
 
 # Mechanical technical-setup thresholds (mirror the funnel's rank_candidates
 # constants; see load_scan_signal_row/_score_technicals_mechanical below).

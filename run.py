@@ -6,6 +6,8 @@ Main entry point for running analyses and generating reports.
 Usage:
     python run.py scan                        # Full market scan + council analysis (default: 8 investigation candidates)
     python run.py scan 6                     # Scan with 6 council investigation candidates
+    python run.py scheduled-scan              # Run the production broker-aware scheduled scan once
+    python run.py sell-review                 # Run due-position sell Council reviews once
     python run.py analyze AAPL MSFT GOOGL    # Analyze specific stocks
     python run.py overview                    # Market overview report
     python run.py portfolio                   # Portfolio status
@@ -34,6 +36,7 @@ import sys
 import logging
 import tempfile
 import os
+import shutil
 import subprocess
 from uuid import uuid4
 from datetime import datetime, timezone
@@ -52,6 +55,7 @@ from artha.scheduler import ArthaScheduler
 from artha.journal import DecisionJournal
 from artha.portfolio_state import PortfolioStateEngine
 from artha.accuracy import AccuracyTracker, Recommendation
+from artha.paths import DATA_DIR, PROJECT_ROOT, runtime_asset_path
 
 # Logging setup
 logging.basicConfig(
@@ -378,7 +382,7 @@ def analyze_stocks(tickers: list[str]):
             analyzed.append(ticker.upper())
 
             # Save report
-            report_dir = Path(__file__).parent / "data" / "reports"
+            report_dir = DATA_DIR / "reports"
             report_dir.mkdir(parents=True, exist_ok=True)
             report_file = report_dir / f"{ticker.upper()}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.txt"
             _atomic_write_text(report_file, report)
@@ -576,7 +580,7 @@ def full_market_scan(
     # Check for already-completed reports today (resume support)
     from datetime import date as date_type
     today_str = date_type.today().strftime("%Y%m%d")
-    report_dir = Path(__file__).parent / "data" / "reports"
+    report_dir = DATA_DIR / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
     already_done_today = set()
     for existing in report_dir.glob(f"*_{today_str}_*.txt"):
@@ -659,7 +663,7 @@ def full_market_scan(
             analyzed.append(ticker)
 
             # Save report
-            report_dir = Path(__file__).parent / "data" / "reports"
+            report_dir = DATA_DIR / "reports"
             report_dir.mkdir(parents=True, exist_ok=True)
             report_file = report_dir / f"{ticker}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.txt"
             _atomic_write_text(report_file, report)
@@ -1215,13 +1219,27 @@ def robinhood_snapshot_refresh_operation(args: list[str]):
 
 def robinhood_snapshot_sync_direct(args: list[str]):
     """Run the deterministic Node MCP snapshot sync client."""
-    script = Path(__file__).resolve().parent / "scripts" / "robinhood_snapshot_sync.mjs"
+    script = runtime_asset_path("scripts", "robinhood_snapshot_sync.mjs")
     if not script.exists():
         print(json.dumps({"success": False, "error": f"Missing sync script: {script}"}, indent=2))
         sys.exit(1)
+    node = shutil.which("node")
+    if not node:
+        print(json.dumps({"success": False, "error": "Node.js 20 or newer is required for Robinhood/OpenClaw snapshot sync."}, indent=2))
+        sys.exit(1)
     proc = subprocess.run(
-        ["/opt/homebrew/bin/node", str(script), *args],
-        cwd=str(Path(__file__).resolve().parent),
+        [
+            node,
+            str(script),
+            "--project-dir",
+            str(PROJECT_ROOT),
+            "--python",
+            sys.executable,
+            "--state-file",
+            str(DATA_DIR / "robinhood" / "snapshot_sync_state.json"),
+            *args,
+        ],
+        cwd=str(PROJECT_ROOT),
         text=True,
         capture_output=True,
         check=False,
@@ -1439,6 +1457,18 @@ def start_monitoring_daemon():
     asyncio.run(scheduler.run_forever())
 
 
+def run_scheduled_scan_once():
+    """Run the exact production scheduled-scan path once."""
+    scheduler = ArthaScheduler()
+    asyncio.run(scheduler.run_scheduled_scan_once())
+
+
+def run_sell_review_once():
+    """Run due sell-Council lifecycle reviews once."""
+    scheduler = ArthaScheduler()
+    asyncio.run(scheduler.run_sell_review_once())
+
+
 def write_launchd_plist_templates():
     """Write macOS launchd plist templates for local automation."""
     from artha.automation import write_launchd_plists
@@ -1466,6 +1496,10 @@ def main():
             print(exc)
             sys.exit(1)
         full_market_scan(max_stocks=max_stocks, send_telegram=send_telegram)
+    elif command == "scheduled-scan":
+        run_scheduled_scan_once()
+    elif command == "sell-review":
+        run_sell_review_once()
     elif command == "analyze":
         if len(sys.argv) < 3:
             print("Usage: python run.py analyze TICKER1 TICKER2 ...")

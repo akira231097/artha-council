@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
+from .paths import DATA_DIR, PROJECT_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "launchd"
+DEFAULT_OUTPUT_DIR = DATA_DIR / "launchd"
 
 
 def _python_path() -> str:
@@ -34,9 +34,9 @@ def _plist(label: str, args: list[str], extra: str) -> str:
 {arg_xml}
     </array>
     <key>StandardOutPath</key>
-    <string>{escape(str(PROJECT_ROOT / "data" / "logs" / f"{label}.out.log"))}</string>
+    <string>{escape(str(DATA_DIR / "logs" / f"{label}.out.log"))}</string>
     <key>StandardErrorPath</key>
-    <string>{escape(str(PROJECT_ROOT / "data" / "logs" / f"{label}.err.log"))}</string>
+    <string>{escape(str(DATA_DIR / "logs" / f"{label}.err.log"))}</string>
 {extra}
 </dict>
 </plist>
@@ -46,11 +46,11 @@ def _plist(label: str, args: list[str], extra: str) -> str:
 def build_launchd_plists(python_path: str | None = None) -> dict[str, str]:
     """Return launchd plist bodies for Artha monitoring and calibration."""
     py = python_path or _python_path()
-    run_py = str(PROJECT_ROOT / "run.py")
+    run_command = [py, "-m", "run"]
     return {
         "com.artha.monitor.plist": _plist(
             "com.artha.monitor",
-            [py, run_py, "monitor"],
+            [*run_command, "monitor"],
             """    <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -59,7 +59,7 @@ def build_launchd_plists(python_path: str | None = None) -> dict[str, str]:
         ),
         "com.artha.calibrate-nightly.plist": _plist(
             "com.artha.calibrate-nightly",
-            [py, run_py, "calibrate"],
+            [*run_command, "calibrate"],
             """    <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -71,7 +71,7 @@ def build_launchd_plists(python_path: str | None = None) -> dict[str, str]:
         ),
         "com.artha.diagnose-nightly.plist": _plist(
             "com.artha.diagnose-nightly",
-            [py, run_py, "diagnose", "--telegram"],
+            [*run_command, "diagnose", "--telegram"],
             """    <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -83,7 +83,7 @@ def build_launchd_plists(python_path: str | None = None) -> dict[str, str]:
         ),
         "com.artha.supervise-nightly.plist": _plist(
             "com.artha.supervise-nightly",
-            [py, run_py, "supervise", "--telegram"],
+            [*run_command, "supervise", "--telegram"],
             """    <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -95,7 +95,7 @@ def build_launchd_plists(python_path: str | None = None) -> dict[str, str]:
         ),
         "com.artha.portfolio-check.plist": _plist(
             "com.artha.portfolio-check",
-            [py, run_py, "check"],
+            [*run_command, "check"],
             """    <key>StartInterval</key>
     <integer>1800</integer>
 """,
@@ -107,7 +107,7 @@ def write_launchd_plists(output_dir: Path | None = None, python_path: str | None
     """Write launchd plist templates under data/launchd and return paths."""
     target = output_dir or DEFAULT_OUTPUT_DIR
     target.mkdir(parents=True, exist_ok=True)
-    (PROJECT_ROOT / "data" / "logs").mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
     written = {}
     for filename, body in build_launchd_plists(python_path=python_path).items():
         path = target / filename

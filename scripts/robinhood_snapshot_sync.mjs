@@ -11,10 +11,12 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
 const DEFAULT_STATE_DIR = path.join(os.homedir(), ".openclaw");
-const DEFAULT_PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_PROJECT_DIR = path.resolve(SCRIPT_DIR, "..");
 const DEFAULT_TMP_DIR = process.env.ARTHA_OPENCLAW_TMP_DIR || path.join(DEFAULT_STATE_DIR, "workspace", "tmp");
+const DEFAULT_DATA_DIR = process.env.ARTHA_DATA_DIR || process.env.ARTHA_MCP_DATA_DIR || path.join(DEFAULT_PROJECT_DIR, "data");
 const DEFAULT_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const DEFAULT_LOCK_FILE = "/tmp/artha-robinhood-snapshot-sync.lock";
+const DEFAULT_LOCK_FILE = path.join(os.tmpdir(), "artha-robinhood-snapshot-sync.lock");
 const DEFAULT_RUNNER_LOCK_FILE = `${DEFAULT_LOCK_FILE}.runner`;
 const DEFAULT_SDK_TIMEOUT_MS = 120000;
 
@@ -24,7 +26,7 @@ function parseArgs(argv) {
     stateDir: process.env.OPENCLAW_STATE_DIR || DEFAULT_STATE_DIR,
     openclawConfig: process.env.OPENCLAW_CONFIG_PATH || path.join(DEFAULT_STATE_DIR, "openclaw.json"),
     handoffFile: path.join(DEFAULT_TMP_DIR, "artha_robinhood_snapshot.json"),
-    stateFile: path.join(DEFAULT_PROJECT_DIR, "data", "robinhood", "snapshot_sync_state.json"),
+    stateFile: path.join(DEFAULT_DATA_DIR, "robinhood", "snapshot_sync_state.json"),
     python: null,
     lockFile: DEFAULT_LOCK_FILE,
     runnerLockFile: DEFAULT_RUNNER_LOCK_FILE,
@@ -112,8 +114,12 @@ function expandHome(value) {
 }
 
 function defaultPython(projectDir) {
+  if (process.env.ARTHA_PYTHON) return process.env.ARTHA_PYTHON;
   const venvPython = path.join(projectDir, ".venv", "bin", "python");
-  return fs.existsSync(venvPython) ? venvPython : "python3";
+  const windowsPython = path.join(projectDir, ".venv", "Scripts", "python.exe");
+  if (fs.existsSync(venvPython)) return venvPython;
+  if (fs.existsSync(windowsPython)) return windowsPython;
+  return process.platform === "win32" ? "python" : "python3";
 }
 
 function readJson(file) {
@@ -123,7 +129,10 @@ function readJson(file) {
 function atomicWriteJson(file, payload) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   fs.renameSync(tmp, file);
 }
 
@@ -151,7 +160,10 @@ function resolveConfig(args) {
   const server = openclaw?.mcp?.servers?.["robinhood-trading"] || {};
   const mcpUrl = args.mcpUrl || server.url || "https://agent.robinhood.com/mcp/trading";
   const accountNumber = args.accountNumber || process.env.ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER || env.ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER || "";
-  const accountSuffix = args.accountSuffix || (accountNumber ? accountNumber.slice(-4) : "0195");
+  const accountSuffix = args.accountSuffix || (accountNumber ? accountNumber.slice(-4) : "");
+  if (!accountNumber && !accountSuffix) {
+    throw new Error("Configure ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER or pass --account-suffix; account selection is never guessed.");
+  }
   const oauthFile = args.oauthFile || findOauthFile(args.stateDir);
   return { mcpUrl, accountNumber, accountSuffix, oauthFile };
 }
@@ -388,7 +400,8 @@ async function runImporter(args, runId, generatedAt) {
   const proc = await runProcess(
     args.python,
     [
-      "run.py",
+      "-m",
+      "run",
       "robinhood-snapshot-import",
       "--strict",
       "--expect-run-id",

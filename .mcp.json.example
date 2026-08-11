@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "artha": {
+      "command": "/absolute/path/to/artha-council/.venv/bin/artha-mcp",
+      "args": [],
+      "env": {
+        "ARTHA_MCP_ACCESS_MODE": "read_only",
+        "ARTHA_MCP_OPERATIONS_ENABLED": "false",
+        "ARTHA_MCP_TRADING_ENABLED": "false",
+        "ARTHA_MCP_KILL_SWITCH": "true",
+        "ARTHA_MCP_MARKET": "US",
+        "ARTHA_MCP_BROKER": "snapshot"
+      }
+    }
+  }
+}

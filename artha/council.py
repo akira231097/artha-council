@@ -33,6 +33,7 @@ from .defer_watchlist import record_defer_watch
 from .dossier import write_decision_dossier
 from .meta_ranker import build_meta_signal, format_meta_signal
 from .portfolio_risk import build_portfolio_factor_risk, format_portfolio_factor_risk
+from .paths import DATA_DIR
 from .shadow_rules import evaluate_shadow_rules_for_decision
 from .valuation import build_valuation_expectations, format_valuation_expectations
 from .buy_scoring import (
@@ -1446,7 +1447,7 @@ class ArthaCouncil:
     """Orchestrates the three-analyst debate and synthesis (v2 decision engine)."""
 
     def __init__(self) -> None:
-        self.profile_path = Path(__file__).resolve().parent.parent / "data" / "config" / "investor_profile.yaml"
+        self.profile_path = DATA_DIR / "config" / "investor_profile.yaml"
         self.portfolio_state = PortfolioStateEngine()
         self.journal = DecisionJournal()
         self.research_desk = ResearchDesk()

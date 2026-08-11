@@ -33,6 +33,7 @@ from .sentinel import NewsSentinel
 from .researcher import ResearchDesk
 from .sell_engine import SellEngine
 from .config import Config
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -629,9 +630,9 @@ class ArthaScheduler:
         except Exception:
             return None
 
-    _RUN_SLOTS_FILE = Path(__file__).resolve().parent.parent / "data" / "scheduler_run_slots.json"
+    _RUN_SLOTS_FILE = DATA_DIR / "scheduler_run_slots.json"
     _BUY_SCAN_CAPACITY_STATE_FILE = (
-        Path(__file__).resolve().parent.parent / "data" / "robinhood" / "buy_scan_capacity_state.json"
+        DATA_DIR / "robinhood" / "buy_scan_capacity_state.json"
     )
 
     def _load_run_slots(self) -> dict[str, datetime]:
@@ -3069,7 +3070,7 @@ class ArthaScheduler:
         failed_items = failed_items or []
         if not report_items and not failed_items:
             return ""
-        reports_dir = Path(__file__).resolve().parent.parent / "data" / "reports"
+        reports_dir = DATA_DIR / "reports"
         reports_dir.mkdir(parents=True, exist_ok=True)
         combined_path = reports_dir / f"{session_id}.txt"
         body = [scan_header.strip()]
@@ -5535,6 +5536,20 @@ class ArthaScheduler:
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def run_scheduled_scan_once(self) -> None:
+        """Run the production scheduled-scan workflow once on demand.
+
+        This is the public one-shot boundary used by the CLI and MCP job
+        runner. It intentionally reuses the same router, Opportunity Scout,
+        Council, execution preparation, audit, and Telegram path as the live
+        scheduler instead of maintaining a second scan implementation.
+        """
+        await self._run_full_scan_and_council()
+
+    async def run_sell_review_once(self) -> None:
+        """Run the due-position sell Council lifecycle review once."""
+        await self._run_periodic_review_check()
 
     def _request_stop(self) -> None:
         """Stop the async loop AND signal the sync scan worker threads."""

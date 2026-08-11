@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import Config
+from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ def _safe_int(val: Any, default: int = 0) -> int:
     except (TypeError, ValueError):
         return default
 
-CRISIS_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "crisis_state.json"
+CRISIS_STATE_FILE = DATA_DIR / "crisis_state.json"
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +491,7 @@ class CrisisFingerprint:
 
     def __init__(self, history_path: Optional[Path] = None):
         self._history_path = history_path or (
-            Path(__file__).resolve().parent.parent / "data" / "fingerprint_history.json"
+            DATA_DIR / "fingerprint_history.json"
         )
         self._history: list[dict] = self._load_history()
 
@@ -1813,7 +1814,7 @@ class CounterfactualEngine:
 
     def __init__(self, storage_path: Optional[Path] = None):
         self._path = storage_path or (
-            Path(__file__).resolve().parent.parent / "data" / "counterfactuals.json"
+            DATA_DIR / "counterfactuals.json"
         )
         self._records: list[CounterfactualRecord] = self._load()
 
@@ -2431,7 +2432,7 @@ class CrisisLearningEngine:
 
     def __init__(self, learning_path: Optional[Path] = None):
         self._path = learning_path or (
-            Path(__file__).resolve().parent.parent / "data" / "crisis_learning.json"
+            DATA_DIR / "crisis_learning.json"
         )
         self._data = self._load()
 
@@ -2588,7 +2589,7 @@ class ShadowCrisisAnalyzer:
     All shadow runs are appended to data/shadow_log.jsonl (newline-JSON).
     """
 
-    SHADOW_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "shadow_log.jsonl"
+    SHADOW_LOG_PATH = DATA_DIR / "shadow_log.jsonl"
 
     def analyze(
         self,

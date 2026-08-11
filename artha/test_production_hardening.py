@@ -4314,6 +4314,25 @@ class TestExecutionReadiness(unittest.TestCase):
         finally:
             Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = old_account
 
+    def test_robinhood_operations_never_guess_an_account(self):
+        from artha.config import Config
+        from artha.robinhood_bridge import (
+            build_auto_buy_runner_operation,
+            build_snapshot_refresh_operation,
+        )
+
+        old_account = Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+        try:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = ""
+            snapshot = build_snapshot_refresh_operation()
+            runner = build_auto_buy_runner_operation()
+            self.assertFalse(snapshot["success"])
+            self.assertFalse(runner["success"])
+            self.assertIn("never guessed", snapshot["reason"])
+            self.assertIn("never guessed", runner["reason"])
+        finally:
+            Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = old_account
+
     def test_snapshot_handoff_validation_rejects_stale_tmp_file(self):
         from artha.robinhood_bridge import SnapshotHandoffValidationError, validate_snapshot_handoff_metadata
 
@@ -8184,7 +8203,8 @@ class TestDossierAndAutomation(unittest.TestCase):
 
         plists = build_launchd_plists(python_path="/tmp/python")
         self.assertIn("com.artha.monitor.plist", plists)
-        self.assertIn("run.py", plists["com.artha.calibrate-nightly.plist"])
+        self.assertIn("<string>-m</string>", plists["com.artha.calibrate-nightly.plist"])
+        self.assertIn("<string>run</string>", plists["com.artha.calibrate-nightly.plist"])
         self.assertIn("calibrate", plists["com.artha.calibrate-nightly.plist"])
         self.assertIn("com.artha.diagnose-nightly.plist", plists)
         self.assertIn("--telegram", plists["com.artha.diagnose-nightly.plist"])

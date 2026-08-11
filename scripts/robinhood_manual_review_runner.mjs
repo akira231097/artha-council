@@ -10,7 +10,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
-const DEFAULT_PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const SNAPSHOT_SCRIPT = path.join(SCRIPT_DIR, "robinhood_snapshot_sync.mjs");
+const DEFAULT_PROJECT_DIR = path.resolve(SCRIPT_DIR, "..");
 const DEFAULT_STATE_DIR = path.join(os.homedir(), ".openclaw");
 const DEFAULT_TMP_DIR = process.env.ARTHA_OPENCLAW_TMP_DIR || path.join(DEFAULT_STATE_DIR, "workspace", "tmp");
 const DEFAULT_TIMEOUT_MS = 120000;
@@ -24,10 +26,11 @@ function parseArgs(argv) {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     callbackData: "",
     telegram: false,
-    lockFile: "/tmp/artha-robinhood-manual-action.lock",
+    lockFile: path.join(os.tmpdir(), "artha-robinhood-manual-action.lock"),
     lockWaitMs: 90000,
     oauthFile: null,
     mcpUrl: null,
+    python: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -46,6 +49,7 @@ function parseArgs(argv) {
     else if (arg === "--lock-wait-ms") args.lockWaitMs = Number(next());
     else if (arg === "--oauth-file") args.oauthFile = next();
     else if (arg === "--mcp-url") args.mcpUrl = next();
+    else if (arg === "--python") args.python = next();
     else if (arg === "--telegram") args.telegram = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
@@ -55,7 +59,7 @@ function parseArgs(argv) {
   args.openclawConfig = path.resolve(expandHome(args.openclawConfig));
   args.tmpDir = path.resolve(expandHome(args.tmpDir));
   args.lockFile = path.resolve(expandHome(args.lockFile));
-  args.python = path.join(args.projectDir, ".venv", "bin", "python");
+  args.python = args.python || defaultPython(args.projectDir);
   return args;
 }
 
@@ -66,6 +70,15 @@ function expandHome(value) {
   return value;
 }
 
+function defaultPython(projectDir) {
+  if (process.env.ARTHA_PYTHON) return process.env.ARTHA_PYTHON;
+  const unixPython = path.join(projectDir, ".venv", "bin", "python");
+  const windowsPython = path.join(projectDir, ".venv", "Scripts", "python.exe");
+  if (fs.existsSync(unixPython)) return unixPython;
+  if (fs.existsSync(windowsPython)) return windowsPython;
+  return process.platform === "win32" ? "python" : "python3";
+}
+
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
@@ -73,7 +86,10 @@ function readJson(file) {
 function atomicWriteJson(file, payload) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   fs.renameSync(tmp, file);
 }
 
@@ -171,7 +187,7 @@ async function callTool(client, name, args, timeoutMs) {
 }
 
 async function runSnapshotSync(args) {
-  await runProcess("/opt/homebrew/bin/node", ["scripts/robinhood_snapshot_sync.mjs", "--market-hours-only", "--quiet"], {
+  await runProcess(process.execPath, [SNAPSHOT_SCRIPT, "--project-dir", args.projectDir, "--python", args.python, "--market-hours-only", "--quiet"], {
     cwd: args.projectDir,
     timeoutMs: 180000,
   });
@@ -285,7 +301,7 @@ function argsMatchForPlace(reviewArgs, placeArgs) {
 
 function runArtha(args, commandArgs, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(args.python, ["run.py", ...commandArgs], {
+    const child = spawn(args.python, ["-m", "run", ...commandArgs], {
       cwd: args.projectDir,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],

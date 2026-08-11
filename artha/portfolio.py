@@ -15,6 +15,7 @@ from typing import Optional
 from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 
 from .config import Config
+from .paths import DATA_DIR
 from .stand_down import maybe_pause_buying_for_limit
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-PORTFOLIO_FILE = Path(__file__).resolve().parent.parent / "data" / "portfolio.json"
+PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
 
 # Decimal quantization for currency (2 decimal places)
 CENTS = Decimal("0.01")
