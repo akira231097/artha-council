@@ -1,5 +1,5 @@
 # Artha Council MCP. Runtime credentials are injected; never bake them in.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 ARG ARTHA_BUILD_COMMIT=unknown
 ARG ARTHA_BUILD_REF=unknown
