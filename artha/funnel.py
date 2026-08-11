@@ -105,6 +105,7 @@ class PromotionFunnel:
     def __init__(self):
         from .universe import UniverseBuilder
         self.universe_builder = UniverseBuilder()
+        self.last_block_reason = ""
 
     def run(
         self,
@@ -127,6 +128,7 @@ class PromotionFunnel:
             List of enriched candidate dicts, ready for council analysis.
         """
         start_time = datetime.now(UTC)
+        self.last_block_reason = ""
         logger.info(f"[funnel] Starting promotion funnel (max={max_council_candidates})...")
 
         # Normalize regime_packet input
@@ -168,6 +170,8 @@ class PromotionFunnel:
 
             if not universe:
                 logger.warning("[funnel] Universe build returned empty — using fallback")
+                if not fallback_on_failure:
+                    self.last_block_reason = "Universe build returned no stocks; strict buy discovery stayed closed."
                 return self._fallback(max_council_candidates) if fallback_on_failure else []
 
             logger.info(f"[funnel] Stage 1 complete: {len(universe)} candidates")
@@ -189,6 +193,17 @@ class PromotionFunnel:
                 audited_universe = int(rank_coverage.get("universe_size") or 0)
                 minimum_coverage = float(Config.RANK_MIN_HISTORY_COVERAGE_PCT)
                 if audited_universe != len(universe) or coverage_pct < minimum_coverage:
+                    if not rank_coverage:
+                        self.last_block_reason = (
+                            "Ranking coverage proof is missing. The audit may be disabled or its artifact write "
+                            "may have failed; strict buy discovery stayed closed."
+                        )
+                    else:
+                        self.last_block_reason = (
+                            f"Ranking covered {int(rank_coverage.get('history_count') or 0)}/"
+                            f"{len(universe)} stocks ({coverage_pct:.1%}), below the required "
+                            f"{minimum_coverage:.0%}; strict buy discovery stayed closed."
+                        )
                     logger.error(
                         "[funnel] BUY SCAN FAIL-CLOSED: ranking coverage %.1f%% (%d/%d audited) "
                         "is below %.0f%% or does not match the current universe; no legacy fallback",
@@ -201,6 +216,8 @@ class PromotionFunnel:
 
             if not ranked:
                 logger.warning("[funnel] Ranking returned empty — using fallback")
+                if not fallback_on_failure:
+                    self.last_block_reason = "Ranking produced no candidates; strict buy discovery stayed closed."
                 return self._fallback(max_council_candidates) if fallback_on_failure else []
 
             # Record momentum scores and enrich with delta/trend
@@ -253,6 +270,8 @@ class PromotionFunnel:
 
             # --- Stage 5: Return diversified top N for council ---
             final = self._select_alpha_sleeves(top_candidates, max_council_candidates)
+            if not final and not fallback_on_failure:
+                self.last_block_reason = "No candidates survived the full promotion funnel; strict buy discovery stayed closed."
 
             # Check minimum threshold — fallback if too few candidates
             if len(final) < MIN_CANDIDATES_THRESHOLD and fallback_on_failure:
@@ -278,6 +297,7 @@ class PromotionFunnel:
             if fallback_on_failure:
                 logger.warning("[funnel] Falling back to legacy ticker scan")
                 return self._fallback(max_council_candidates)
+            self.last_block_reason = f"Promotion funnel failed with {type(e).__name__}; strict buy discovery stayed closed."
             return []
 
     def _catalyst_lane_candidates(self) -> list[dict]:

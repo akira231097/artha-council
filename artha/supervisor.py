@@ -21,11 +21,19 @@ from .config import Config
 from .diagnostics import run_calibration_diagnosis
 from .execution import build_execution_readiness_report, normalize_robinhood_position_snapshot
 from .execution_learning import build_execution_learning_summary
+from .feedback_loop import build_feedback_loop_report
+from .fill_finalizer import (
+    backfill_position_trade_episodes,
+    reconcile_closed_position_control_state,
+)
 from .journal import DecisionJournal
 from .paths import DATA_DIR
 from .portfolio import PORTFOLIO_FILE, Portfolio
+from .self_review import reconcile_lesson_routes
 from .shadow_rules import (
+    backfill_trim_hold_shadows,
     backfill_shadow_rules_from_features,
+    record_position_promotion_shadows,
     summarize_shadow_rules,
     update_shadow_rule_outcomes,
 )
@@ -222,6 +230,13 @@ def _check_latest_decision_artifacts(journal: DecisionJournal) -> dict[str, Any]
 
 def _check_rank_coverage() -> dict[str, Any]:
     """Verify that a recent full-universe rank run examined enough symbols."""
+    strict = bool(getattr(Config, "SCAN_REQUIRE_MIN_RANK_COVERAGE", True))
+    if strict and not bool(getattr(Config, "RANK_COVERAGE_AUDIT_ENABLED", True)):
+        return {
+            "name": "rank_coverage",
+            "status": "FAIL",
+            "message": "Strict rank coverage is enabled, but its immutable coverage audit is disabled.",
+        }
     paths = sorted(RANK_COVERAGE_DIR.glob("*/*.json"), reverse=True)[:100]
     candidates: list[tuple[datetime, int, Path, dict[str, Any]]] = []
     for path in paths:
@@ -239,7 +254,7 @@ def _check_rank_coverage() -> dict[str, Any]:
     if not candidates:
         return {
             "name": "rank_coverage",
-            "status": "WARN",
+            "status": "FAIL" if strict else "WARN",
             "message": "No immutable ranking-coverage audit exists yet.",
         }
 
@@ -257,7 +272,7 @@ def _check_rank_coverage() -> dict[str, Any]:
     coverage = float(summary.get("history_coverage_pct") or 0.0)
     minimum = float(getattr(Config, "RANK_MIN_HISTORY_COVERAGE_PCT", 0.90) or 0.90)
     age_hours = max(0.0, (now - generated).total_seconds() / 3600.0)
-    status = "PASS" if coverage >= minimum and age_hours <= max_age_hours else "WARN"
+    status = "PASS" if coverage >= minimum and age_hours <= max_age_hours else ("FAIL" if strict else "WARN")
     return {
         "name": "rank_coverage",
         "status": status,
@@ -739,6 +754,50 @@ def _check_position_monitoring(journal: DecisionJournal) -> dict[str, Any]:
         return {"name": "position_monitoring", "status": "FAIL", "message": f"Position monitoring check failed: {exc}"}
 
 
+def _check_exit_control_state(
+    journal: DecisionJournal,
+    *,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+) -> dict[str, Any]:
+    """Ensure closed theses cannot remain visible as active exit work."""
+    held_tickers = {
+        str(position.ticker or "").upper()
+        for position in Portfolio.load(Path(portfolio_path)).positions
+    }
+    stale_signals: list[str] = []
+    for signal in journal.get_active_sell_signals():
+        thesis_id = str(signal.get("thesis_id") or "")
+        ticker = str(signal.get("ticker") or "").upper()
+        thesis = journal.get_thesis(thesis_id) if thesis_id else None
+        status = str((thesis or {}).get("status") or "").lower()
+        if status in {"archived", "expired"} or (thesis is None and ticker not in held_tickers):
+            stale_signals.append(str(signal.get("signal_id") or signal.get("ticker") or "unknown"))
+    stale_confirmations: list[str] = []
+    for row in journal.get_pending_exit_confirmations():
+        thesis_id = str(row.get("thesis_id") or "")
+        thesis = journal.get_thesis(thesis_id) if thesis_id else None
+        if not thesis or str(thesis.get("status") or "").lower() not in {"active", "pending_exit"}:
+            stale_confirmations.append(f"{row.get('ticker')}:{thesis_id}")
+    if stale_signals or stale_confirmations:
+        return {
+            "name": "exit_control_state",
+            "status": "FAIL",
+            "message": (
+                f"Closed theses retain {len(stale_signals)} active sell signal(s) and "
+                f"{len(stale_confirmations)} pending exit confirmation(s)."
+            ),
+            "stale_sell_signals": stale_signals,
+            "stale_exit_confirmations": stale_confirmations,
+        }
+    return {
+        "name": "exit_control_state",
+        "status": "PASS",
+        "message": "No closed thesis remains in active sell or exit-confirmation state.",
+        "stale_sell_signals": [],
+        "stale_exit_confirmations": [],
+    }
+
+
 def _check_broker_reconciliation_snapshot() -> dict[str, Any]:
     """Verify Robinhood reconciliation has a fresh, account-checked snapshot when holdings exist."""
     try:
@@ -1036,12 +1095,21 @@ def _check_broker_fill_accounting(
     *,
     portfolio_path: str | Path = PORTFOLIO_FILE,
 ) -> dict[str, Any]:
-    """Verify every broker sell fill reached the shared accounting contract."""
-    sell_orders = [
+    """Verify broker fills reached accounting and position-learning contracts."""
+    all_filled_orders = [
         row
         for row in journal.get_execution_orders(limit=5000)
+        if str(row.get("status") or "").lower() in {"filled", "partially_filled"}
+    ]
+    buy_orders = [
+        row
+        for row in all_filled_orders
+        if str(row.get("side") or "").lower() == "buy"
+    ]
+    sell_orders = [
+        row
+        for row in all_filled_orders
         if str(row.get("side") or "").lower() == "sell"
-        and str(row.get("status") or "").lower() == "filled"
     ]
     effects = journal.get_broker_fill_effects(limit=5000)
     events = journal.get_sell_trade_events(limit=5000)
@@ -1091,11 +1159,12 @@ def _check_broker_fill_accounting(
         and row.get("thesis_id")
         and str(row.get("event_id") or "") not in tracking_event_ids
     ]
-    episode_theses = {
-        str(row.get("thesis_id") or "")
+    episodes_by_thesis = {
+        str(row.get("thesis_id") or ""): row
         for row in episodes
         if row.get("thesis_id")
     }
+    episode_theses = set(episodes_by_thesis)
     missing_episodes = sorted(
         {
             str(row.get("thesis_id") or "")
@@ -1105,7 +1174,27 @@ def _check_broker_fill_accounting(
         }
     )
 
-    held = {position.ticker.upper() for position in Portfolio.load(Path(portfolio_path)).positions}
+    portfolio = Portfolio.load(Path(portfolio_path))
+    held = {position.ticker.upper() for position in portfolio.positions}
+    held_theses = {
+        str(position.thesis_id): position.ticker.upper()
+        for position in portfolio.positions
+        if getattr(position, "thesis_id", None)
+    }
+    missing_buy_episodes = sorted(
+        {
+            str(row.get("thesis_id") or "")
+            for row in buy_orders
+            if row.get("thesis_id")
+            and str(row.get("thesis_id") or "") not in episode_theses
+        }
+    )
+    missing_held_episodes = sorted(
+        f"{ticker}:{thesis_id}"
+        for thesis_id, ticker in held_theses.items()
+        if thesis_id not in episodes_by_thesis
+        or str(episodes_by_thesis[thesis_id].get("status") or "").lower() != "open"
+    )
     trim_cooldown_missing: list[str] = []
     for event in events:
         if str(event.get("event_type") or "").upper() != "TRIM":
@@ -1123,14 +1212,21 @@ def _check_broker_fill_accounting(
             trim_cooldown_missing.append(str(event.get("event_id") or ticker))
 
     hard_failures = (
-        missing_effects + missing_events + missing_exit_tracking + trim_cooldown_missing
+        missing_effects
+        + missing_events
+        + missing_exit_tracking
+        + trim_cooldown_missing
+        + missing_buy_episodes
+        + missing_held_episodes
     )
     if hard_failures:
         status = "FAIL"
         message = (
             f"Sell-fill contract is incomplete: {len(missing_effects)} missing effect(s), "
             f"{len(missing_events)} missing event(s), {len(missing_exit_tracking)} missing "
-            f"post-sell tracker(s), {len(trim_cooldown_missing)} missing trim cooldown(s)."
+            f"post-sell tracker(s), {len(trim_cooldown_missing)} missing trim cooldown(s), "
+            f"{len(missing_buy_episodes)} buy episode(s), and "
+            f"{len(missing_held_episodes)} held/open episode(s)."
         )
     elif missing_episodes:
         status = "WARN"
@@ -1138,7 +1234,8 @@ def _check_broker_fill_accounting(
     else:
         status = "PASS"
         message = (
-            f"{len(sell_orders)} filled sell order(s) have durable effects/events; "
+            f"{len(buy_orders)} filled buy and {len(sell_orders)} filled sell order(s) "
+            "have durable accounting/learning records; "
             f"{len(episodes)} position episode(s) and {len(tracking)} post-sell tracker(s) are recorded."
         )
     return {
@@ -1146,6 +1243,7 @@ def _check_broker_fill_accounting(
         "status": status,
         "message": message,
         "filled_sell_orders": len(sell_orders),
+        "filled_buy_orders": len(buy_orders),
         "fill_effects": len(effects),
         "sell_events": len(events),
         "position_episodes": len(episodes),
@@ -1154,6 +1252,8 @@ def _check_broker_fill_accounting(
         "missing_events": missing_events[:20],
         "missing_exit_tracking": missing_exit_tracking[:20],
         "missing_episodes": missing_episodes[:20],
+        "missing_buy_episodes": missing_buy_episodes[:20],
+        "missing_held_episodes": missing_held_episodes[:20],
         "trim_cooldown_missing": trim_cooldown_missing[:20],
     }
 
@@ -1285,6 +1385,40 @@ def _check_execution_learning(
     }
 
 
+def _check_feedback_loop(journal: DecisionJournal) -> dict[str, Any]:
+    """Prove that each feedback producer has a guarded downstream consumer."""
+    report = build_feedback_loop_report(journal)
+    status = str(report.get("status") or "FAIL").upper()
+    if status == "FAIL":
+        message = "Feedback-loop integrity failed: " + "; ".join(
+            str(item) for item in (report.get("failures") or [])
+        )
+    elif status == "WARN":
+        message = "Feedback loops are connected with measurement gaps: " + "; ".join(
+            str(item) for item in (report.get("warnings") or [])
+        )
+    else:
+        buy = report.get("buy_outcome_feedback") or {}
+        sell = report.get("sell_outcome_feedback") or {}
+        sentinel = report.get("sentinel_feedback") or {}
+        shadow = report.get("shadow_feedback") or {}
+        provenance = report.get("decision_provenance") or {}
+        message = (
+            "Guarded feedback loops are connected: "
+            f"{buy.get('current_era_graded', 0)} current-era buy grades, "
+            f"{sell.get('completed', 0)}/{sell.get('minimum_completed', 0)} mature sell reviews, "
+            f"{shadow.get('completed', 0)} completed shadow evaluations, "
+            f"Sentinel escalation={'on' if sentinel.get('sell_council_escalation_enabled') else 'off'}, "
+            f"dossier provenance={provenance.get('status', 'unknown')}."
+        )
+    return {
+        "name": "feedback_loop",
+        "status": status,
+        "message": message,
+        "report": report,
+    }
+
+
 def _check_telegram(sender: TelegramSender) -> dict[str, Any]:
     if sender.enabled:
         return {"name": "telegram", "status": "PASS", "message": "Telegram is configured."}
@@ -1411,6 +1545,18 @@ def run_supervisor_check(
 
     logger.info("[supervisor] Starting Supervisor v1")
     operations: list[dict[str, Any]] = []
+    op = _timed_operation("trim_hold_shadow_backfill", lambda: backfill_trim_hold_shadows(journal))
+    operations.append(op)
+
+    op = _timed_operation(
+        "position_promotion_shadow",
+        lambda: record_position_promotion_shadows(
+            journal,
+            portfolio_path=PORTFOLIO_FILE,
+        ),
+    )
+    operations.append(op)
+
     op = _timed_operation("shadow_rule_outcome_update", lambda: update_shadow_rule_outcomes(journal))
     operations.append(op)
     shadow_updates = op.get("result") or {"updated": 0, "errors": 1 if op.get("status") == "FAIL" else 0, "skipped": 0}
@@ -1422,6 +1568,27 @@ def run_supervisor_check(
     op = _timed_operation("decision_feature_backfill", lambda: backfill_decision_features(journal))
     operations.append(op)
     decision_backfilled = op.get("result") if op.get("status") == "PASS" else 0
+
+    op = _timed_operation("lesson_route_reconciliation", reconcile_lesson_routes)
+    operations.append(op)
+
+    op = _timed_operation(
+        "position_episode_backfill",
+        lambda: backfill_position_trade_episodes(
+            journal,
+            portfolio_path=PORTFOLIO_FILE,
+        ),
+    )
+    operations.append(op)
+
+    op = _timed_operation(
+        "closed_position_control_state_reconciliation",
+        lambda: reconcile_closed_position_control_state(
+            journal,
+            portfolio_path=PORTFOLIO_FILE,
+        ),
+    )
+    operations.append(op)
 
     op = _timed_operation(
         "trade_action_reconciliation",
@@ -1478,9 +1645,11 @@ def run_supervisor_check(
         _timed_check("recent_sessions", lambda: _check_recent_sessions(journal)),
         _timed_check("defer_watchlist", lambda: _check_defer_watches(journal)),
         _timed_check("position_monitoring", lambda: _check_position_monitoring(journal)),
+        _timed_check("exit_control_state", lambda: _check_exit_control_state(journal)),
         _timed_check("broker_fill_accounting", lambda: _check_broker_fill_accounting(journal)),
         _timed_check("position_classification", lambda: _check_position_classification()),
         _timed_check("execution_learning", lambda: _check_execution_learning(journal)),
+        _timed_check("feedback_loop", lambda: _check_feedback_loop(journal)),
         _timed_check("broker_reconciliation", lambda: _check_broker_reconciliation_snapshot()),
         _timed_check("calibration_diagnosis", lambda: _check_calibration_and_diagnosis(journal)),
         _timed_check("shadow_rules", lambda: _check_shadow_rules(journal)),

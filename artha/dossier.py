@@ -164,6 +164,8 @@ def _stock_snapshot(stock_data: dict[str, Any]) -> dict[str, Any]:
         "funnel_candidate": _json_safe(stock_data.get("funnel_candidate") or {}),
         "alpha_shadow_signals": _json_safe(stock_data.get("alpha_shadow_signals") or {}),
         "calibration_meta_signal": _json_safe(stock_data.get("calibration_meta_signal") or {}),
+        "council_learning_context": _json_safe(stock_data.get("council_learning_context") or {}),
+        "sentinel_risk_context": _json_safe(stock_data.get("sentinel_risk_context") or {}),
         "sec": {
             "companyfacts_available": bool(sec_companyfacts),
             "filings_available": bool(sec_filings),
@@ -207,6 +209,8 @@ def extract_decision_feature_row(dossier: dict[str, Any], dossier_path: str) -> 
         "portfolio_factor_risk": portfolio_risk,
         "alpha_shadow_signals": stock.get("alpha_shadow_signals") or {},
         "calibration_meta_signal": stock.get("calibration_meta_signal") or {},
+        "council_learning_context": stock.get("council_learning_context") or {},
+        "sentinel_risk_context": stock.get("sentinel_risk_context") or {},
         "analyst_verdicts": {
             key: (value or {}).get("verdict")
             for key, value in (dossier.get("analysts") or {}).items()
@@ -272,7 +276,7 @@ def write_decision_dossier(
     evidence = [item for item in evidence if isinstance(item, dict)]
 
     dossier = {
-        "schema_version": 1,
+        "schema_version": 2,
         "ticker": ticker,
         "generated_at": generated.isoformat(),
         "decision": {
@@ -322,6 +326,8 @@ def write_decision_dossier(
             "intelligence_brief": _json_safe(intelligence_brief),
             "pre_brief": _json_safe(pre_brief),
             "momentum_context": _json_safe(momentum_context),
+            "council_learning": _json_safe(stock_data.get("council_learning_context") or {}),
+            "sentinel_risk": _json_safe(stock_data.get("sentinel_risk_context") or {}),
         },
     }
 

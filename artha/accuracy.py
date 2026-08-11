@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -232,35 +233,62 @@ def _brier_score(verdict: str, confidence: object, excess_pct: Decimal) -> Optio
     return round((probability - float(outcome)) ** 2, 4)
 
 
-# --- Benchmark price helpers (FMP EOD, cached per process) -----------------
-_history_cache: dict[str, Optional[list[dict]]] = {}
+# --- Benchmark price helpers (FMP EOD, short-lived successful-result cache) -
+_HISTORY_CACHE_TTL_SECONDS = 15 * 60
+_history_cache: dict[str, tuple[float, list[dict]]] = {}
 
 
 def _fmp_history(symbol: str, period: str = "1y") -> Optional[list[dict]]:
-    """Fetch (and cache) FMP EOD history rows sorted ascending by date."""
+    """Fetch FMP EOD history without making transient failures permanent."""
     symbol = str(symbol or "").upper().strip()
     if not symbol:
         return None
     cache_key = f"{symbol}:{period}"
-    if cache_key not in _history_cache:
-        try:
-            from .collector import FMPCollector
-            _history_cache[cache_key] = FMPCollector().history(symbol, period=period)
-        except Exception as exc:
-            logger.warning("[accuracy] FMP history failed for %s: %s", symbol, exc)
-            _history_cache[cache_key] = None
-    return _history_cache[cache_key]
+    cached = _history_cache.get(cache_key)
+    if cached and time.monotonic() - cached[0] < _HISTORY_CACHE_TTL_SECONDS:
+        return cached[1]
+    try:
+        from .collector import FMPCollector
+
+        rows = FMPCollector().history(symbol, period=period)
+    except Exception as exc:
+        logger.warning("[accuracy] FMP history failed for %s: %s", symbol, exc)
+        _history_cache.pop(cache_key, None)
+        return None
+    if not isinstance(rows, list) or not rows:
+        _history_cache.pop(cache_key, None)
+        return None
+    _history_cache[cache_key] = (time.monotonic(), rows)
+    return rows
 
 
-def _close_on_or_after(rows: Optional[list[dict]], target_date: str) -> Optional[float]:
-    """First close on/after an ISO date from ascending FMP history rows."""
+def _close_on_or_after(
+    rows: Optional[list[dict]],
+    target_date: str,
+    *,
+    max_calendar_days: int = 7,
+) -> Optional[float]:
+    """First nearby close on/after an ISO date from ascending FMP rows.
+
+    Weekends and exchange holidays require a small forward tolerance. A larger
+    gap indicates incomplete provider history and must not silently change the
+    measurement horizon.
+    """
     if not rows:
         return None
+    target = _parse_dt(f"{target_date[:10]}T00:00:00+00:00")
+    if target is None:
+        return None
+    latest = target + timedelta(days=max(0, int(max_calendar_days)))
     for row in rows:
-        if str(row.get("date") or "") >= target_date[:10]:
-            close = row.get("close")
-            if close:
-                return float(close)
+        row_date = _parse_dt(f"{str(row.get('date') or '')[:10]}T00:00:00+00:00")
+        if row_date is None or row_date < target:
+            continue
+        if row_date > latest:
+            return None
+        close = row.get("close")
+        if close:
+            return float(close)
     return None
 
 
@@ -646,6 +674,262 @@ class AccuracyTracker:
         finally:
             self._unlock(lf)
 
+    def backfill_missing_benchmark_grades(
+        self,
+        now: Optional[datetime] = None,
+        *,
+        max_tickers: int = 25,
+        current_era_only: bool = True,
+    ) -> dict[str, Any]:
+        """Retry fallback grades in bounded batches without holding an I/O lock.
+
+        Provider calls happen against a read snapshot. The exclusive lock is
+        reacquired only to apply still-missing results, so Council recording is
+        never blocked behind a long historical-data fetch.
+        """
+        now = now or _utcnow()
+        lf = self._lock(exclusive=False)
+        try:
+            snapshot = self._load()
+        finally:
+            self._unlock(lf)
+
+        candidates: list[dict[str, Any]] = []
+        for rec in snapshot:
+            if rec.get("status") != "GRADED":
+                continue
+            if str(rec.get("grade_basis") or "") != "absolute_legacy_fallback":
+                continue
+            if current_era_only and not _is_current_era(rec):
+                continue
+            rec_dt = _record_timestamp(rec)
+            if not rec_dt or rec_dt + timedelta(days=ACCURACY_REVIEW_DAYS) > now:
+                continue
+            if _to_decimal(rec.get("entry_price", "0")) <= 0:
+                continue
+            candidates.append(dict(rec))
+
+        ticker_limit = max(0, int(max_tickers))
+        last_attempt_by_ticker: dict[str, str] = {}
+        for row in candidates:
+            ticker = str(row.get("ticker") or "").upper()
+            attempted_at = str(row.get("benchmark_backfill_last_attempt_at") or "")
+            existing = last_attempt_by_ticker.get(ticker)
+            if existing is None or attempted_at < existing:
+                last_attempt_by_ticker[ticker] = attempted_at
+        selected_tickers = [
+            ticker
+            for ticker, _ in sorted(
+                last_attempt_by_ticker.items(),
+                key=lambda item: (item[1], item[0]),
+            )[:ticker_limit]
+        ]
+        selected_set = set(selected_tickers)
+        attempted_keys: set[tuple[str, str]] = set()
+        prepared: dict[tuple[str, str], tuple[Decimal, Decimal, Decimal]] = {}
+        skipped = 0
+        for rec in candidates:
+            ticker = str(rec.get("ticker") or "").upper()
+            timestamp = str(rec.get("timestamp") or "")
+            if ticker not in selected_set:
+                continue
+            attempted_keys.add((ticker, timestamp))
+            rec_dt = _record_timestamp(rec)
+            if not rec_dt:
+                skipped += 1
+                continue
+            review_dt = rec_dt + timedelta(days=ACCURACY_REVIEW_DAYS)
+            review_close = _close_on_or_after(
+                _fmp_history(ticker, period="5y"),
+                review_dt.date().isoformat(),
+            )
+            benchmark_return = _benchmark_return_pct(rec_dt, review_dt, period="5y")
+            entry = _to_decimal(rec.get("entry_price", "0"))
+            if not review_close or benchmark_return is None or entry <= 0:
+                skipped += 1
+                continue
+            current = _to_decimal(review_close)
+            change_pct = ((current - entry) / entry * 100).quantize(CENTS)
+            prepared[(ticker, timestamp)] = (current, change_pct, benchmark_return)
+
+        regraded = 0
+        if attempted_keys:
+            lf = self._lock(exclusive=True)
+            try:
+                records = self._load()
+                changed = False
+                for idx, rec in enumerate(records):
+                    key = (
+                        str(rec.get("ticker") or "").upper(),
+                        str(rec.get("timestamp") or ""),
+                    )
+                    if key not in attempted_keys:
+                        continue
+                    if str(rec.get("grade_basis") or "") != "absolute_legacy_fallback":
+                        continue
+                    updated = dict(rec)
+                    updated["benchmark_backfill_last_attempt_at"] = now.isoformat()
+                    updated["benchmark_backfill_attempts"] = (
+                        int(updated.get("benchmark_backfill_attempts") or 0) + 1
+                    )
+                    values = prepared.get(key)
+                    if values is None:
+                        records[idx] = updated
+                        changed = True
+                        continue
+                    previous_grade = str(rec.get("grade") or "")
+                    current, change_pct, benchmark_return = values
+                    updated = self._apply_grade_fields(
+                        updated,
+                        current,
+                        change_pct,
+                        benchmark_return,
+                    )
+                    updated.setdefault("previous_grade", previous_grade)
+                    updated["benchmark_backfilled_at"] = now.isoformat()
+                    records[idx] = updated
+                    regraded += 1
+                    changed = True
+                if changed:
+                    self._save(records)
+            finally:
+                self._unlock(lf)
+
+        remaining = max(0, len(candidates) - regraded)
+        return {
+            "eligible_fallback_records": len(candidates),
+            "selected_tickers": len(selected_tickers),
+            "attempted_records": len(attempted_keys),
+            "prepared": len(prepared),
+            "regraded": regraded,
+            "skipped": skipped,
+            "remaining": remaining,
+            "current_era_only": bool(current_era_only),
+        }
+
+    def grade_due_recommendations_from_history(
+        self,
+        now: Optional[datetime] = None,
+        *,
+        max_records: int = 250,
+    ) -> dict[str, Any]:
+        """Grade due recommendations at the fixed review horizon.
+
+        Historical ticker and benchmark closes are fetched outside the file
+        lock. Missing provider data leaves a recommendation pending for a
+        later retry instead of closing it with a different time horizon.
+        """
+        current_time = now or _utcnow()
+        lf = self._lock(exclusive=False)
+        try:
+            snapshot = self._load()
+        finally:
+            self._unlock(lf)
+
+        due: list[dict[str, Any]] = []
+        for rec in snapshot:
+            if rec.get("status") != "PENDING":
+                continue
+            rec_dt = _record_timestamp(rec)
+            if rec_dt is None:
+                continue
+            review_dt = rec_dt + timedelta(days=ACCURACY_REVIEW_DAYS)
+            if review_dt <= current_time:
+                due.append(dict(rec))
+        due.sort(
+            key=lambda rec: (
+                str(rec.get("review_after") or ""),
+                str(rec.get("ticker") or ""),
+                str(rec.get("timestamp") or ""),
+            )
+        )
+        total_due = len(due)
+        due = due[: max(0, int(max_records))]
+
+        prepared: dict[
+            tuple[str, str],
+            tuple[Decimal, Decimal, Decimal, Decimal, datetime, bool],
+        ] = {}
+        skipped: list[dict[str, str]] = []
+        for rec in due:
+            ticker = str(rec.get("ticker") or "").upper().strip()
+            timestamp = str(rec.get("timestamp") or "")
+            rec_dt = _record_timestamp(rec)
+            if not ticker or rec_dt is None:
+                skipped.append({"ticker": ticker, "timestamp": timestamp, "reason": "invalid_identity"})
+                continue
+            review_dt = rec_dt + timedelta(days=ACCURACY_REVIEW_DAYS)
+            rows = _fmp_history(ticker, period="5y")
+            entry = _to_decimal(rec.get("entry_price", "0"))
+            entry_backfilled = False
+            if entry <= 0:
+                entry_close = _close_on_or_after(rows, rec_dt.date().isoformat())
+                if entry_close:
+                    entry = _to_decimal(entry_close)
+                    entry_backfilled = True
+            review_close = _close_on_or_after(rows, review_dt.date().isoformat())
+            benchmark_return = _benchmark_return_pct(rec_dt, review_dt, period="5y")
+            if entry <= 0 or not review_close or benchmark_return is None:
+                skipped.append(
+                    {"ticker": ticker, "timestamp": timestamp, "reason": "historical_data_unavailable"}
+                )
+                continue
+            current = _to_decimal(review_close)
+            change_pct = ((current - entry) / entry * 100).quantize(CENTS)
+            prepared[(ticker, timestamp)] = (
+                entry,
+                current,
+                change_pct,
+                benchmark_return,
+                review_dt,
+                entry_backfilled,
+            )
+
+        graded_records: list[dict[str, Any]] = []
+        if prepared:
+            lf = self._lock(exclusive=True)
+            try:
+                records = self._load()
+                changed = False
+                for idx, rec in enumerate(records):
+                    key = (
+                        str(rec.get("ticker") or "").upper(),
+                        str(rec.get("timestamp") or ""),
+                    )
+                    values = prepared.get(key)
+                    if values is None or rec.get("status") != "PENDING":
+                        continue
+                    entry, current, change_pct, benchmark_return, review_dt, entry_backfilled = values
+                    updated = dict(rec)
+                    if entry_backfilled:
+                        updated["entry_price"] = str(entry)
+                    updated = self._apply_grade_fields(
+                        updated,
+                        current,
+                        change_pct,
+                        benchmark_return,
+                    )
+                    updated["graded_at"] = current_time.isoformat()
+                    updated["review_window_end"] = review_dt.isoformat()
+                    updated["review_price_source"] = "fmp_eod_close_on_or_after_fixed_horizon"
+                    records[idx] = updated
+                    graded_records.append(dict(updated))
+                    changed = True
+                if changed:
+                    self._save(records)
+            finally:
+                self._unlock(lf)
+
+        return {
+            "due": total_due,
+            "selected": len(due),
+            "graded": len(graded_records),
+            "graded_records": graded_records,
+            "skipped": skipped,
+            "remaining_due": max(0, total_due - len(graded_records)),
+            "fixed_review_days": ACCURACY_REVIEW_DAYS,
+        }
+
     def backfill_recommendation_outcomes(self, journal: Any = None) -> int:
         """Grade matured artha.db recommendation rows the same excess-vs-benchmark way.
 
@@ -705,7 +989,7 @@ class AccuracyTracker:
         logger.info("[accuracy] Backfilled outcomes for %d recommendation row(s)", updated)
         return updated
 
-    def get_summary_stats(self, since: object = None) -> dict:
+    def get_summary_stats(self, since: object = None, *, benchmark_only: bool = False) -> dict:
         """Return aggregate accuracy statistics."""
         since_dt = _parse_dt(since) if since is not None else None
         lf = self._lock(exclusive=False)
@@ -720,7 +1004,17 @@ class AccuracyTracker:
                 if (ts := _record_timestamp(r)) is not None and ts >= since_dt
             ]
 
-        graded = [r for r in records if r.get("status") == "GRADED"]
+        all_graded = [r for r in records if r.get("status") == "GRADED"]
+        graded = [
+            row
+            for row in all_graded
+            if not benchmark_only
+            or (
+                str(row.get("grade_basis") or "").startswith("excess_vs_")
+                and _num_or_none(row.get("excess_return_pct")) is not None
+            )
+        ]
+        excluded_nonbenchmark = len(all_graded) - len(graded)
         pending = [r for r in records if r.get("status") == "PENDING"]
 
         if not graded:
@@ -734,6 +1028,8 @@ class AccuracyTracker:
                 "strict_accuracy": None,
                 "analyst_accuracy": {},
                 "scope_start": since_dt.isoformat() if since_dt else None,
+                "benchmark_only": bool(benchmark_only),
+                "excluded_nonbenchmark": excluded_nonbenchmark,
             }
 
         correct = sum(1 for r in graded if r.get("grade") == "CORRECT")
@@ -798,6 +1094,8 @@ class AccuracyTracker:
             "incorrect": incorrect,
             "analyst_accuracy": analyst_accuracy,
             "scope_start": since_dt.isoformat() if since_dt else None,
+            "benchmark_only": bool(benchmark_only),
+            "excluded_nonbenchmark": excluded_nonbenchmark,
             "avg_price_change": round(
                 sum(float(r.get("price_change_pct", 0)) for r in graded if r.get("grade") != "UNGRADED") / total, 2
             ) if total else 0,
@@ -1056,7 +1354,10 @@ class AccuracyTracker:
     def format_monthly_report(self) -> Optional[str]:
         """Format a Telegram-friendly monthly accuracy report."""
         stats = self.get_summary_stats()
-        current_stats = self.get_summary_stats(since=Config.ACCURACY_CURRENT_ERA_START)
+        current_stats = self.get_summary_stats(
+            since=Config.ACCURACY_CURRENT_ERA_START,
+            benchmark_only=True,
+        )
         if stats["total_graded"] == 0 and stats["total_pending"] == 0:
             return None
 

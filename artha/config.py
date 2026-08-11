@@ -453,6 +453,9 @@ class Config:
     SENTINEL_KEYWORD_ONLY: bool = False  # If True, skip GPT classification
     SENTINEL_SONNET_BATCH_MAX: int = 30  # Backward-compatible name; max headlines per GPT batch
     SENTINEL_ALERT_COOLDOWN_HOURS: int = 6  # Dedupe window for sentinel alerts
+    SENTINEL_VERIFIED_NEGATIVE_LOOKBACK_HOURS: int = _env_int(
+        "ARTHA_SENTINEL_VERIFIED_NEGATIVE_LOOKBACK_HOURS", 24
+    )
 
     # -------------------------------------------------------------------------
     # Crisis Mode v3 Settings
@@ -771,6 +774,18 @@ class Config:
         "agentic-gpt-gemini-gpt-2026-06-02",
     )
     ACCURACY_MIN_PATTERN_SAMPLES: int = int(os.getenv("ARTHA_ACCURACY_MIN_PATTERN_SAMPLES", "3"))
+    ACCURACY_BENCHMARK_BACKFILL_ENABLED: bool = os.getenv(
+        "ARTHA_ACCURACY_BENCHMARK_BACKFILL_ENABLED",
+        "true",
+    ).lower() in ("1", "true", "yes")
+    ACCURACY_BENCHMARK_BACKFILL_MAX_TICKERS: int = _env_int(
+        "ARTHA_ACCURACY_BENCHMARK_BACKFILL_MAX_TICKERS",
+        25,
+    )
+    ACCURACY_NIGHTLY_GRADE_MAX_RECORDS: int = _env_int(
+        "ARTHA_ACCURACY_NIGHTLY_GRADE_MAX_RECORDS",
+        250,
+    )
 
     # -------------------------------------------------------------------------
     # Sell-Side Engine Settings
@@ -831,6 +846,10 @@ class Config:
     ).lower() in ("1", "true", "yes")
     SELL_ESCALATE_HIGH_NEWS_TO_LLM: bool = os.getenv(
         "ARTHA_SELL_ESCALATE_HIGH_NEWS_TO_LLM",
+        "true",
+    ).lower() in ("1", "true", "yes")
+    SELL_SENTINEL_COUNCIL_ESCALATION_ENABLED: bool = os.getenv(
+        "ARTHA_SELL_SENTINEL_COUNCIL_ESCALATION_ENABLED",
         "true",
     ).lower() in ("1", "true", "yes")
     SELL_HIGH_NEWS_SEMANTIC_MIN_CONFIDENCE: float = float(

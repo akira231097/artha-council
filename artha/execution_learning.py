@@ -1,8 +1,8 @@
 """Observational execution-quality measurements.
 
-This module deliberately has no connection to Council prompts, scores, order
-sizing, or broker placement. It summarizes completed position episodes and
-sell events so the supervisor can detect one-sided or missing learning data.
+This module summarizes completed position episodes and sell events. Mature
+60-day sell outcomes may enter Sell Council as sample-gated advisory context;
+they never alter scores, sizing, deterministic gates, or broker placement.
 """
 from __future__ import annotations
 

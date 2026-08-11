@@ -25,7 +25,7 @@ from .execution import (
     mask_account_number,
     normalize_robinhood_position_snapshot,
 )
-from .fill_finalizer import finalize_broker_sell_fill
+from .fill_finalizer import finalize_broker_buy_fill_learning, finalize_broker_sell_fill
 from .journal import DecisionJournal
 from .portfolio import PORTFOLIO_FILE, Portfolio, Position
 from .position_classification import attach_position_classification
@@ -1567,6 +1567,15 @@ def _projected_sector_gate_for_action(
     """Repeat exact post-order sector exposure using current portfolio state."""
     try:
         resolved_intent = intent or _order_intent_for_action(row)
+        side = str(getattr(resolved_intent, "side", "") or "").lower().strip()
+        if side != "buy":
+            return {
+                "passed": True,
+                "status": "NOT_APPLICABLE",
+                "side": side or "unknown",
+                "reasons": [],
+                "reason": "Projected sector concentration applies only to buy orders.",
+            }
         notional = _resolved_notional_for_intent(resolved_intent)
         evidence = (
             resolved_intent.evidence
@@ -3453,7 +3462,15 @@ def record_order_fill(
             ):
                 portfolio.save(Path(portfolio_path))
                 portfolio_repaired = True
+            buy_learning = finalize_broker_buy_fill_learning(
+                journal=journal,
+                execution_row=row,
+                ticker=ticker,
+                portfolio_path=portfolio_path,
+                source="already_applied_buy_repair",
+            )
         elif side == "sell":
+            buy_learning = None
             portfolio_repaired = _repair_already_applied_sell_fill(
                 row=row,
                 journal=journal,
@@ -3490,6 +3507,9 @@ def record_order_fill(
             "broker_order_id": broker_order_id,
             "already_recorded": True,
             "portfolio_repaired": portfolio_repaired,
+            "episode_id": (
+                buy_learning.get("episode_id") if side == "buy" and buy_learning else None
+            ),
         }
     if already_applied and applied_quantity > 0 and quantity > applied_quantity:
         quantity_to_apply = quantity - applied_quantity
@@ -3553,6 +3573,14 @@ def record_order_fill(
                     "notes": "Robinhood fill matched existing broker-synced portfolio position; no duplicate share mutation applied.",
                 },
             )
+            refreshed_row = journal.get_execution_order_by_intent_id(order_intent_id) or row
+            buy_learning = finalize_broker_buy_fill_learning(
+                journal=journal,
+                execution_row=refreshed_row,
+                ticker=ticker,
+                portfolio_path=portfolio_path,
+                source="broker_snapshot_already_reflected",
+            )
             linked_action = journal.get_trade_action_by_intent_id(order_intent_id)
             if linked_action:
                 journal.update_trade_action(
@@ -3584,6 +3612,7 @@ def record_order_fill(
                 "broker_order_id": broker_order_id,
                 "already_recorded": True,
                 "source": "broker_snapshot_already_reflected",
+                "episode_id": buy_learning.get("episode_id"),
             }
         if thesis and getattr(thesis, "status", "") == "pending":
             thesis = tracker.activate_thesis(thesis.thesis_id, avg_price, shares=quantity)
@@ -3682,6 +3711,16 @@ def record_order_fill(
             "notes": "Robinhood fill recorded; Artha portfolio/thesis state updated.",
         },
     )
+    buy_learning: dict[str, Any] | None = None
+    if side == "buy":
+        refreshed_row = journal.get_execution_order_by_intent_id(order_intent_id) or row
+        buy_learning = finalize_broker_buy_fill_learning(
+            journal=journal,
+            execution_row=refreshed_row,
+            ticker=ticker,
+            portfolio_path=portfolio_path,
+            source="broker_fill_callback",
+        )
     linked_action = journal.get_trade_action_by_intent_id(order_intent_id)
     if linked_action:
         journal.update_trade_action(
@@ -3704,6 +3743,7 @@ def record_order_fill(
         "quantity": quantity,
         "avg_price": avg_price,
         "broker_order_id": broker_order_id,
+        "episode_id": buy_learning.get("episode_id") if buy_learning else None,
         **(
             {
                 "already_recorded": bool(sell_finalization.get("already_recorded")),

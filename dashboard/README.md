@@ -1,42 +1,66 @@
-# ARTHA Dashboard
+# ARTHA Control Room
 
-Real-time, phone-friendly observability for the ARTHA trading agent. One page:
-portfolio vitals, equity curve with trade markers, positions with stop-loss
-protection bars, today's activity timeline, council decisions, the self-grading
-report card + lessons, system health, and the fixes/self-improvement feed.
+ARTHA's read-only operations dashboard. It is designed to answer six questions
+without requiring the reader to understand the trading code:
 
-## Architecture
+1. Is ARTHA healthy right now?
+2. How is the portfolio performing?
+3. What does ARTHA own, and how is each holding protected?
+4. Why did Council buy, wait, or avoid, and what happened at Robinhood?
+5. How did the market universe narrow into Council candidates?
+6. What is genuinely learning versus still collecting evidence?
 
-- `server.py` — stdlib-only Python HTTP server (no dependencies). Assembles
-  `/api/dashboard` from ARTHA's live data files and the journal DB
-  (**strictly read-only**: sqlite `mode=ro`, 2s busy timeout). Shellouts
-  (openclaw cron state, git log) are cached 5 min and time-boxed. Its only
-  writes are under `data/dashboard/` (access token, intraday equity samples).
-- `index.html` — single-page vanilla JS/CSS, hand-rolled SVG charts, zero CDN.
-  Polls every 15s while the market is open, 60s otherwise.
+## Views
+
+- **Overview** - alarms, portfolio value, capacity, equity curve, today's work,
+  and the latest Council-to-broker journey.
+- **Portfolio** - holdings, stops, latest sell review, sector concentration, and
+  realized/unrealized results.
+- **Decisions** - Council verdict, Execution Officer outcome, and Robinhood fill
+  or block reason shown as three separate stages.
+- **How ARTHA Works** - live scan coverage, funnel/router/Scout/Council counts,
+  and plain-language pipeline explanations.
+- **Learning** - benchmark grades, closed trade episodes, post-sell maturity,
+  paper trials, calibration, Sentinel, and explicit strategy-effect gates.
+- **Health** - the current trading cage, services, all Supervisor checks, and
+  the operating schedule.
+
+## Architecture and safety
+
+- `server.py` assembles `/api/dashboard` from ARTHA's local records and SQLite
+  journal in read-only mode.
+- `index.html`, `styles.css`, and `app.js` provide a dependency-free responsive
+  interface suitable for a phone, tablet, or desktop.
+- `test_dashboard.py` protects the dashboard contract, privacy boundary,
+  current trading limits, decision/execution linkage, and chart anomaly filter.
+- Broker account numbers, credentials, and raw broker payloads are never sent
+  to the browser.
+- The service cannot review, place, cancel, or modify an order. Its only writes
+  are the private dashboard token and chart samples under `data/dashboard/`.
+- The API refreshes every 15 seconds during estimated regular market hours and
+  every minute otherwise. Robinhood remains the authority for market/session
+  and trade execution checks.
 
 ## Access
 
-- Served on `0.0.0.0:8787` (`ARTHA_DASHBOARD_PORT` to change).
-- Token auth: `data/dashboard/token.txt` (auto-generated, chmod 600).
-  Open `http://<host>:8787/?k=<token>` once — a cookie keeps you signed in.
-- Phone on home Wi-Fi: `http://192.168.1.158:8787/?k=<token>`
-- Anywhere via Tailscale: `http://100.88.234.49:8787/?k=<token>`
-  (requires Tailscale on the phone, same tailnet).
+- Service: `0.0.0.0:8787` (`ARTHA_DASHBOARD_PORT` can override it).
+- Authentication: `data/dashboard/token.txt`, generated with file mode `0600`.
+- Open the private URL containing `?k=<token>` once. The server stores a
+  same-site, HTTP-only cookie and redirects to a clean URL without the token.
+- Home network: `http://<private-lan-address>:8787/`
+- Private overlay network: `http://<private-overlay-address>:8787/`
+
+Existing saved private links continue to work; the access token is unchanged.
 
 ## Service
 
-launchd label `com.artha.dashboard` (plist in `data/launchd/`):
+The launchd label is `com.artha.dashboard`. Logs are written to
+`data/logs/dashboard.out.log` and `data/logs/dashboard.err.log`.
 
-```sh
-cp data/launchd/com.artha.dashboard.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.artha.dashboard.plist
-```
+## Data-quality note
 
-Logs: `data/logs/dashboard.{out,err}.log`.
-
-## Notes
-
-- Equity history before 2026-06-16 18:00Z is excluded: those snapshots
-  double-counted the first buy (pre-fix accounting) and would show a fake loss.
-- The dashboard never places orders and cannot modify ARTHA state.
+Portfolio snapshots before `2026-06-16T18:00:00Z` are excluded because the
+pre-fix ledger double-counted the first buy. The chart also hides isolated
+single-point accounting spikes that strongly disagree with both neighboring
+snapshots. The raw journal remains untouched, and the dashboard reports the
+number of hidden chart points.

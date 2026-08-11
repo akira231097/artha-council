@@ -84,6 +84,12 @@ def create_server(
         require_read()
         return service.configuration()
 
+    @mcp.tool(annotations=READ_ONLY, structured_output=True)
+    def artha_sync_status() -> dict[str, Any]:
+        """Verify loaded Artha/MCP source fingerprint, build commit, and update channel."""
+        require_read()
+        return service.sync_status()
+
     @mcp.tool(annotations=READ_OPEN, structured_output=True)
     async def artha_health() -> dict[str, Any]:
         """Check MCP storage, broker connectivity, configuration, and latest Supervisor state."""
@@ -289,6 +295,15 @@ def create_server(
     def configuration_resource() -> str:
         require_read()
         return json.dumps(service.configuration(), indent=2, ensure_ascii=True)
+
+    @mcp.resource(
+        "artha://sync-status",
+        name="Artha source and MCP alignment",
+        mime_type="application/json",
+    )
+    def sync_status_resource() -> str:
+        require_read()
+        return json.dumps(service.sync_status(), indent=2, ensure_ascii=True)
 
     @mcp.resource(
         "artha://portfolio", name="Artha portfolio", mime_type="application/json"

@@ -11,6 +11,7 @@ from dataclasses import replace
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
+from .provenance import build_provenance
 from .server import create_server
 from .settings import MCPSettings
 
@@ -47,12 +48,19 @@ def main(argv: list[str] | None = None) -> None:
         http_path=args.path or settings.http_path,
     )
     findings = settings.startup_findings()
+    provenance = build_provenance()
     if args.check:
-        print(json.dumps(settings.public_summary(), indent=2, ensure_ascii=True))
-        raise SystemExit(1 if findings["errors"] else 0)
-    if findings["errors"]:
+        payload = settings.public_summary()
+        payload["provenance"] = provenance
+        print(json.dumps(payload, indent=2, ensure_ascii=True))
+        raise SystemExit(
+            1 if findings["errors"] or provenance["status"] == "FAIL" else 0
+        )
+    if findings["errors"] or provenance["status"] == "FAIL":
         for message in findings["errors"]:
             print(f"Artha MCP configuration error: {message}", file=sys.stderr)
+        for message in provenance["errors"]:
+            print(f"Artha MCP source-alignment error: {message}", file=sys.stderr)
         raise SystemExit(2)
 
     logging.basicConfig(

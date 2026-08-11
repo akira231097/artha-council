@@ -16,24 +16,57 @@ SECTOR_BENCHMARKS: dict[str, str] = {
     "Healthcare": "XLV",
     "Health Care": "XLV",
     "Industrials": "XLI",
+    "Basic Materials": "XLB",
     "Materials": "XLB",
     "Real Estate": "XLRE",
     "Technology": "XLK",
     "Utilities": "XLU",
 }
 
+SECTOR_ALIASES: dict[str, str] = {
+    "communication services": "Communication Services",
+    "communications": "Communication Services",
+    "telecom": "Communication Services",
+    "telecommunications": "Communication Services",
+    "consumer cyclical": "Consumer Cyclical",
+    "consumer discretionary": "Consumer Cyclical",
+    "consumer defensive": "Consumer Defensive",
+    "consumer staples": "Consumer Defensive",
+    "energy": "Energy",
+    "financial": "Financial Services",
+    "financials": "Financial Services",
+    "financial services": "Financial Services",
+    "health care": "Healthcare",
+    "healthcare": "Healthcare",
+    "industrials": "Industrials",
+    "basic materials": "Basic Materials",
+    "materials": "Basic Materials",
+    "real estate": "Real Estate",
+    "technology": "Technology",
+    "information technology": "Technology",
+    "utilities": "Utilities",
+}
+
+
+def normalize_sector(sector: str | None) -> str:
+    """Normalize provider-specific sector labels before concentration math."""
+    value = str(sector or "").strip()
+    if not value or value.lower() in {"unknown", "n/a", "na", "none", "null", "unclassified"}:
+        return ""
+    return SECTOR_ALIASES.get(value.lower(), value)
+
 
 def sector_benchmark_for(sector: str | None, fallback: str = "SPY") -> str:
     """Return the canonical sector ETF benchmark for a company sector."""
     if not sector:
         return fallback
-    return SECTOR_BENCHMARKS.get(str(sector).strip(), fallback)
+    return SECTOR_BENCHMARKS.get(normalize_sector(sector), fallback)
 
 
 def primary_market_benchmark_for(sector: str | None) -> str:
     """Use QQQ for tech/communication growth exposure, SPY otherwise."""
-    value = str(sector or "").strip()
-    if value in {"Technology", "Communication Services", "Consumer Cyclical", "Consumer Discretionary"}:
+    value = normalize_sector(sector)
+    if value in {"Technology", "Communication Services", "Consumer Cyclical"}:
         return "QQQ"
     return "SPY"
 
@@ -77,7 +110,7 @@ def evaluate_projected_sector_limit(
     """Evaluate exact post-order sector exposure for new buys and ADDs."""
     positions = portfolio_state.get("positions") or []
     total_nav = _num(portfolio_state.get("total_value"), 0.0)
-    normalized_sector = str(sector or "").strip()
+    normalized_sector = normalize_sector(sector)
     notional = max(0.0, _num(proposed_notional, 0.0))
     reasons: list[str] = []
     if not normalized_sector:
@@ -91,7 +124,7 @@ def evaluate_projected_sector_limit(
         _num(position.get("market_value"), 0.0)
         for position in positions
         if isinstance(position, dict)
-        and str(position.get("sector") or "").strip() == normalized_sector
+        and normalize_sector(position.get("sector")) == normalized_sector
     )
     current_pct = current_sector_value / total_nav if total_nav > 0 else None
     projected_value = current_sector_value + notional

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_version": "1.4.0",
+  "runtime_tree_sha256": "26cb838eaa3f7b185b0ecef448c7462d012eb62733e6ecde51dc5b8cd0d3bd0d",
+  "source_provenance": {
+    "commit": "6a43dd1786edf86b0750f5346bdd73da3cbdc759",
+    "tree_sha256": "ff65ef7c1cacc03ae5b23fdad73614e62cc864cd6467418e56e930694a0f4719",
+    "managed_paths": [
+      "artha/**/*.py",
+      "dashboard/**/*.{py,js,html,css,md}",
+      "run.py",
+      "scripts/robinhood_auto_trade_runner.mjs",
+      "scripts/robinhood_manual_review_runner.mjs",
+      "scripts/robinhood_snapshot_sync.mjs"
+    ],
+    "file_count": 89
+  },
+  "update_channels": {
+    "rolling": "ghcr.io/akira231097/artha-council-mcp:main",
+    "stable": "ghcr.io/akira231097/artha-council-mcp:1.4.0",
+    "rolling_policy": "rebuilt from every tested public main commit",
+    "stable_policy": "immutable semantic release; updated only by a new versioned tag"
+  }
+}
