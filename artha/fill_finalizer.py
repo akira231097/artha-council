@@ -1,10 +1,10 @@
-"""Idempotent broker sell-fill accounting and learning intake.
+"""Idempotent broker-fill accounting and learning intake.
 
 Robinhood order placement and investment policy live elsewhere. This module
-only applies the consequences of a broker-confirmed sell: portfolio accounting,
-thesis lifecycle, trim cooldown, post-sell tracking, and episode/event records.
-Every broker-driven sell path calls this same operation so a new reconciliation
-route cannot silently omit one of those effects.
+applies the consequences of broker-confirmed fills. Sell fills receive the full
+portfolio/thesis/tracking treatment; buy fills are linked into the same durable
+position-episode ledger. Every broker-driven path calls these shared operations
+so a new reconciliation route cannot silently omit learning records.
 """
 from __future__ import annotations
 
@@ -442,8 +442,10 @@ def _episode_buy_orders(
     ]
     end_at = max(end_times) if str(getattr(thesis, "status", "")) == "archived" and end_times else None
     candidates: list[tuple[datetime, dict[str, Any]]] = []
-    for row in journal.get_execution_orders(ticker=ticker, status="filled", limit=5000):
+    for row in journal.get_execution_orders(ticker=ticker, limit=5000):
         if str(row.get("side") or "").lower() != "buy":
+            continue
+        if str(row.get("status") or "").lower() not in {"filled", "partially_filled"}:
             continue
         row_thesis_id = str(row.get("thesis_id") or "")
         if row_thesis_id and row_thesis_id != str(getattr(thesis, "thesis_id", "")):
@@ -479,7 +481,7 @@ def rebuild_position_episode(
         row
         for row in journal.get_execution_orders(limit=5000)
         if str(row.get("thesis_id") or "") == thesis_id
-        and str(row.get("status") or "").lower() == "filled"
+        and str(row.get("status") or "").lower() in {"filled", "partially_filled"}
     ]
     events = journal.get_sell_trade_events(thesis_id=thesis_id, limit=1000)
     thesis = ThesisTracker(journal).get(thesis_id)
@@ -578,6 +580,147 @@ def rebuild_position_episode(
     }
     journal.save_position_trade_episode(episode)
     return episode
+
+
+def finalize_broker_buy_fill_learning(
+    *,
+    journal: DecisionJournal,
+    execution_row: dict[str, Any] | None,
+    ticker: str,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+    source: str = "broker_buy_fill_callback",
+) -> dict[str, Any]:
+    """Link a confirmed buy fill to its thesis-level position episode.
+
+    Share and cash accounting remains owned by ``record_order_fill`` and the
+    broker snapshot importer. This operation is deliberately idempotent and
+    only repairs the durable learning identity used for expectancy analysis.
+    """
+    row = dict(execution_row or {})
+    ticker = str(ticker or row.get("ticker") or "").upper().strip()
+    if not ticker:
+        return {"status": "WARN", "message": "Buy fill has no ticker."}
+
+    portfolio = Portfolio.load(Path(portfolio_path))
+    position = portfolio.get_position(ticker)
+    tracker = ThesisTracker(journal)
+    thesis_id = str(
+        row.get("thesis_id")
+        or getattr(position, "thesis_id", "")
+        or ""
+    )
+    thesis = tracker.get(thesis_id) if thesis_id else None
+    if thesis is None:
+        thesis = tracker.get_active(ticker) or tracker.get_pending_for_ticker(ticker)
+        thesis_id = str(getattr(thesis, "thesis_id", "") or "")
+    if not thesis_id or thesis is None:
+        return {
+            "status": "WARN",
+            "ticker": ticker,
+            "message": "Confirmed buy fill could not be linked to a position thesis.",
+        }
+
+    order_intent_id = str(row.get("order_intent_id") or "")
+    if order_intent_id and str(row.get("thesis_id") or "") != thesis_id:
+        journal.update_execution_order(order_intent_id, {"thesis_id": thesis_id})
+
+    position_type = str(
+        getattr(position, "position_type", "")
+        or getattr(thesis, "position_type", "")
+        or ""
+    )
+    episode = rebuild_position_episode(
+        journal,
+        thesis_id=thesis_id,
+        ticker=ticker,
+        position_type=position_type,
+        source=source,
+    )
+    return {
+        "status": "PASS" if episode else "WARN",
+        "ticker": ticker,
+        "thesis_id": thesis_id,
+        "episode_id": episode.get("episode_id") if episode else None,
+        "source": source,
+    }
+
+
+def backfill_position_trade_episodes(
+    journal: DecisionJournal,
+    *,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+    source: str = "position_episode_backfill",
+) -> dict[str, Any]:
+    """Rebuild every identifiable open or closed position episode.
+
+    Targets come from filled orders, sell events, and current broker-backed
+    holdings. This makes the operation repair both historical closed episodes
+    and open positions that have never produced a sell event.
+    """
+    portfolio = Portfolio.load(Path(portfolio_path))
+    tracker = ThesisTracker(journal)
+    targets: dict[str, tuple[str, str]] = {}
+
+    for row in journal.get_execution_orders(limit=5000):
+        if str(row.get("status") or "").lower() not in {"filled", "partially_filled"}:
+            continue
+        thesis_id = str(row.get("thesis_id") or "")
+        ticker = str(row.get("ticker") or "").upper().strip()
+        if thesis_id and ticker:
+            targets[thesis_id] = (ticker, "")
+
+    for event in journal.get_sell_trade_events(limit=5000):
+        thesis_id = str(event.get("thesis_id") or "")
+        ticker = str(event.get("ticker") or "").upper().strip()
+        position_type = str(event.get("position_type") or "")
+        if thesis_id and ticker:
+            targets[thesis_id] = (ticker, position_type)
+
+    held_thesis_ids: set[str] = set()
+    for position in portfolio.positions:
+        thesis_id = str(getattr(position, "thesis_id", "") or "")
+        ticker = str(getattr(position, "ticker", "") or "").upper().strip()
+        position_type = str(getattr(position, "position_type", "") or "")
+        if thesis_id and ticker:
+            targets[thesis_id] = (ticker, position_type)
+            held_thesis_ids.add(thesis_id)
+
+    rebuilt = 0
+    missing_theses: list[str] = []
+    for thesis_id, (ticker, position_type) in sorted(targets.items()):
+        thesis = tracker.get(thesis_id)
+        if thesis is None:
+            missing_theses.append(thesis_id)
+            continue
+        if rebuild_position_episode(
+            journal,
+            thesis_id=thesis_id,
+            ticker=ticker or thesis.ticker,
+            position_type=position_type or thesis.position_type,
+            source=source,
+        ):
+            rebuilt += 1
+
+    episodes = journal.get_position_trade_episodes(limit=5000)
+    episode_by_thesis = {
+        str(row.get("thesis_id") or ""): row
+        for row in episodes
+        if row.get("thesis_id")
+    }
+    held_missing_open_episode = sorted(
+        thesis_id
+        for thesis_id in held_thesis_ids
+        if thesis_id not in episode_by_thesis
+        or str(episode_by_thesis[thesis_id].get("status") or "").lower() != "open"
+    )
+    return {
+        "targets": len(targets),
+        "episodes_rebuilt": rebuilt,
+        "episodes_total": len(episodes),
+        "held_theses": len(held_thesis_ids),
+        "held_missing_open_episode": held_missing_open_episode,
+        "missing_theses": sorted(missing_theses),
+    }
 
 
 def finalize_broker_sell_fill(
@@ -883,6 +1026,33 @@ def finalize_broker_sell_fill(
             "filled_at": timestamp,
         }
     )
+    if event_type == "TRIM":
+        try:
+            from .shadow_rules import record_trim_hold_shadow
+
+            record_trim_hold_shadow(
+                journal,
+                journal.get_sell_trade_event(event_id) or {
+                    "event_id": event_id,
+                    "ticker": ticker,
+                    "thesis_id": thesis_id or None,
+                    "event_type": event_type,
+                    "shares": event_shares,
+                    "average_price": price,
+                    "sell_reason": reason,
+                    "position_type": position_type,
+                    "source": source,
+                    "data_quality": data_quality,
+                    "filled_at": timestamp,
+                },
+            )
+        except Exception as exc:
+            # A learning-only failure must never interrupt sell accounting.
+            logger.warning(
+                "[fill_finalizer] trim shadow intake failed event=%s: %s",
+                event_id,
+                exc,
+            )
 
     if full_exit and tracked:
         tracking_id = _stable_id("post_sell", event_id, tracked.thesis_id)
@@ -1142,19 +1312,12 @@ def backfill_sell_fill_accounting(
             )
             tracked_exits += 1
 
-    episodes = 0
-    for thesis_id in sorted(thesis_ids):
-        thesis = tracker.get(thesis_id)
-        if not thesis:
-            continue
-        if rebuild_position_episode(
-            journal,
-            thesis_id=thesis_id,
-            ticker=thesis.ticker,
-            position_type=thesis.position_type,
-            source="historical_execution_backfill",
-        ):
-            episodes += 1
+    episode_backfill = backfill_position_trade_episodes(
+        journal,
+        portfolio_path=portfolio_path,
+        source="historical_execution_backfill",
+    )
+    episodes = int(episode_backfill.get("episodes_rebuilt") or 0)
     all_events = journal.get_sell_trade_events(limit=5000)
     all_episodes = journal.get_position_trade_episodes(limit=5000)
     event_types = {
@@ -1172,6 +1335,7 @@ def backfill_sell_fill_accounting(
         "post_sell_tracking_upserts": tracked_exits,
         "event_types": event_types,
         "episode_statuses": episode_statuses,
+        "held_missing_open_episode": episode_backfill.get("held_missing_open_episode") or [],
         "unlinked_sell_orders": sum(1 for row in sell_orders if not row.get("thesis_id")),
         "inferred_cost_events": sum(
             1 for row in all_events if "inferred_cost" in str(row.get("data_quality") or "")

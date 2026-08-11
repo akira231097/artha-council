@@ -2032,19 +2032,34 @@ class DecisionJournal:
         ticker: str,
         *,
         dossier_path: str | None = None,
+        generated_before: str | None = None,
     ) -> dict[str, Any] | None:
-        """Return the best point-in-time classification row for a ticker."""
+        """Return the best classification row, optionally bounded in time."""
         ticker = str(ticker or "").upper().strip()
         if not ticker:
             return None
         with self._connect() as conn:
             row = None
             if dossier_path:
+                if generated_before:
+                    row = conn.execute(
+                        "SELECT * FROM decision_features WHERE ticker = ? AND dossier_path = ? "
+                        "AND datetime(generated_at) <= datetime(?) LIMIT 1",
+                        (ticker, str(dossier_path), str(generated_before)),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM decision_features WHERE ticker = ? AND dossier_path = ? LIMIT 1",
+                        (ticker, str(dossier_path)),
+                    ).fetchone()
+            if not row and generated_before:
                 row = conn.execute(
-                    "SELECT * FROM decision_features WHERE ticker = ? AND dossier_path = ? LIMIT 1",
-                    (ticker, str(dossier_path)),
+                    "SELECT * FROM decision_features WHERE ticker = ? "
+                    "AND datetime(generated_at) <= datetime(?) "
+                    "ORDER BY datetime(generated_at) DESC, id DESC LIMIT 1",
+                    (ticker, str(generated_before)),
                 ).fetchone()
-            if not row:
+            if not row and not generated_before:
                 row = conn.execute(
                     "SELECT * FROM decision_features WHERE ticker = ? "
                     "ORDER BY datetime(generated_at) DESC, id DESC LIMIT 1",

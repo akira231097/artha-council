@@ -1239,6 +1239,209 @@ class TestShadowRulesAndSupervisor(unittest.TestCase):
         self.assertEqual(backfilled, 0)
         self.assertEqual(len(rows), 1)
 
+    def test_shadow_rule_graduation_deduplicates_correlated_ticker_reviews(self):
+        import artha.shadow_rules as shadow_rules
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        for index in range(6):
+            observed = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(days=index)
+            journal.save_shadow_rule_evaluation(
+                {
+                    "evaluation_id": f"repeat-{index}",
+                    "rule_id": "repeat_probe",
+                    "rule_version": "v1",
+                    "ticker": "SAME",
+                    "decision_generated_at": observed.isoformat(),
+                    "real_action": "DEFER",
+                    "shadow_action": "STARTER",
+                    "rule_status": "shadow_mode",
+                    "hypothetical_entry": 100.0,
+                    "excess_return_20d": 0.10,
+                    "status": "tracking",
+                }
+            )
+
+        with patch.object(shadow_rules, "SHADOW_RULE_PROMOTE_MIN_N", 2):
+            summary = shadow_rules.summarize_shadow_rules(journal)
+
+        result = summary["rules"]["repeat_probe"]
+        self.assertEqual(result["count"], 6)
+        self.assertEqual(result["independent_count"], 1)
+        self.assertEqual(result["suppressed_correlated_count"], 5)
+        self.assertEqual(result["promotion_n_evaluated"], 1)
+        self.assertEqual(result["graduation"], "tracking")
+        self.assertEqual(summary["candidate_promotions"], [])
+
+    def test_shadow_rule_graduation_requires_positive_independent_expectancy(self):
+        import artha.shadow_rules as shadow_rules
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        for ticker, advantage in (("ONE", 0.01), ("TWO", 0.01), ("THREE", -0.10)):
+            journal.save_shadow_rule_evaluation(
+                {
+                    "evaluation_id": f"expectancy-{ticker}",
+                    "rule_id": "expectancy_probe",
+                    "rule_version": "v1",
+                    "ticker": ticker,
+                    "decision_generated_at": "2026-01-01T00:00:00+00:00",
+                    "real_action": "DEFER",
+                    "shadow_action": "STARTER",
+                    "rule_status": "shadow_mode",
+                    "hypothetical_entry": 100.0,
+                    "excess_return_20d": advantage,
+                    "status": "tracking",
+                }
+            )
+
+        with patch.object(shadow_rules, "SHADOW_RULE_PROMOTE_MIN_N", 3), patch.object(
+            shadow_rules,
+            "SHADOW_RULE_PROMOTE_WIN_RATE",
+            0.65,
+        ):
+            summary = shadow_rules.summarize_shadow_rules(journal)
+
+        result = summary["rules"]["expectancy_probe"]
+        self.assertAlmostEqual(result["promotion_win_rate_vs_baseline"], 2 / 3, places=4)
+        self.assertLess(result["promotion_avg_rule_advantage"], 0)
+        self.assertEqual(result["graduation"], "tracking")
+        self.assertEqual(summary["candidate_promotions"], [])
+
+    def test_trim_hold_counterfactual_is_idempotent_and_exposure_oriented(self):
+        from artha.journal import DecisionJournal
+        from artha.shadow_rules import backfill_trim_hold_shadows, summarize_shadow_rules
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        journal.save_decision_features(
+            {
+                "dossier_path": "trim.json",
+                "generated_at": "2026-06-01T00:00:00+00:00",
+                "ticker": "TRIM",
+                "final_verdict": "STARTER",
+                "sector": "Technology",
+                "feature_json": "{}",
+            }
+        )
+        journal.save_decision_features(
+            {
+                "dossier_path": "trim-future.json",
+                "generated_at": "2026-07-01T00:00:00+00:00",
+                "ticker": "TRIM",
+                "final_verdict": "DEFER",
+                "sector": "Healthcare",
+                "feature_json": "{}",
+            }
+        )
+        journal.save_sell_trade_event(
+            {
+                "event_id": "trim-event",
+                "broker_order_id": "rh-trim",
+                "order_intent_id": "trim-intent",
+                "ticker": "TRIM",
+                "thesis_id": "thesis-trim",
+                "event_type": "TRIM",
+                "shares": 0.25,
+                "average_price": 100.0,
+                "proceeds": 25.0,
+                "realized_pnl": 1.0,
+                "sell_reason": "Earnings risk trim",
+                "source": "unit",
+                "data_quality": "broker_fill",
+                "filled_at": "2026-06-10T14:00:00+00:00",
+            }
+        )
+
+        first = backfill_trim_hold_shadows(journal)
+        second = backfill_trim_hold_shadows(journal)
+        rows = journal.get_shadow_rule_evaluations(limit=10)
+
+        self.assertEqual(first["inserted"], 1)
+        self.assertEqual(second["inserted"], 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["real_action"], "TRIM")
+        self.assertEqual(rows[0]["shadow_action"], "HOLD_SHARES")
+        self.assertEqual(rows[0]["benchmark_ticker"], "QQQ")
+        journal.update_shadow_rule_evaluation(
+            rows[0]["evaluation_id"],
+            {
+                "price_20d": 110.0,
+                "benchmark_price_entry": 100.0,
+                "benchmark_price_20d": 105.0,
+            },
+        )
+        summary = summarize_shadow_rules(journal)
+        result = summary["rules"]["trim_hold_counterfactual"]
+        self.assertEqual(result["shadow_side"], "buy_like")
+        self.assertAlmostEqual(result["avg_rule_advantage"], 0.05, places=4)
+
+    def test_proven_winner_add_probe_records_shadow_only(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.shadow_rules import record_position_promotion_shadows
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        thesis = tracker.create_thesis(
+            "WIN",
+            "STARTER",
+            thesis_summary="Winner promotion unit thesis",
+        )
+        thesis = tracker.activate_thesis(thesis.thesis_id, 100.0, shares=0.2)
+        journal.save_decision_features(
+            {
+                "dossier_path": "win.json",
+                "generated_at": "2026-06-20T00:00:00+00:00",
+                "ticker": "WIN",
+                "final_verdict": "ACCUMULATE",
+                "opportunity_score": 72,
+                "adjusted_score": 72,
+                "sector": "Technology",
+                "feature_json": "{}",
+            }
+        )
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="WIN",
+                    asset_type="stock",
+                    shares=0.2,
+                    avg_cost=100,
+                    opened_at="2026-06-01T00:00:00+00:00",
+                    current_price=110,
+                    market_value=22,
+                    sector="Technology",
+                    thesis_id=thesis.thesis_id,
+                    position_type="STARTER",
+                    trailing_stop_price=102,
+                )
+            ],
+            cash_available=200,
+        ).save(portfolio_path)
+
+        first = record_position_promotion_shadows(
+            journal,
+            portfolio_path=portfolio_path,
+            now=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        )
+        second = record_position_promotion_shadows(
+            journal,
+            portfolio_path=portfolio_path,
+            now=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(first["inserted"], 1)
+        self.assertEqual(first["live_actions_created"], 0)
+        self.assertEqual(second["inserted"], 0)
+        rows = journal.get_shadow_rule_evaluations(limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rule_id"], "proven_winner_add_probe")
+        self.assertEqual(rows[0]["shadow_action"], "ADD")
+        self.assertEqual(journal.get_execution_orders(limit=10), [])
+        self.assertEqual(journal.get_trade_actions(limit=10), [])
+
     def test_supervisor_persists_and_sends_plain_english_report(self):
         import artha.supervisor as supervisor
         from artha.journal import DecisionJournal
@@ -4960,6 +5163,12 @@ class TestExecutionReadiness(unittest.TestCase):
             self.assertAlmostEqual(float(filled_row["quantity"]), 1.25)
             fill_audit = json.loads(filled_row["response_json"])
             self.assertTrue(fill_audit["artha_fill_applied"])
+            episodes = journal.get_position_trade_episodes(status="open")
+            self.assertEqual(len(episodes), 1)
+            self.assertEqual(episodes[0]["thesis_id"], pending.thesis_id)
+            self.assertEqual(episodes[0]["buy_fill_count"], 1)
+            self.assertAlmostEqual(episodes[0]["buy_notional"], 12.5)
+            self.assertEqual(result["episode_id"], episodes[0]["episode_id"])
             second = record_order_fill(
                 order_intent_id=intent.order_intent_id,
                 fill_payload={
@@ -4982,6 +5191,10 @@ class TestExecutionReadiness(unittest.TestCase):
             ]
             self.assertEqual(len(replay_buy_transactions), 1)
             self.assertEqual(journal.get_execution_order_by_intent_id(intent.order_intent_id)["status"], "filled")
+            self.assertEqual(len(journal.get_position_trade_episodes(status="open")), 1)
+            from artha.supervisor import _check_broker_fill_accounting
+            accounting = _check_broker_fill_accounting(journal, portfolio_path=portfolio_path)
+            self.assertEqual(accounting["status"], "PASS", accounting)
         finally:
             (
                 Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
@@ -5160,6 +5373,9 @@ class TestExecutionReadiness(unittest.TestCase):
             pos = Portfolio.load(portfolio_path).get_position("TEST")
             self.assertAlmostEqual(pos.shares, 1.25)
             self.assertAlmostEqual(pos.hard_stop_price, 9.2)  # rule-4.1 initial stop: -8% (was legacy -12%)
+            episodes = journal.get_position_trade_episodes(status="open")
+            self.assertEqual(len(episodes), 1)
+            self.assertEqual(result["episode_id"], episodes[0]["episode_id"])
         finally:
             (
                 Config.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
@@ -9607,6 +9823,143 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertEqual(result["status"], "FAIL")
         self.assertEqual(result["missing_effects"], ["rh-bypassed-sell"])
         self.assertEqual(result["missing_events"], ["rh-bypassed-sell"])
+
+    def test_supervisor_fails_when_held_position_has_no_open_episode(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.supervisor import _check_broker_fill_accounting
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="UNTRACKED", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="UNTRACKED",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=100,
+                    thesis_id=thesis.thesis_id,
+                    position_type="STARTER",
+                )
+            ]
+        ).save(portfolio_path)
+
+        result = _check_broker_fill_accounting(journal, portfolio_path=portfolio_path)
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(
+            result["missing_held_episodes"],
+            [f"UNTRACKED:{thesis.thesis_id}"],
+        )
+
+    def test_episode_backfill_includes_open_positions_without_sell_events(self):
+        from artha.fill_finalizer import backfill_position_trade_episodes
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="OPEN", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="OPEN",
+                    asset_type="stock",
+                    shares=0.2,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=20,
+                    thesis_id=thesis.thesis_id,
+                    position_type="STARTER",
+                )
+            ]
+        ).save(portfolio_path)
+        journal.save_execution_order(
+            {
+                "order_intent_id": "open-buy",
+                "ticker": "OPEN",
+                "side": "buy",
+                "order_type": "market",
+                "quantity": 0.2,
+                "notional": 20,
+                "estimated_price": 100,
+                "status": "filled",
+                "broker_order_id": "rh-open-buy",
+                "thesis_id": thesis.thesis_id,
+                "filled_at": "2026-06-05T14:00:00+00:00",
+                "response_json": {
+                    "order": {
+                        "id": "rh-open-buy",
+                        "symbol": "OPEN",
+                        "side": "buy",
+                        "state": "filled",
+                        "cumulative_quantity": "0.2",
+                        "average_price": "100",
+                        "last_transaction_at": "2026-06-05T14:00:00+00:00",
+                    }
+                },
+            }
+        )
+
+        first = backfill_position_trade_episodes(journal, portfolio_path=portfolio_path)
+        second = backfill_position_trade_episodes(journal, portfolio_path=portfolio_path)
+
+        self.assertEqual(first["held_missing_open_episode"], [])
+        self.assertEqual(second["held_missing_open_episode"], [])
+        episodes = journal.get_position_trade_episodes(status="open")
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(episodes[0]["buy_fill_count"], 1)
+        self.assertAlmostEqual(episodes[0]["buy_notional"], 20.0)
+
+    def test_partial_buy_fill_is_included_in_open_episode(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.robinhood_bridge import record_order_fill
+        from artha.supervisor import _check_broker_fill_accounting
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="PARTBUY", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio().save(portfolio_path)
+        journal.save_execution_order(
+            {
+                "order_intent_id": "partial-buy",
+                "ticker": "PARTBUY",
+                "side": "buy",
+                "order_type": "market",
+                "quantity": 0.2,
+                "notional": 20,
+                "estimated_price": 100,
+                "status": "submitted",
+                "broker_order_id": "rh-partial-buy",
+                "thesis_id": thesis.thesis_id,
+                "request_json": {"symbol": "PARTBUY", "side": "buy", "quantity": "0.2"},
+            }
+        )
+
+        result = record_order_fill(
+            order_intent_id="partial-buy",
+            fill_payload={
+                "id": "rh-partial-buy",
+                "symbol": "PARTBUY",
+                "side": "buy",
+                "state": "partially_filled",
+                "cumulative_quantity": "0.1",
+                "average_price": "100",
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        episode = journal.get_position_trade_episodes(status="open")[0]
+        self.assertEqual(episode["buy_fill_count"], 1)
+        self.assertAlmostEqual(episode["shares_bought"], 0.1)
+        accounting = _check_broker_fill_accounting(journal, portfolio_path=portfolio_path)
+        self.assertEqual(accounting["status"], "PASS", accounting)
 
     def test_sector_backfill_reaches_portfolio_state_and_intended_risk_gate(self):
         from types import SimpleNamespace

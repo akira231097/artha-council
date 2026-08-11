@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 RULE_VERSION = "v1"
 
 BUY_LIKE = {"BUY", "STARTER", "TACTICAL_BUY", "ACCUMULATE", "ADD", "STRONG BUY"}
+EXPOSURE_LIKE_SHADOW_ACTIONS = BUY_LIKE | {"HOLD_SHARES"}
 NO_BUY = {"WATCH", "DEFER", "AVOID", "HOLD", "SELL", "TRIM", "STRONG SELL"}
 
 PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
@@ -46,7 +47,29 @@ def _env_float(name: str, default: float) -> float:
 # when it has enough evaluations and beats its baseline often enough.
 SHADOW_RULE_PROMOTE_MIN_N = int(_env_float("ARTHA_SHADOW_RULE_PROMOTE_MIN_N", 20))
 SHADOW_RULE_PROMOTE_WIN_RATE = _env_float("ARTHA_SHADOW_RULE_PROMOTE_WIN_RATE", 0.65)
+SHADOW_RULE_INDEPENDENCE_DAYS = int(
+    _env_float("ARTHA_SHADOW_RULE_INDEPENDENCE_DAYS", 60)
+)
+SHADOW_RULE_PROMOTE_MIN_HORIZON_DAYS = int(
+    _env_float("ARTHA_SHADOW_RULE_PROMOTE_MIN_HORIZON_DAYS", 20)
+)
 SELL_RULE_HORIZON_DAYS = int(_env_float("ARTHA_SELL_RULE_HORIZON_DAYS", 60))
+PROMOTION_SHADOW_MIN_HOLD_DAYS = int(
+    _env_float("ARTHA_PROMOTION_SHADOW_MIN_HOLD_DAYS", 20)
+)
+PROMOTION_SHADOW_MIN_GAIN_PCT = _env_float(
+    "ARTHA_PROMOTION_SHADOW_MIN_GAIN_PCT",
+    5.0,
+)
+PROMOTION_SHADOW_MIN_SCORE = _env_float("ARTHA_PROMOTION_SHADOW_MIN_SCORE", 65.0)
+PROMOTION_SHADOW_MIN_NOTIONAL = _env_float(
+    "ARTHA_PROMOTION_SHADOW_MIN_NOTIONAL",
+    10.0,
+)
+PROMOTION_SHADOW_MAX_NOTIONAL = _env_float(
+    "ARTHA_PROMOTION_SHADOW_MAX_NOTIONAL",
+    25.0,
+)
 
 # Sell-side shadow rules simulated against real position price paths.
 # 'all_or_nothing' (hold through the horizon) is the baseline the others are
@@ -162,6 +185,218 @@ def _payload_from_feature_row(row: dict[str, Any]) -> dict[str, Any]:
 def _evaluation_id(rule_id: str, dossier_path: str, ticker: str, generated_at: str) -> str:
     raw = f"{RULE_VERSION}|{rule_id}|{dossier_path}|{ticker}|{generated_at}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _stable_shadow_id(rule_id: str, identity: str) -> str:
+    raw = f"{RULE_VERSION}|{rule_id}|{identity}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def record_trim_hold_shadow(
+    journal: DecisionJournal,
+    event: dict[str, Any],
+) -> bool:
+    """Track whether holding broker-confirmed trimmed shares was superior.
+
+    This is a counterfactual learning row only. It never changes the completed
+    trim, a sell rule, a Council verdict, or an execution action.
+    """
+    if str(event.get("event_type") or "").upper() != "TRIM":
+        return False
+    event_id = str(event.get("event_id") or "")
+    ticker = str(event.get("ticker") or "").upper().strip()
+    price = _num(event.get("average_price"), None)
+    observed_at = str(event.get("filled_at") or _utcnow_iso())
+    if not event_id or not ticker or price is None or price <= 0:
+        return False
+    feature = journal.get_latest_decision_feature(
+        ticker,
+        generated_before=observed_at,
+    ) or {}
+    sector = str(feature.get("sector") or "")
+    return journal.save_shadow_rule_evaluation(
+        {
+            "evaluation_id": _stable_shadow_id("trim_hold_counterfactual", event_id),
+            "rule_id": "trim_hold_counterfactual",
+            "rule_version": RULE_VERSION,
+            "ticker": ticker,
+            "dossier_path": str(feature.get("dossier_path") or ""),
+            "decision_generated_at": observed_at,
+            "real_action": "TRIM",
+            "shadow_action": "HOLD_SHARES",
+            "rule_status": "shadow_mode",
+            "trigger_reason": (
+                "Practice test: after a real trim, would retaining the trimmed shares "
+                "have outperformed the appropriate benchmark?"
+            ),
+            "evidence_json": {
+                "sell_event_id": event_id,
+                "thesis_id": event.get("thesis_id"),
+                "trimmed_shares": event.get("shares"),
+                "trim_reason": event.get("sell_reason"),
+                "data_quality": event.get("data_quality"),
+            },
+            "hypothetical_entry": price,
+            "benchmark_ticker": primary_market_benchmark_for(sector),
+            "sector_benchmark_ticker": sector_benchmark_for(sector),
+            "status": "tracking",
+        }
+    )
+
+
+def backfill_trim_hold_shadows(journal: DecisionJournal | None = None) -> dict[str, Any]:
+    """Idempotently seed trim-opportunity learning from durable sell events."""
+    journal = journal or DecisionJournal()
+    trims = [
+        event
+        for event in journal.get_sell_trade_events(limit=5000)
+        if str(event.get("event_type") or "").upper() == "TRIM"
+    ]
+    inserted = sum(1 for event in trims if record_trim_hold_shadow(journal, event))
+    return {"trim_events": len(trims), "inserted": inserted}
+
+
+def record_position_promotion_shadows(
+    journal: DecisionJournal | None = None,
+    *,
+    portfolio_path: str | Path = PORTFOLIO_FILE,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Create one private ADD experiment for each independently proven winner.
+
+    Qualification is intentionally stricter than a normal starter: the holding
+    must be seasoned, profitable, protected above cost by its trailing level,
+    supported by a buy-like scored decision, below its dollar cap, and inside
+    the projected sector cap. This function records no trade action.
+    """
+    from .portfolio import Portfolio
+    from .portfolio_risk import evaluate_projected_sector_limit
+    from .portfolio_state import PortfolioStateEngine
+    from .thesis_tracker import ThesisTracker
+
+    journal = journal or DecisionJournal()
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    observed_at = observed_at.astimezone(timezone.utc)
+    portfolio = Portfolio.load(Path(portfolio_path))
+    portfolio_state = PortfolioStateEngine(Path(portfolio_path)).compute_state()
+    tracker = ThesisTracker(journal)
+    eligible: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    inserted = 0
+
+    for position in portfolio.positions:
+        ticker = str(position.ticker or "").upper().strip()
+        reasons: list[str] = []
+        thesis = tracker.get_sell_monitored(ticker)
+        thesis_id = str(getattr(thesis, "thesis_id", "") or position.thesis_id or "")
+        opened = _ensure_dt(position.opened_at or position.entry_date)
+        held_days = (observed_at - opened).days if opened else -1
+        current_price = _num(position.current_price, None)
+        if (current_price is None or current_price <= 0) and position.shares:
+            current_price = _num(position.market_value, 0.0) / float(position.shares)
+        avg_cost = _num(position.avg_cost, 0.0) or 0.0
+        gain_pct = (
+            (current_price / avg_cost - 1.0) * 100.0
+            if current_price is not None and avg_cost > 0
+            else None
+        )
+        trailing_stop = _num(position.trailing_stop_price, None)
+        feature = journal.get_latest_decision_feature(ticker) or {}
+        score = _num(
+            feature.get("adjusted_score"),
+            _num(feature.get("opportunity_score"), 0.0),
+        ) or 0.0
+        verdict = str(feature.get("final_verdict") or "").upper()
+        market_value = _num(position.market_value, None)
+        if market_value is None and current_price is not None:
+            market_value = float(position.shares or 0.0) * current_price
+        market_value = market_value or 0.0
+        headroom = max(0.0, float(Config.ROBINHOOD_MAX_POSITION_DOLLARS) - market_value)
+        proposed_notional = min(PROMOTION_SHADOW_MAX_NOTIONAL, headroom)
+        sector = str(position.sector or feature.get("sector") or "")
+
+        if not thesis_id or thesis is None or str(getattr(thesis, "status", "")) != "active":
+            reasons.append("no_active_thesis")
+        if held_days < PROMOTION_SHADOW_MIN_HOLD_DAYS:
+            reasons.append("insufficient_holding_period")
+        if gain_pct is None or gain_pct < PROMOTION_SHADOW_MIN_GAIN_PCT:
+            reasons.append("gain_not_proven")
+        if trailing_stop is None or trailing_stop < avg_cost:
+            reasons.append("profit_not_protected_above_cost")
+        if score < PROMOTION_SHADOW_MIN_SCORE or verdict not in BUY_LIKE:
+            reasons.append("decision_not_buy_like_or_score_too_low")
+        if proposed_notional < PROMOTION_SHADOW_MIN_NOTIONAL:
+            reasons.append("insufficient_position_headroom")
+
+        sector_check = evaluate_projected_sector_limit(
+            ticker=ticker,
+            sector=sector,
+            portfolio_state=portfolio_state,
+            proposed_notional=proposed_notional,
+            max_sector_pct=float(Config.MAX_SECTOR_PCT),
+        )
+        if not sector_check.get("passed"):
+            reasons.append("projected_sector_limit")
+        if current_price is None or current_price <= 0:
+            reasons.append("missing_current_price")
+
+        if reasons:
+            skipped.append({"ticker": ticker, "reasons": sorted(set(reasons))})
+            continue
+
+        evaluation = {
+            "evaluation_id": _stable_shadow_id("proven_winner_add_probe", thesis_id),
+            "rule_id": "proven_winner_add_probe",
+            "rule_version": RULE_VERSION,
+            "ticker": ticker,
+            "dossier_path": str(feature.get("dossier_path") or ""),
+            "decision_generated_at": observed_at.isoformat(),
+            "real_action": "HOLD",
+            "shadow_action": "ADD",
+            "rule_status": "shadow_mode",
+            "trigger_reason": (
+                "Practice test: would one capped second tranche in a seasoned, "
+                "profitable, thesis-supported winner improve benchmark-relative return?"
+            ),
+            "evidence_json": {
+                "thesis_id": thesis_id,
+                "held_days": held_days,
+                "gain_pct": round(gain_pct or 0.0, 4),
+                "trailing_stop": trailing_stop,
+                "avg_cost": avg_cost,
+                "decision_score": score,
+                "decision_verdict": verdict,
+                "hypothetical_notional": round(proposed_notional, 2),
+                "sector_check": sector_check,
+                "live_order_created": False,
+            },
+            "hypothetical_entry": current_price,
+            "benchmark_ticker": primary_market_benchmark_for(sector),
+            "sector_benchmark_ticker": sector_benchmark_for(sector),
+            "status": "tracking",
+        }
+        was_inserted = journal.save_shadow_rule_evaluation(evaluation)
+        inserted += int(was_inserted)
+        eligible.append(
+            {
+                "ticker": ticker,
+                "inserted": was_inserted,
+                "gain_pct": round(gain_pct or 0.0, 2),
+                "held_days": held_days,
+                "score": score,
+                "hypothetical_notional": round(proposed_notional, 2),
+            }
+        )
+
+    return {
+        "positions_seen": len(portfolio.positions),
+        "eligible": eligible,
+        "inserted": inserted,
+        "skipped": skipped,
+        "live_actions_created": 0,
+    }
 
 
 def _candidate_shadow_rules(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -478,7 +713,12 @@ def update_shadow_rule_outcomes(journal: DecisionJournal | None = None) -> dict[
     return {"updated": updated, "errors": errors, "skipped": skipped, "sell_rule_evals": sell_rule_evals}
 
 
-def _row_rule_advantage(row: dict[str, Any], shadow_is_buy_like: bool) -> float | None:
+def _row_rule_advantage(
+    row: dict[str, Any],
+    shadow_is_buy_like: bool,
+    *,
+    minimum_horizon_days: int = 10,
+) -> float | None:
     """Benchmark-relative advantage of the SHADOW action over the real action.
 
     Stored excess_return_* columns always describe the hypothetical ENTRY's
@@ -488,11 +728,60 @@ def _row_rule_advantage(row: dict[str, Any], shadow_is_buy_like: bool) -> float 
     inverted: the shadow rule wins when the entry LAGGED its benchmark.
     Uses the longest matured horizon available (60d, else 20d, else 10d).
     """
-    for key in ("excess_return_60d", "excess_return_20d", "excess_return_10d"):
+    horizons = (60, 20, 10)
+    for days in horizons:
+        if days < minimum_horizon_days:
+            continue
+        key = f"excess_return_{days}d"
         value = _num(row.get(key), None)
         if value is not None:
             return value if shadow_is_buy_like else -value
     return None
+
+
+def _independent_shadow_rows(
+    rows: list[dict[str, Any]],
+    *,
+    independence_days: int = SHADOW_RULE_INDEPENDENCE_DAYS,
+) -> list[dict[str, Any]]:
+    """Keep non-overlapping ticker observations for one shadow rule.
+
+    Daily reviews of the same company share the same price path and are not
+    independent experiments. The earliest observation starts a fixed embargo;
+    another observation for that ticker is admitted only after the embargo.
+    """
+    window = timedelta(days=max(1, int(independence_days)))
+
+    def sort_key(row: dict[str, Any]) -> tuple[str, datetime, str]:
+        ticker = str(row.get("ticker") or "").upper()
+        observed = _ensure_dt(
+            row.get("decision_generated_at")
+            or row.get("created_at")
+            or row.get("updated_at")
+        ) or datetime.max.replace(tzinfo=timezone.utc)
+        return ticker, observed, str(row.get("evaluation_id") or "")
+
+    accepted: list[dict[str, Any]] = []
+    last_by_ticker: dict[str, datetime] = {}
+    for row in sorted(rows, key=sort_key):
+        ticker = str(row.get("ticker") or "").upper().strip()
+        observed = _ensure_dt(
+            row.get("decision_generated_at")
+            or row.get("created_at")
+            or row.get("updated_at")
+        )
+        cluster_key = ticker or str(row.get("evaluation_id") or "unknown")
+        previous = last_by_ticker.get(cluster_key)
+        if previous is not None and observed is not None and observed < previous + window:
+            continue
+        if previous is not None and observed is None:
+            continue
+        accepted.append(row)
+        if observed is not None:
+            last_by_ticker[cluster_key] = observed
+        elif cluster_key not in last_by_ticker:
+            last_by_ticker[cluster_key] = datetime.max.replace(tzinfo=timezone.utc)
+    return accepted
 
 
 def summarize_shadow_rules(journal: DecisionJournal | None = None) -> dict[str, Any]:
@@ -530,17 +819,45 @@ def summarize_shadow_rules(journal: DecisionJournal | None = None) -> dict[str, 
     candidate_promotions: list[dict[str, Any]] = []
     for rule_id, bucket in by_rule.items():
         rule_rows = [r for r in rows if str(r.get("rule_id") or "unknown") == rule_id]
+        independent_rows = _independent_shadow_rows(rule_rows)
+        bucket["independent_count"] = len(independent_rows)
+        bucket["independent_completed"] = sum(
+            1 for row in independent_rows if row.get("status") == "completed"
+        )
+        bucket["suppressed_correlated_count"] = len(rule_rows) - len(independent_rows)
         for key in ("excess_return_10d", "excess_return_20d", "excess_return_60d"):
-            vals = [_num(r.get(key), None) for r in rule_rows if r.get(key) is not None]
+            raw_vals = [_num(r.get(key), None) for r in rule_rows if r.get(key) is not None]
+            raw_vals = [v for v in raw_vals if v is not None]
+            bucket[f"raw_avg_{key}"] = (
+                round(sum(raw_vals) / len(raw_vals), 4) if raw_vals else None
+            )
+            vals = [_num(r.get(key), None) for r in independent_rows if r.get(key) is not None]
             vals = [v for v in vals if v is not None]
             bucket[f"avg_{key}"] = round(sum(vals) / len(vals), 4) if vals else None
 
-        shadow_is_buy_like = bucket["shadow_action"] in BUY_LIKE
+        shadow_is_buy_like = bucket["shadow_action"] in EXPOSURE_LIKE_SHADOW_ACTIONS
         bucket["shadow_side"] = "buy_like" if shadow_is_buy_like else "no_buy_like"
         advantages = [
+            adv for adv in (_row_rule_advantage(r, shadow_is_buy_like) for r in independent_rows)
+            if adv is not None
+        ]
+        raw_advantages = [
             adv for adv in (_row_rule_advantage(r, shadow_is_buy_like) for r in rule_rows)
             if adv is not None
         ]
+        promotion_advantages = [
+            adv
+            for adv in (
+                _row_rule_advantage(
+                    r,
+                    shadow_is_buy_like,
+                    minimum_horizon_days=SHADOW_RULE_PROMOTE_MIN_HORIZON_DAYS,
+                )
+                for r in independent_rows
+            )
+            if adv is not None
+        ]
+        bucket["raw_n_evaluated"] = len(raw_advantages)
         bucket["n_evaluated"] = len(advantages)
         bucket["avg_rule_advantage"] = (
             round(sum(advantages) / len(advantages), 4) if advantages else None
@@ -549,10 +866,25 @@ def summarize_shadow_rules(journal: DecisionJournal | None = None) -> dict[str, 
             round(sum(1 for adv in advantages if adv > 0) / len(advantages), 4)
             if advantages else None
         )
+        bucket["promotion_n_evaluated"] = len(promotion_advantages)
+        bucket["promotion_avg_rule_advantage"] = (
+            round(sum(promotion_advantages) / len(promotion_advantages), 4)
+            if promotion_advantages else None
+        )
+        bucket["promotion_win_rate_vs_baseline"] = (
+            round(
+                sum(1 for adv in promotion_advantages if adv > 0)
+                / len(promotion_advantages),
+                4,
+            )
+            if promotion_advantages else None
+        )
         promotable = (
-            len(advantages) >= SHADOW_RULE_PROMOTE_MIN_N
-            and bucket["win_rate_vs_baseline"] is not None
-            and bucket["win_rate_vs_baseline"] >= SHADOW_RULE_PROMOTE_WIN_RATE
+            len(promotion_advantages) >= SHADOW_RULE_PROMOTE_MIN_N
+            and bucket["promotion_win_rate_vs_baseline"] is not None
+            and bucket["promotion_win_rate_vs_baseline"] >= SHADOW_RULE_PROMOTE_WIN_RATE
+            and bucket["promotion_avg_rule_advantage"] is not None
+            and bucket["promotion_avg_rule_advantage"] > 0
         )
         bucket["graduation"] = "candidate_promote" if promotable else "tracking"
         if promotable:
@@ -561,8 +893,9 @@ def summarize_shadow_rules(journal: DecisionJournal | None = None) -> dict[str, 
                     "rule_id": rule_id,
                     "kind": "entry_side",
                     "evidence": (
-                        f"n={len(advantages)}, win_rate={bucket['win_rate_vs_baseline']:.0%}, "
-                        f"avg_advantage={bucket['avg_rule_advantage']:+.2%}"
+                        f"independent_n={len(promotion_advantages)}, "
+                        f"win_rate={bucket['promotion_win_rate_vs_baseline']:.0%}, "
+                        f"avg_advantage={bucket['promotion_avg_rule_advantage']:+.2%}"
                     ),
                 }
             )
@@ -579,6 +912,9 @@ def summarize_shadow_rules(journal: DecisionJournal | None = None) -> dict[str, 
         "promotion_gate": {
             "min_n": SHADOW_RULE_PROMOTE_MIN_N,
             "win_rate": SHADOW_RULE_PROMOTE_WIN_RATE,
+            "minimum_horizon_days": SHADOW_RULE_PROMOTE_MIN_HORIZON_DAYS,
+            "same_ticker_independence_days": SHADOW_RULE_INDEPENDENCE_DAYS,
+            "positive_average_advantage_required": True,
         },
     }
 
