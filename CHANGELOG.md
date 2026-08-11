@@ -2,6 +2,23 @@
 
 All notable public releases of Artha Council are documented here.
 
+## 1.4.0 - 2026-08-11
+
+- Synchronized the public core through local production source commit
+  `6a43dd1786e`, including sector-aware routing, non-blocking scan work,
+  completed trade-learning/fill cleanup, guarded feedback-loop audits, and the
+  rebuilt operations dashboard.
+- Added an MCP-visible build/source fingerprint and release manifest so clients
+  can prove that the loaded Artha core and MCP boundary are from one artifact.
+- Rebuilt the rolling MCP image from every tested `main` commit, embedded OCI
+  commit/version provenance, and added in-container startup verification.
+- Added a source-only local promotion runner that excludes runtime/private data,
+  requires clean committed code, Gitleaks, full regression tests, protected pull
+  requests, and fail-closed conflict handling. The managed boundary includes
+  the three broker runner modules while preserving the portable public overlay.
+- Added release-integrity tests covering version parity, Docker/CI coupling,
+  private-data boundaries, source drift, and secret-safe promotion.
+
 ## 1.3.0 - 2026-08-11
 
 - Added an MCP server built with the Python SDK 2.0, with structured tools,

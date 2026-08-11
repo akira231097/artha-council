@@ -26,6 +26,7 @@ from .jobs import WorkflowJobManager
 from .markets import get_market_profile, normalize_instrument
 from .models import BrokerName, InstrumentRef, MarketCode, OrderRequest
 from .notifications import NotificationHub
+from .provenance import build_provenance
 from .research import ResearchAdapter, build_research_adapter
 from .security import (
     OPERATE_SCOPE,
@@ -83,6 +84,7 @@ class ArthaMCPService:
     def capabilities(self) -> dict[str, Any]:
         profile = get_market_profile(self.settings.market)
         broker = self.broker.capabilities
+        provenance = build_provenance()
         return {
             "name": "Artha Council MCP",
             "version": __version__,
@@ -143,13 +145,19 @@ class ArthaMCPService:
                 "final_broker_recheck": True,
                 "fail_closed": True,
             },
+            "provenance": provenance,
         }
 
     def configuration(self) -> dict[str, Any]:
         return self.settings.public_summary()
 
+    def sync_status(self) -> dict[str, Any]:
+        """Prove that the loaded core and MCP source belong to one release."""
+        return build_provenance()
+
     async def health(self) -> dict[str, Any]:
         findings = self.settings.startup_findings()
+        provenance = build_provenance()
         try:
             broker_health = await self.broker.health()
         except Exception as exc:  # noqa: BLE001 - health must report every adapter boundary failure
@@ -160,15 +168,18 @@ class ArthaMCPService:
         latest_supervisor = self.journal.get_latest_supervisor_run()
         status = (
             "FAIL"
-            if findings["errors"]
+            if findings["errors"] or provenance["status"] == "FAIL"
             else "WARN"
-            if findings["warnings"] or broker_health.get("status") != "PASS"
+            if findings["warnings"]
+            or broker_health.get("status") != "PASS"
+            or provenance["status"] == "WARN"
             else "PASS"
         )
         return {
             "status": status,
             "generated_at": datetime.now(UTC).isoformat(),
             "configuration": findings,
+            "provenance": provenance,
             "broker": redact(broker_health),
             "storage": {
                 "data_dir_configured": True,

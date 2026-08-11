@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "artha-council"
-version = "1.3.0"
+version = "1.4.0"
 description = "Auditable multi-agent equity research and portfolio automation with an MCP interface"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -48,7 +48,7 @@ include = ["artha*", "artha_mcp*"]
 py-modules = ["run"]
 
 [tool.setuptools.data-files]
-"share/artha-council" = ["package.json", "package-lock.json"]
+"share/artha-council" = ["package.json", "package-lock.json", "artha_release_manifest.json"]
 "share/artha-council/scripts" = [
   "scripts/robinhood_auto_trade_runner.mjs",
   "scripts/robinhood_manual_review_runner.mjs",

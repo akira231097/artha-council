@@ -47,6 +47,7 @@ class TestMCPProtocol(unittest.IsolatedAsyncioTestCase):
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
                 self.assertIn("artha_capabilities", names)
+                self.assertIn("artha_sync_status", names)
                 self.assertIn("artha_place_previewed_order", names)
                 self.assertIn("artha_reconcile_execution", names)
                 self.assertIn("artha_broker_orders", names)
@@ -74,6 +75,10 @@ class TestMCPProtocol(unittest.IsolatedAsyncioTestCase):
                 resources = await session.list_resources()
                 self.assertIn(
                     "artha://capabilities",
+                    {str(item.uri) for item in resources.resources},
+                )
+                self.assertIn(
+                    "artha://sync-status",
                     {str(item.uri) for item in resources.resources},
                 )
                 prompts = await session.list_prompts()

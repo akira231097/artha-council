@@ -27,13 +27,19 @@ They do not represent missing application logic.
 ## Creating a Public Release
 
 1. Start from the sanitized public repository, never from a live runtime clone.
-2. Synchronize only reviewed source, tests, and documentation.
+2. Synchronize only reviewed source, tests, and documentation. For the local
+   production checkout, use the allowlisted source-promotion tool documented in
+   `docs/MCP_UPDATES.md`; never push its Git branch or history.
 3. replace personal deployment paths and identifiers with configuration.
 4. Run secret and personal-data scans over files and Git history.
 5. Run compile, regression, and static-analysis checks.
 6. Review dependency licenses and the repository SBOM.
 7. Commit through a review branch and verify GitHub checks before merging.
 8. Tag the release and update `CHANGELOG.md` and `CITATION.cff`.
+
+Every public pull request runs the source/version integrity check. Every merge
+to `main` rebuilds the rolling MCP image, while stable MCP Registry releases
+remain immutable and require a new semantic version.
 
 ## Third-Party Services
 

@@ -7,11 +7,11 @@
     "url": "https://github.com/akira231097/artha-council",
     "source": "github"
   },
-  "version": "1.3.0",
+  "version": "1.4.0",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/akira231097/artha-council-mcp:1.3.0",
+      "identifier": "ghcr.io/akira231097/artha-council-mcp:1.4.0",
       "transport": {
         "type": "stdio"
       },

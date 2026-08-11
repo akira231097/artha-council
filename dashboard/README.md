@@ -47,8 +47,8 @@ without requiring the reader to understand the trading code:
 - Authentication: `data/dashboard/token.txt`, generated with file mode `0600`.
 - Open the private URL containing `?k=<token>` once. The server stores a
   same-site, HTTP-only cookie and redirects to a clean URL without the token.
-- Home network: `http://192.168.1.158:8787/`
-- Tailscale: `http://100.88.234.49:8787/`
+- Home network: `http://<private-lan-address>:8787/`
+- Private overlay network: `http://<private-overlay-address>:8787/`
 
 Existing saved private links continue to work; the access token is unchanged.
 

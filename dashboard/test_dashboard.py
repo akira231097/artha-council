@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -75,8 +76,6 @@ class DashboardPureFunctionTests(unittest.TestCase):
 class DashboardLiveContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not server.DB.exists():
-            raise unittest.SkipTest("ARTHA live journal is not present")
         cls.payload = server.build_payload()
         cls.serialized = json.dumps(cls.payload, default=str)
 
@@ -89,11 +88,19 @@ class DashboardLiveContractTests(unittest.TestCase):
         ):
             self.assertIn(key, self.payload)
 
+    @unittest.skipUnless(
+        os.getenv("ARTHA_DASHBOARD_LIVE_TESTS") == "1",
+        "requires an explicitly selected live Artha data directory",
+    )
     def test_all_supervisor_checks_are_visible(self):
         raw = server._supervisor()
         self.assertGreaterEqual(len(raw["checks"]), 20)
         self.assertEqual(len(self.payload["system"]["checks"]), len(raw["checks"]))
 
+    @unittest.skipUnless(
+        os.getenv("ARTHA_DASHBOARD_LIVE_TESTS") == "1",
+        "requires an explicitly selected live Artha data directory",
+    )
     def test_current_live_limits_and_autonomy_are_not_hard_coded_stale_values(self):
         policy = self.payload["system"]["policy"]
         self.assertEqual(policy["max_positions"], 20)
@@ -118,6 +125,10 @@ class DashboardLiveContractTests(unittest.TestCase):
         self.assertIn("minimum", sell)
         self.assertEqual(sell["ready"], sell["completed"] >= sell["minimum"])
 
+    @unittest.skipUnless(
+        os.getenv("ARTHA_DASHBOARD_LIVE_TESTS") == "1",
+        "requires an explicitly selected live Artha data directory",
+    )
     def test_recent_decisions_include_execution_stage(self):
         self.assertTrue(self.payload["decisions"])
         for decision in self.payload["decisions"]:

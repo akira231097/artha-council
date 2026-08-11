@@ -12,9 +12,10 @@ narrows a broad US-stock universe, ranks opportunities, asks independent analyst
 roles to debate the strongest candidates, monitors active investment theses, and
 uses deterministic broker gates before an order can proceed.
 
-Version 1.3 adds a first-class MCP server for portable local or OAuth-protected
-remote access. It supports the existing US workflow and market-aware broker
-adapters for Indian cash equities without treating US research as India data.
+Version 1.4 hardens the MCP server with source/build provenance for portable
+local or OAuth-protected remote access. It supports the existing US workflow
+and market-aware broker adapters for Indian cash equities without treating US
+research as India data.
 India adapters provide broker-verified instrument lookup and fail-closed,
 whole-share delivery limit execution with current static-IP requirements.
 
@@ -153,15 +154,19 @@ The user supplies their own model subscriptions, data subscriptions, broker
 credentials, and notification credentials. The MCP server never provides or
 shares the maintainer's accounts. See [Artha MCP](docs/MCP.md) and
 [India Support](docs/MCP_INDIA.md) for the exact capability and safety boundary.
+See [MCP Updates](docs/MCP_UPDATES.md) for release fingerprints, rolling versus
+stable channels, and the fail-closed local-source promotion path.
 
 ## Verification
 
 ```bash
 python -m compileall -q artha artha_mcp dashboard run.py
 python -m unittest discover -s tests -t . -v
+python scripts/check_release_integrity.py
 python -m artha.test_enhancements
 python -m artha.test_alpha_pipeline_hardening
 python -m artha.test_production_hardening
+python -m artha.test_feedback_loop_hardening
 ```
 
 Tests use synthetic fixtures and must not require real broker credentials.
@@ -204,6 +209,7 @@ The Apache license covers Artha's source code, not provider data or broker acces
 - [Design notes and diagram](docs/DESIGN.md)
 - [Public release and data boundary](docs/PUBLIC_RELEASE.md)
 - [Artha MCP](docs/MCP.md)
+- [MCP source alignment and updates](docs/MCP_UPDATES.md)
 - [India support](docs/MCP_INDIA.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)

@@ -1636,7 +1636,7 @@ class TestShadowRulesAndSupervisor(unittest.TestCase):
             "\n".join(
                 [
                     "----------------------------------------",
-                    "Exception occurred during processing of request from ('192.168.1.254', 46656)",
+                    "Exception occurred during processing of request from ('192.0.2.254', 46656)",
                     "Traceback (most recent call last):",
                     '  File "/opt/homebrew/lib/python3.14/socketserver.py", line 697, in process_request_thread',
                     "    self.finish_request(request, client_address)",

@@ -50,6 +50,9 @@ jobs:
       - name: Compile source
         run: python -m compileall -q artha artha_mcp dashboard run.py
 
+      - name: Verify release and MCP source alignment
+        run: python scripts/check_release_integrity.py
+
       - name: Validate MCP configuration and protocol tests
         run: |
           python -m artha_mcp --check
@@ -63,6 +66,12 @@ jobs:
 
       - name: Run alpha-pipeline hardening tests
         run: python -m artha.test_alpha_pipeline_hardening
+
+      - name: Run feedback-loop hardening tests
+        run: python -m artha.test_feedback_loop_hardening
+
+      - name: Run dashboard contract tests
+        run: python -m unittest dashboard.test_dashboard -v
 
   secret-scan:
     runs-on: ubuntu-latest
