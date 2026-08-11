@@ -5,8 +5,8 @@ type: software
 authors:
   - family-names: "Sarath"
     alias: "akira231097"
-version: 1.1.1
-date-released: 2026-08-10
+version: 1.2.0
+date-released: 2026-08-11
 repository-code: "https://github.com/akira231097/artha-council"
 url: "https://github.com/akira231097/artha-council"
 license: Apache-2.0

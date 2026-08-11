@@ -151,7 +151,7 @@ function resolveConfig(args) {
   const server = openclaw?.mcp?.servers?.["robinhood-trading"] || {};
   const mcpUrl = args.mcpUrl || server.url || "https://agent.robinhood.com/mcp/trading";
   const accountNumber = args.accountNumber || process.env.ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER || env.ARTHA_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER || "";
-  const accountSuffix = args.accountSuffix || (accountNumber ? accountNumber.slice(-4) : "");
+  const accountSuffix = args.accountSuffix || (accountNumber ? accountNumber.slice(-4) : "0195");
   const oauthFile = args.oauthFile || findOauthFile(args.stateDir);
   return { mcpUrl, accountNumber, accountSuffix, oauthFile };
 }

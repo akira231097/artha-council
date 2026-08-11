@@ -18,9 +18,9 @@ flowchart TD
     C -->|hard_reject| X[Dropped]
 
     D --> E[Council analysts]
-    E --> E1[Fundamental<br/>GPT-5.5]
+    E --> E1[Fundamental<br/>configured GPT model]
     E --> E2[Technical<br/>Gemini]
-    E --> E3[Contrarian / Risk<br/>GPT-5.5]
+    E --> E3[Contrarian / Risk<br/>configured GPT model]
     E1 --> F[Synthesis / CIO audit<br/>hard risk gate + score-mapped label]
     E2 --> F
     E3 --> F
@@ -66,8 +66,8 @@ that never share authority.
 The research layer (`funnel.py` → `broker_router.py` → `opportunity_scout.py` →
 `council.py`) produces only a *label*: `BUY`, `STARTER`, `TACTICAL_BUY`,
 `DEFER`, `WATCH`, or `AVOID`. Three analysts run with no cross-contamination —
-each gets its own model, prompt, and data slice (Fundamental=GPT-5.5,
-Technical=Gemini, Contrarian/Risk=GPT-5.5). The synthesis/CIO layer reconciles
+each gets its own model, prompt, and data slice (Fundamental and
+Contrarian/Risk use configured GPT models; Technical uses Gemini). The synthesis/CIO layer reconciles
 them under a key constraint encoded in `_min_risk_action`: the CIO can
 *restrict* a recommendation below the score-mapped action but can **never
 upgrade above it** (`_ACTION_RISK_ORDER` runs BUY → AVOID, and the final action

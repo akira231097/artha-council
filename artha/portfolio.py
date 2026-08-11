@@ -69,6 +69,10 @@ class Position:
     avg_cost: float
     opened_at: str  # ISO datetime (UTC)
     notes: str = ""
+    sector: str = ""
+    industry: str = ""
+    classification_source: str = ""
+    classification_updated_at: str = ""
 
     # Crisis Mode v3 metadata (optional — only set for crisis purchases)
     is_crisis_purchase: bool = False
@@ -215,8 +219,16 @@ class Portfolio:
         })
         self.last_updated = _utcnow()
 
-    def sell_position(self, ticker: str, shares: float, price: float,
-                      notes: str = "") -> Optional[float]:
+    def sell_position(
+        self,
+        ticker: str,
+        shares: float,
+        price: float,
+        notes: str = "",
+        *,
+        broker_order_id: str = "",
+        timestamp: str | None = None,
+    ) -> Optional[float]:
         """Sell shares from a position. Returns realized P&L or None if not found."""
         ticker, shares_d, price_d = self._validate_trade_inputs(ticker, shares, price)
         pos = self.get_position(ticker)
@@ -249,10 +261,73 @@ class Portfolio:
             "price": float(price_d),
             "total": float(sell_total),
             "realized_pnl": float(realized_pnl),
-            "timestamp": _utcnow(),
+            "cost_basis_per_share": float(avg_cost_d),
+            "timestamp": timestamp or _utcnow(),
+            "broker_order_id": str(broker_order_id or ""),
             "notes": notes,
         })
         self.cash_deployed = float(max(Decimal("0"), _to_decimal(self.cash_deployed) - cost_basis_released))
+        self.last_updated = _utcnow()
+        return float(realized_pnl)
+
+    def record_reflected_sell_fill(
+        self,
+        ticker: str,
+        shares: float,
+        price: float,
+        avg_cost: float,
+        *,
+        broker_order_id: str,
+        notes: str = "",
+        timestamp: str | None = None,
+    ) -> float:
+        """Record a sell already reflected in broker-synced share quantity.
+
+        Snapshot reconciliation can update the remaining shares before the
+        order callback arrives. In that case mutating the position again would
+        double-sell it, but the transaction, realized P&L, and released cost
+        basis still need to be recorded. The broker order id makes this method
+        idempotent across restarts.
+        """
+        ticker, shares_d, price_d = self._validate_trade_inputs(ticker, shares, price)
+        avg_cost_d = _to_decimal(avg_cost)
+        if avg_cost_d <= 0:
+            raise ValueError("Average cost must be greater than zero")
+
+        recorded = Decimal("0")
+        for txn in self.transactions:
+            if str(txn.get("type") or "").upper() != "SELL":
+                continue
+            if str(txn.get("ticker") or "").upper() != ticker:
+                continue
+            txn_order_id = str(txn.get("broker_order_id") or "")
+            txn_notes = str(txn.get("notes") or "")
+            if broker_order_id and broker_order_id != txn_order_id and broker_order_id not in txn_notes:
+                continue
+            recorded += _to_decimal(txn.get("shares") or 0)
+
+        delta = shares_d - recorded
+        if delta <= Decimal("0.000001"):
+            return 0.0
+
+        realized_pnl = ((price_d - avg_cost_d) * delta).quantize(CENTS, ROUND_HALF_UP)
+        sell_total = (delta * price_d).quantize(CENTS, ROUND_HALF_UP)
+        released = (avg_cost_d * delta).quantize(CENTS, ROUND_HALF_UP)
+        self.transactions.append({
+            "type": "SELL",
+            "ticker": ticker,
+            "shares": float(delta),
+            "price": float(price_d),
+            "total": float(sell_total),
+            "realized_pnl": float(realized_pnl),
+            "cost_basis_per_share": float(avg_cost_d),
+            "timestamp": timestamp or _utcnow(),
+            "broker_order_id": str(broker_order_id or ""),
+            "notes": notes,
+        })
+        self.cash_deployed = float(
+            max(Decimal("0"), _to_decimal(self.cash_deployed) - released)
+        )
         self.last_updated = _utcnow()
         return float(realized_pnl)
 

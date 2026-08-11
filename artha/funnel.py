@@ -174,12 +174,29 @@ class PromotionFunnel:
             # --- Stage 2: Machine Rank ---
             logger.info("[funnel] Stage 2: Ranking by momentum + regime fit...")
             from .rank_candidates import rank_universe
+            rank_coverage: dict = {}
             ranked = rank_universe(
                 universe=universe,
                 regime_type=regime_type,
                 overlays=overlays,
                 top_n=max(50, int(getattr(Config, "FUNNEL_RANK_TOP_N", 150))),
+                coverage_out=rank_coverage,
             )
+
+            if Config.SCAN_REQUIRE_MIN_RANK_COVERAGE:
+                coverage_pct = float(rank_coverage.get("history_coverage_pct") or 0.0)
+                audited_universe = int(rank_coverage.get("universe_size") or 0)
+                minimum_coverage = float(Config.RANK_MIN_HISTORY_COVERAGE_PCT)
+                if audited_universe != len(universe) or coverage_pct < minimum_coverage:
+                    logger.error(
+                        "[funnel] BUY SCAN FAIL-CLOSED: ranking coverage %.1f%% (%d/%d audited) "
+                        "is below %.0f%% or does not match the current universe; no legacy fallback",
+                        coverage_pct * 100.0,
+                        int(rank_coverage.get("history_count") or 0),
+                        audited_universe,
+                        minimum_coverage * 100.0,
+                    )
+                    return []
 
             if not ranked:
                 logger.warning("[funnel] Ranking returned empty — using fallback")
@@ -291,18 +308,25 @@ class PromotionFunnel:
                         "gap_pct": c.get("gap_pct"),
                         "volume_confirmed": True,
                         "catalyst_type": c.get("catalyst_type"),
+                        "catalyst_confirmed": bool(c.get("catalyst_confirmed")),
+                        "catalyst_live_eligible": bool(c.get("live_eligible")),
+                        "catalyst_routing_reason": c.get("routing_reason"),
                         "price": c.get("price"),
                     }
                     for c in candidates if c.get("symbol")
                 })
             except Exception as ss_e:
                 logger.debug("[funnel] Catalyst scan-signal update failed: %s", ss_e)
+            live_candidates = [c for c in candidates if bool(c.get("live_eligible"))]
+            research_only = [c for c in candidates if not bool(c.get("live_eligible"))]
             logger.info(
-                "[funnel] Catalyst lane: %d episodic-pivot candidates (%s)",
-                len(candidates),
-                ", ".join(str(c.get("symbol")) for c in candidates[:8]),
+                "[funnel] Catalyst lane: %d live, %d research-only (%s)",
+                len(live_candidates),
+                len(research_only),
+                ", ".join(str(c.get("symbol")) for c in live_candidates[:8]) or "none",
             )
-        return candidates
+            return live_candidates
+        return []
 
     def _build_enrichment_pool(
         self,

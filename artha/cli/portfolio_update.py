@@ -27,6 +27,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from artha.journal import DecisionJournal
+from artha.fill_finalizer import finalize_broker_sell_fill
 from artha.thesis_tracker import ThesisTracker, _HARD_STOP, _REVIEW_DAYS, _utcnow_iso, _add_days
 from artha.portfolio import Portfolio, PORTFOLIO_FILE
 from artha.config import Config
@@ -174,7 +175,7 @@ def _set_position_sell_fields(pos: Any, thesis: Any, hard_stop: float, review_da
 
 
 def cmd_sell(args: argparse.Namespace) -> None:
-    """Record a full or partial sell and archive/update thesis."""
+    """Record a confirmed manual sell through the shared fill finalizer."""
     ticker = args.ticker.upper()
     shares = float(args.shares)
     price = float(args.price)
@@ -186,103 +187,68 @@ def cmd_sell(args: argparse.Namespace) -> None:
         _out(False, f"{ticker} not found in portfolio")
         return
 
-    tracker = ThesisTracker()
+    journal = DecisionJournal()
+    tracker = ThesisTracker(journal)
     thesis_id = getattr(existing, "thesis_id", None)
 
     current_shares = float(existing.shares)
     is_full_exit = shares >= current_shares * 0.99  # 99%+ → treat as full exit
-
-    avg_cost_at_sell = float(existing.avg_cost)  # capture before potential removal
-    pnl = (price - avg_cost_at_sell) * shares
+    shares_to_record = current_shares if is_full_exit else min(shares, current_shares)
+    avg_cost_at_sell = float(existing.avg_cost)
+    pnl = (price - avg_cost_at_sell) * shares_to_record
     pnl_pct = (price - avg_cost_at_sell) / avg_cost_at_sell * 100 if avg_cost_at_sell else 0
-
-    if is_full_exit:
-        portfolio.positions = [p for p in portfolio.positions if p.ticker.upper() != ticker]
-        if thesis_id:
-            tracker.archive_thesis(thesis_id, exit_price=price, exit_reason=reason)
-
-        # Add to recently_exited list if schema supports it
-        if hasattr(portfolio, "recently_exited"):
-            portfolio.recently_exited = getattr(portfolio, "recently_exited", []) or []
-            portfolio.recently_exited.insert(0, {
-                "ticker": ticker,
-                "exit_date": _utcnow_iso()[:10],
-                "exit_price": price,
-                "exit_reason": reason,
-                "thesis_id": thesis_id,
-                "shadow_tracking": True,
-            })
-
-        # Start post-sell tracking
-        if thesis_id:
-            _start_post_sell_tracking(ticker, thesis_id, price, reason, shares,
-                                      getattr(existing, "position_type", "BUY"))
-    else:
-        # Partial sell (trim)
-        existing.shares = round(current_shares - shares, 6)
-        existing.market_value = round(existing.shares * float(existing.current_price or price), 4)
-        if thesis_id:
-            tracker.set_cooldown(thesis_id, Config.SELL_COOLDOWN_AFTER_TRIM)
-
-    # Reduce cash_deployed by the cost basis that was released on this sell
-    # (mirrors Portfolio.sell_position() logic; avoids a nonexistent portfolio.cash field)
-    cost_basis_removed = avg_cost_at_sell * shares
-    portfolio.cash_deployed = max(0.0, portfolio.cash_deployed - cost_basis_removed)
-    # Real cash accounting: sale proceeds return to cash_available
-    portfolio.cash_available = float(portfolio.cash_available or 0.0) + shares * price
-    portfolio.transactions.append({
-        "type": "SELL",
-        "ticker": ticker,
-        "shares": shares,
-        "price": price,
-        "total": round(shares * price, 2),
-        "realized_pnl": round(pnl, 2),
-        "timestamp": _utcnow_iso(),
-        "notes": reason,
-    })
-    portfolio.last_updated = _utcnow_iso()
-
-    _save_portfolio(portfolio)
+    filled_at = _utcnow_iso()
+    manual_fill_id = f"manual-cli:{ticker}:{filled_at}"
+    result = finalize_broker_sell_fill(
+        journal=journal,
+        execution_row={
+            "ticker": ticker,
+            "thesis_id": thesis_id,
+            "rationale": reason,
+            "evidence_json": {
+                "sell_council": {"action": "EXIT" if is_full_exit else "TRIM"}
+            },
+        },
+        ticker=ticker,
+        cumulative_quantity=shares_to_record,
+        average_price=price,
+        broker_order_id=manual_fill_id,
+        state="filled",
+        source="manual_cli_confirmation",
+        filled_at=filled_at,
+        portfolio_path=PORTFOLIO_FILE,
+        data_quality="manual_confirmed_fill",
+        portfolio_notes=reason,
+        credit_cash_available=True,
+    )
+    portfolio = _load_portfolio()
+    remaining = portfolio.get_position(ticker)
 
     action = "EXITED" if is_full_exit else "TRIMMED"
-    proceeds = shares * price
+    proceeds = shares_to_record * price
     msg = (
         f"{'✅' if pnl >= 0 else '🔴'} Portfolio updated — {action} {ticker}\n\n"
-        f"• Sold {shares} shares @ ${price:.2f}\n"
+        f"• Sold {shares_to_record} shares @ ${price:.2f}\n"
         f"• P&L: ${pnl:.2f} ({pnl_pct:+.1f}%)\n"
         f"• Proceeds: ${proceeds:.2f}\n"
     )
     if not is_full_exit:
-        msg += f"• Remaining: {existing.shares:.4f} shares\n"
+        msg += f"• Remaining: {float(remaining.shares if remaining else 0):.4f} shares\n"
         msg += f"• Sell cooldown: {Config.SELL_COOLDOWN_AFTER_TRIM} days\n"
     else:
         msg += "• Post-sell shadow tracking started (5/20/60 day checkpoints)\n"
 
-    _out(True, msg, {"ticker": ticker, "shares_sold": shares, "price": price, "pnl": pnl})
-
-
-def _start_post_sell_tracking(
-    ticker: str,
-    thesis_id: str,
-    sell_price: float,
-    exit_reason: str,
-    shares: float,
-    position_type: str,
-) -> None:
-    """Create a post-sell tracking record in the database."""
-    import uuid as _uuid
-    journal = DecisionJournal()
-    journal.save_post_sell_tracking({
-        "tracking_id": str(_uuid.uuid4()),
-        "ticker": ticker,
-        "thesis_id": thesis_id,
-        "sell_date": _utcnow_iso()[:10],
-        "sell_price": sell_price,
-        "sell_reason": exit_reason,
-        "position_type": position_type,
-        "shares": shares,
-        "status": "tracking",
-    })
+    _out(
+        True,
+        msg,
+        {
+            "ticker": ticker,
+            "shares_sold": shares_to_record,
+            "price": price,
+            "pnl": pnl,
+            "fill_event_id": result.get("event_id"),
+        },
+    )
 
 
 def cmd_add(args: argparse.Namespace) -> None:
@@ -298,7 +264,7 @@ def cmd_trim(args: argparse.Namespace) -> None:
 
 
 def cmd_activate_thesis(args: argparse.Namespace) -> None:
-    """Activate a pending thesis after an operator-recorded purchase."""
+    """Activate a pending thesis after the operator records a filled buy."""
     thesis_id = args.thesis_id
     entry_price = float(args.entry_price)
     shares = float(args.shares) if args.shares else None

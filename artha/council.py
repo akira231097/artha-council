@@ -12,7 +12,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from dataclasses import dataclass, field, asdict
 
 try:
@@ -643,6 +643,8 @@ def _extract_scoring_json(synthesis: str) -> Optional[dict]:
 # were stored as permanently-inert dead weight.
 _DECISION_OPS = {"lt", "lte", "gt", "gte", "eq"}
 _DECISION_METRICS = {"price", "pnl_pct", "days_held", "trading_days_held"}
+_DECISION_EFFECTS = {"invalidate", "review"}
+_TIME_REVIEW_METRICS = {"days_held", "trading_days_held"}
 _DECISION_METRIC_ALIASES = {
     "close_price": "price",
     "last_price": "price",
@@ -664,7 +666,8 @@ def _extract_decision_json(synthesis: str) -> Optional[dict]:
           "stop_price": float | null,          # ATR-derived, cap 10% below entry
           "target_price": float | null,
           "invalidation_conditions": [
-            {"metric": str, "op": str, "value": number, "description": str}
+            {"metric": str, "op": str, "value": number, "description": str,
+             "effect": "invalidate" | "review"}
           ],
           "half_size": bool
         }
@@ -743,6 +746,7 @@ def _normalize_decision_json(parsed: dict) -> Optional[dict]:
         op = str(item.get("op") or "").strip().lower()
         value = _float_or_none(item.get("value"))
         description = str(item.get("description") or "").strip()
+        effect = str(item.get("effect") or "").lower().strip()
         if metric not in _DECISION_METRICS or op not in _DECISION_OPS or value is None:
             if metric or op:
                 logger.info(
@@ -751,11 +755,14 @@ def _normalize_decision_json(parsed: dict) -> Optional[dict]:
                     metric, op, sorted(_DECISION_METRICS), sorted(_DECISION_OPS),
                 )
             continue
+        if effect not in _DECISION_EFFECTS:
+            effect = "review" if metric in _TIME_REVIEW_METRICS else "invalidate"
         conditions.append({
             "metric": metric,
             "op": op,
             "value": value,
             "description": description,
+            "effect": effect,
         })
 
     return {
@@ -767,6 +774,84 @@ def _normalize_decision_json(parsed: dict) -> Optional[dict]:
         "invalidation_conditions": conditions,
         "half_size": bool(parsed.get("half_size")),
     }
+
+
+def _merge_invalidation_conditions(*condition_groups: Any) -> list[Any]:
+    """Merge structured machine rules with free-text fundamental evidence."""
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for group in condition_groups:
+        if not isinstance(group, list):
+            continue
+        for condition in group:
+            if isinstance(condition, str):
+                condition = condition.strip()
+                if not condition:
+                    continue
+                key = f"text:{condition.casefold()}"
+            elif isinstance(condition, dict):
+                condition = dict(condition)
+                key = "dict:" + json.dumps(condition, sort_keys=True, default=str)
+            else:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(condition)
+    return merged
+
+
+def _extract_thesis_summary(synthesis: str, max_chars: int = 500) -> str:
+    """Extract the actual investment thesis, never JSON/report metadata."""
+    lines = (synthesis or "").splitlines()
+    start = None
+    inline = ""
+    heading = re.compile(r"^\*{0,2}SYNTHESIS:\*{0,2}\s*(.*)$", re.IGNORECASE)
+    for index, raw in enumerate(lines):
+        match = heading.match(raw.strip())
+        if match:
+            start = index + 1
+            inline = match.group(1).strip()
+
+    def _invalid(line: str) -> bool:
+        upper = line.upper()
+        return (
+            not line
+            or line.startswith("```")
+            or line in {"---", "***"}
+            or line.startswith("{")
+            or line.startswith("}")
+            or upper.startswith("PRIMARY DRIVER:")
+            or "COUNCIL CONSENSUS:" in upper
+            or "RECOMMENDED ACTION:" in upper
+            or "ACTION NORMALIZATION NOTE:" in upper
+        )
+
+    if start is not None:
+        parts: list[str] = []
+        if inline and not _invalid(inline):
+            parts.append(inline)
+        for raw in lines[start:]:
+            line = raw.strip()
+            if parts and not line:
+                break
+            if line.startswith("**") and line.endswith("**"):
+                break
+            if line.startswith("```"):
+                break
+            if _invalid(line):
+                continue
+            parts.append(line)
+        if parts:
+            return " ".join(parts)[:max_chars].strip()
+
+    for raw in lines:
+        line = raw.strip()
+        if _invalid(line) or line.startswith("#") or line.startswith("**"):
+            continue
+        if len(line) >= 40:
+            return line[:max_chars]
+    return ""
 
 
 def _compute_atr14(price_history: list | None) -> Optional[float]:
@@ -992,7 +1077,7 @@ def hard_risk_gate(
         profile.get("sector") or
         (stock_data.get("yf_quote") or {}).get("sector") or ""
     ).strip()
-    if sector and total_value > 0 and is_new_position:
+    if sector and total_value > 0:
         sector_value = 0.0
         for p in positions:
             if not isinstance(p, dict) or str(p.get("sector", "")).strip() != sector:
@@ -1002,9 +1087,16 @@ def hard_risk_gate(
             except (TypeError, ValueError):
                 pass
         sector_pct = sector_value / total_value
-        if sector_pct >= config.MAX_SECTOR_PCT:
+        portfolio_risk = stock_data.get("portfolio_factor_risk") or {}
+        projected_pct_value = portfolio_risk.get("sector_after_candidate_pct")
+        try:
+            projected_pct = float(projected_pct_value) / 100.0
+        except (TypeError, ValueError):
+            projected_pct = sector_pct
+        if projected_pct > config.MAX_SECTOR_PCT + 0.000001:
             return False, (
-                f"SECTOR LIMIT: Already {sector_pct:.0%} in '{sector}' "
+                f"SECTOR LIMIT: Proposed {'ADD' if not is_new_position else 'buy'} would raise "
+                f"'{sector}' exposure from {sector_pct:.1%} to {projected_pct:.1%} "
                 f"(max {config.MAX_SECTOR_PCT:.0%})."
             )
 
@@ -1558,6 +1650,19 @@ class ArthaCouncil:
             portfolio_factor_risk = {}
             stock_data["portfolio_factor_risk"] = {}
 
+        if Config.ALPHA_SHADOW_SIGNALS_ENABLED:
+            try:
+                from .alpha_shadow import build_alpha_shadow_signals
+
+                stock_data["alpha_shadow_signals"] = build_alpha_shadow_signals(stock_data)
+            except Exception as shadow_err:
+                logger.warning("  [council] Alpha shadow signal build failed for %s: %s", ticker, shadow_err)
+                stock_data["alpha_shadow_signals"] = {
+                    "mode": "shadow_only",
+                    "status": "unavailable",
+                    "live_score_impact": 0.0,
+                }
+
         try:
             # Wave 2: pass stock_data so the meta-ranker can derive an
             # opportunity-score proxy and bucket the candidate properly
@@ -2036,9 +2141,14 @@ class ArthaCouncil:
             if not cio_verdict and cio_decision.get("verdict"):
                 cio_verdict = str(cio_decision["verdict"]).upper()
             if cio_decision.get("invalidation_conditions"):
-                # Structured {metric, op, value, description} conditions —
-                # Wave 1 sell engine consumes these directly.
-                invalidation_conditions = cio_decision["invalidation_conditions"]
+                # Preserve the scoring block's fundamental/event conditions
+                # while adding machine-checkable price/time rules. Replacing
+                # one with the other left Sell Council without the original
+                # business reasons that would invalidate the investment.
+                invalidation_conditions = _merge_invalidation_conditions(
+                    invalidation_conditions,
+                    cio_decision["invalidation_conditions"],
+                )
             entry_zone = cio_decision.get("entry_zone") or {}
             if entry_zone.get("valid_until_iso"):
                 entry_valid_until = str(entry_zone["valid_until_iso"])
@@ -2491,14 +2601,7 @@ class ArthaCouncil:
                     except Exception:
                         pass
 
-                    # Build thesis summary from synthesis first paragraph
-                    thesis_summary = ""
-                    if synthesis:
-                        for line in synthesis.split("\n"):
-                            line = line.strip()
-                            if line and not line.startswith("**") and not line.startswith("#"):
-                                thesis_summary = line[:500]
-                                break
+                    thesis_summary = _extract_thesis_summary(synthesis)
 
                     existing_pending = tracker.get_pending_for_ticker(ticker)
                     if existing_pending:

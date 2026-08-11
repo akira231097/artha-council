@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .journal import DecisionJournal
+from .config import Config
 from .portfolio_risk import primary_market_benchmark_for, sector_benchmark_for
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ def _payload_from_decision(decision: Any, stock_data: dict[str, Any]) -> dict[st
     revision = valuation.get("revision_trend") if isinstance(valuation, dict) else {}
     timing = valuation.get("timing_risk") if isinstance(valuation, dict) else {}
     quote = stock_data.get("quote") or stock_data.get("yf_quote") or {}
+    alpha_shadow = stock_data.get("alpha_shadow_signals") or {}
     dossier_path = str(getattr(decision, "dossier_path", "") or "")
     generated_at = (
         getattr(decision, "generated_at", None)
@@ -119,6 +121,7 @@ def _payload_from_decision(decision: Any, stock_data: dict[str, Any]) -> dict[st
         "sector": str(risk.get("sector") or valuation.get("sector") or ""),
         "market_benchmark_ticker": str(risk.get("market_benchmark_ticker") or ""),
         "sector_benchmark_ticker": str(risk.get("sector_benchmark_ticker") or ""),
+        "alpha_shadow_signals": alpha_shadow if isinstance(alpha_shadow, dict) else {},
     }
 
 
@@ -130,6 +133,7 @@ def _payload_from_feature_row(row: dict[str, Any]) -> dict[str, Any]:
         feature_json = {}
     valuation = feature_json.get("valuation_expectations") or {}
     risk = feature_json.get("portfolio_factor_risk") or {}
+    alpha_shadow = feature_json.get("alpha_shadow_signals") or {}
     revision = valuation.get("revision_trend") or {}
     timing = valuation.get("timing_risk") or {}
     return {
@@ -151,6 +155,7 @@ def _payload_from_feature_row(row: dict[str, Any]) -> dict[str, Any]:
         "sector": str(row.get("sector") or risk.get("sector") or ""),
         "market_benchmark_ticker": str(risk.get("market_benchmark_ticker") or ""),
         "sector_benchmark_ticker": str(row.get("benchmark_ticker") or risk.get("sector_benchmark_ticker") or ""),
+        "alpha_shadow_signals": alpha_shadow if isinstance(alpha_shadow, dict) else {},
     }
 
 
@@ -170,6 +175,7 @@ def _candidate_shadow_rules(payload: dict[str, Any]) -> list[dict[str, Any]]:
     rsi = _num(payload.get("rsi"), None)
     price_vs_sma50 = _num(payload.get("price_vs_sma50_pct"), None)
     rules: list[dict[str, Any]] = []
+    alpha_shadow = payload.get("alpha_shadow_signals") if isinstance(payload.get("alpha_shadow_signals"), dict) else {}
 
     if (
         action in {"DEFER", "WATCH"}
@@ -223,6 +229,51 @@ def _candidate_shadow_rules(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
             }
         )
+
+    if getattr(Config, "ALPHA_SHADOW_SIGNALS_ENABLED", True) and action in NO_BUY:
+        insider = alpha_shadow.get("insider_cluster") if isinstance(alpha_shadow.get("insider_cluster"), dict) else {}
+        industry = alpha_shadow.get("industry_momentum") if isinstance(alpha_shadow.get("industry_momentum"), dict) else {}
+        episodic = alpha_shadow.get("episodic_pivot") if isinstance(alpha_shadow.get("episodic_pivot"), dict) else {}
+        explorer = (
+            alpha_shadow.get("quality_small_cap_explorer")
+            if isinstance(alpha_shadow.get("quality_small_cap_explorer"), dict)
+            else {}
+        )
+        if insider.get("cluster_confirmed"):
+            rules.append(
+                {
+                    "rule_id": "insider_cluster_starter_probe",
+                    "shadow_action": "STARTER",
+                    "trigger_reason": "Practice test: three or more disclosed open-market insider buyers formed a 14-day cluster.",
+                }
+            )
+        if (
+            int(_num(industry.get("peer_count"), 0.0) or 0) >= 5
+            and (_num(industry.get("z_score"), 0.0) or 0.0) >= 1.0
+        ):
+            rules.append(
+                {
+                    "rule_id": "industry_momentum_starter_probe",
+                    "shadow_action": "STARTER",
+                    "trigger_reason": "Practice test: the candidate belongs to a statistically strong industry group.",
+                }
+            )
+        if (_num(episodic.get("quality_score"), 0.0) or 0.0) >= 70.0:
+            rules.append(
+                {
+                    "rule_id": "episodic_pivot_starter_probe",
+                    "shadow_action": "STARTER",
+                    "trigger_reason": "Practice test: a high-quality earnings/news gap had strong volume confirmation.",
+                }
+            )
+        if explorer.get("qualified"):
+            rules.append(
+                {
+                    "rule_id": "quality_small_cap_explorer_probe",
+                    "shadow_action": "STARTER",
+                    "trigger_reason": "Practice test: a liquid, profitable, seasoned $500M-$2B company passed every explorer fence.",
+                }
+            )
 
     return rules
 

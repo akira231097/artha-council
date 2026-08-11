@@ -160,6 +160,8 @@ def _stock_snapshot(stock_data: dict[str, Any]) -> dict[str, Any]:
         "price_target_consensus": _json_safe(price_target),
         "valuation_expectations": _json_safe(stock_data.get("valuation_expectations") or {}),
         "portfolio_factor_risk": _json_safe(stock_data.get("portfolio_factor_risk") or {}),
+        "funnel_candidate": _json_safe(stock_data.get("funnel_candidate") or {}),
+        "alpha_shadow_signals": _json_safe(stock_data.get("alpha_shadow_signals") or {}),
         "calibration_meta_signal": _json_safe(stock_data.get("calibration_meta_signal") or {}),
         "sec": {
             "companyfacts_available": bool(sec_companyfacts),
@@ -202,6 +204,7 @@ def extract_decision_feature_row(dossier: dict[str, Any], dossier_path: str) -> 
         "market_snapshot": dossier.get("market_snapshot") or {},
         "valuation_expectations": valuation,
         "portfolio_factor_risk": portfolio_risk,
+        "alpha_shadow_signals": stock.get("alpha_shadow_signals") or {},
         "calibration_meta_signal": stock.get("calibration_meta_signal") or {},
         "analyst_verdicts": {
             key: (value or {}).get("verdict")

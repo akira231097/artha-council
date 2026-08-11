@@ -446,7 +446,11 @@ class TestValuationAndRisk(unittest.TestCase):
                 SimpleNamespace(symbol="AAA", name="AAA Inc", sector="Technology", industry="Software", market_cap=2_000_000_000, volume=500_000, regime_score=1.0),
                 SimpleNamespace(symbol="BBB", name="BBB Inc", sector="Healthcare", industry="Tools", market_cap=2_000_000_000, volume=500_000, regime_score=1.0),
             ]
-            with patch("yfinance.download", side_effect=fake_download), patch("artha.rank_candidates.YFinanceCollector.cleanup_caches") as cleanup:
+            with tempfile.TemporaryDirectory() as rank_tmp, \
+                 patch("yfinance.download", side_effect=fake_download), \
+                 patch("artha.rank_candidates.YFinanceCollector.cleanup_caches") as cleanup, \
+                 patch("artha.rank_candidates.RANK_COVERAGE_DIR", Path(rank_tmp) / "coverage"), \
+                 patch("artha.rank_candidates.SCAN_SIGNALS_DIR", Path(rank_tmp) / "signals"):
                 ranked = rank_universe(universe, top_n=2)
             self.assertEqual(len(ranked), 2)
             self.assertEqual(len(calls), 2)
@@ -1587,8 +1591,24 @@ class TestShadowRulesAndSupervisor(unittest.TestCase):
 class TestExecutionReadiness(unittest.TestCase):
     def setUp(self):
         from artha.config import Config
+        from artha import portfolio_state
 
         self.tmp_dir = Path(tempfile.mkdtemp())
+        self._portfolio_state_path = portfolio_state.PORTFOLIO_JSON_PATH
+        portfolio_state.PORTFOLIO_JSON_PATH = self.tmp_dir / "portfolio.json"
+        portfolio_state.PORTFOLIO_JSON_PATH.write_text(
+            json.dumps(
+                {
+                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "cash_available": 350.0,
+                    "monthly_contribution": 350.0,
+                    "positions": [],
+                    "transactions": [],
+                    "notes": "Isolated execution-hardening test portfolio.",
+                }
+            ),
+            encoding="utf-8",
+        )
         self._stand_down_config = (
             Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT,
             Config.ROBINHOOD_CONTROL_FILE,
@@ -1598,12 +1618,14 @@ class TestExecutionReadiness(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+        from artha import portfolio_state
         from artha.config import Config
 
         (
             Config.ARTHA_AUTO_PAUSE_BUYS_ON_LIMIT,
             Config.ROBINHOOD_CONTROL_FILE,
         ) = self._stand_down_config
+        portfolio_state.PORTFOLIO_JSON_PATH = self._portfolio_state_path
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def _journal_with_clean_buy_decision(self):
@@ -2366,6 +2388,7 @@ class TestExecutionReadiness(unittest.TestCase):
 
         with patch.object(Config, "YFINANCE_BATCH_SIZE", 2), \
              patch.object(Config, "YFINANCE_DOWNLOAD_TIMEOUT_SECONDS", 7), \
+             patch("artha.rank_candidates.RANK_COVERAGE_DIR", self.tmp_dir / "rank-coverage-empty"), \
              patch("yfinance.download", return_value=pd.DataFrame()) as download:
             ranked = rank_universe(universe, top_n=2)
 
@@ -2388,6 +2411,7 @@ class TestExecutionReadiness(unittest.TestCase):
         with patch.object(Config, "YFINANCE_BATCH_SIZE", 1), \
              patch.object(Config, "YFINANCE_DOWNLOAD_TIMEOUT_SECONDS", 7), \
              patch.object(Config, "YFINANCE_RANK_TOTAL_TIMEOUT_SECONDS", 5), \
+             patch("artha.rank_candidates.RANK_COVERAGE_DIR", self.tmp_dir / "rank-coverage-budget"), \
              patch("artha.rank_candidates.time.monotonic", side_effect=[0, 0, 10]), \
              patch("yfinance.download", return_value=pd.DataFrame()) as download:
             rank_universe(universe, top_n=2)
@@ -4561,8 +4585,9 @@ class TestExecutionReadiness(unittest.TestCase):
             portfolio_path = self.tmp_dir / "portfolio.json"
 
             # Seed: KEEP stays at the broker, GONE was sold manually.
+            seeded_theses = {}
             for tick in ("KEEP", "GONE"):
-                pending = tracker.create_thesis(
+                seeded_theses[tick] = tracker.create_thesis(
                     ticker=tick,
                     position_type="STARTER",
                     thesis_summary=f"Unit thesis {tick}.",
@@ -4576,6 +4601,14 @@ class TestExecutionReadiness(unittest.TestCase):
             )
             bridge.sync_snapshot_to_artha(seed, journal=journal, portfolio_path=portfolio_path)
             self.assertIsNotNone(Portfolio.load(portfolio_path).get_position("GONE"))
+            tracker.mark_waiting_for_sell(
+                seeded_theses["GONE"].thesis_id,
+                reason="Council EXIT awaiting broker confirmation",
+            )
+            self.assertEqual(
+                tracker.get(seeded_theses["GONE"].thesis_id).status,
+                "pending_exit",
+            )
 
             sent = []
 
@@ -4605,6 +4638,11 @@ class TestExecutionReadiness(unittest.TestCase):
             self.assertEqual(len(sells), 1)
             self.assertIn("Sold outside Artha", sells[0]["notes"])
             self.assertTrue(any("Sold outside Artha" in t for t in sent))
+            gone_thesis = tracker.get(seeded_theses["GONE"].thesis_id)
+            self.assertEqual(gone_thesis.status, "archived")
+            self.assertEqual(len(journal.get_pending_post_sell_reviews()), 1)
+            self.assertEqual(len(journal.get_sell_trade_events(ticker="GONE")), 1)
+            self.assertEqual(len(journal.get_broker_fill_effects()), 1)
             # tracker resets after close
             self.assertEqual(bridge._load_external_sell_tracker(), {})
         finally:
@@ -4833,6 +4871,8 @@ class TestExecutionReadiness(unittest.TestCase):
                     "opportunity_score": 68,
                     "confidence": 8,
                     "price": 10.0,
+                    "sector": "Technology",
+                    "industry": "Software - Infrastructure",
                     "evidence_count": 12,
                     "feature_json": "{}",
                 }
@@ -4884,6 +4924,9 @@ class TestExecutionReadiness(unittest.TestCase):
             portfolio_after_fill = Portfolio.load(portfolio_path)
             pos = portfolio_after_fill.get_position("TEST")
             self.assertEqual(pos.thesis_id, pending.thesis_id)
+            self.assertEqual(pos.sector, "Technology")
+            self.assertEqual(pos.industry, "Software - Infrastructure")
+            self.assertTrue(pos.classification_source.startswith("decision_features:"))
             self.assertAlmostEqual(pos.shares, 1.25)
             self.assertAlmostEqual(pos.hard_stop_price, 9.2)  # rule-4.1 initial stop: -8% (was legacy -12%)
             buy_transactions = [
@@ -5987,7 +6030,14 @@ class TestExecutionReadiness(unittest.TestCase):
                 }
             )
 
+            clean_sector_state = {
+                "total_value": 364.50,
+                "total_invested": 0.0,
+                "cash_available": 364.50,
+                "positions": [],
+            }
             with patch("artha.execution_officer.ChatGPTBackendClient.chat", return_value=premature_wait), \
+                 patch("artha.execution.PortfolioStateEngine.compute_state", return_value=clean_sector_state), \
                  patch.object(MarketHours, "is_market_open", lambda self, now=None: True):
                 result = scheduler._prepare_scan_buy_robinhood_review(
                     "USB",
@@ -8809,7 +8859,12 @@ class TestSellSideHardening(unittest.TestCase):
 
         journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
         tracker = ThesisTracker(journal=journal)
-        pending = tracker.create_thesis("RTX", "TACTICAL_BUY", thesis_summary="unit pending")
+        pending = tracker.create_thesis(
+            "RTX",
+            "TACTICAL_BUY",
+            thesis_summary="unit pending",
+            invalidation_conditions=["Fundamental catalyst fails"],
+        )
         tracker.activate_thesis(pending.thesis_id, entry_price=100.0, shares=0.1)
         with journal._connect() as conn:
             conn.execute("UPDATE position_theses SET status = 'pending_exit' WHERE ticker = 'RTX'")
@@ -9096,6 +9151,15 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertIsNone(Portfolio.load(portfolio_path).get_position("FULL"))
         self.assertEqual(tracker.get(thesis.thesis_id).status, "archived")
         self.assertEqual(journal.get_trade_action("ta_full")["status"], "filled")
+        self.assertEqual(len(journal.get_broker_fill_effects()), 1)
+        self.assertEqual(len(journal.get_sell_trade_events(thesis_id=thesis.thesis_id)), 1)
+        self.assertEqual(len(journal.get_pending_post_sell_reviews()), 1)
+        episodes = journal.get_position_trade_episodes(status="closed")
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(episodes[0]["sell_fill_count"], 1)
+        from artha.supervisor import _check_broker_fill_accounting
+        accounting = _check_broker_fill_accounting(journal, portfolio_path=portfolio_path)
+        self.assertEqual(accounting["status"], "PASS", accounting)
         journal.update_trade_action("ta_full", {"status": "submitted"})
         repeated = record_order_fill(
             order_intent_id=intent_id,
@@ -9112,6 +9176,9 @@ class TestSellSideHardening(unittest.TestCase):
         )
         self.assertTrue(repeated["already_recorded"])
         self.assertEqual(journal.get_trade_action("ta_full")["status"], "filled")
+        self.assertEqual(len(journal.get_broker_fill_effects()), 1)
+        self.assertEqual(len(journal.get_sell_trade_events(thesis_id=thesis.thesis_id)), 1)
+        self.assertEqual(len(journal.get_pending_post_sell_reviews()), 1)
 
     def test_partial_trim_fill_keeps_thesis_active_and_updates_remaining_value(self):
         from artha.journal import DecisionJournal
@@ -9173,6 +9240,963 @@ class TestSellSideHardening(unittest.TestCase):
         refreshed = tracker.get(thesis.thesis_id)
         self.assertEqual(refreshed.status, "active")
         self.assertIsNotNone(refreshed.sell_cooldown_until)
+        self.assertEqual(len(journal.get_sell_trade_events(thesis_id=thesis.thesis_id)), 1)
+        self.assertEqual(journal.get_pending_post_sell_reviews(), [])
+
+    def test_replayed_trim_fill_does_not_extend_cooldown(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import record_order_fill
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        thesis = self._active_thesis(journal, ticker="COOL", position_type="STARTER", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="COOL",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-08-01T14:00:00Z",
+                    market_value=100,
+                )
+            ]
+        ).save(portfolio_path)
+        intent_id = "sell-intent-cooldown-replay"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "COOL",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 0.25,
+                "notional": 25,
+                "estimated_price": 100,
+                "status": "submitted",
+                "thesis_id": thesis.thesis_id,
+                "evidence_json": {"sell_council": {"confirmed": True, "action": "TRIM"}},
+            }
+        )
+        fill = {
+            "id": "rh-cooldown-replay",
+            "symbol": "COOL",
+            "side": "sell",
+            "state": "filled",
+            "cumulative_quantity": "0.25",
+            "average_price": "100",
+            "last_transaction_at": "2026-08-09T15:30:00Z",
+        }
+
+        first = record_order_fill(
+            order_intent_id=intent_id,
+            fill_payload=fill,
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+        cooldown_before = tracker.get(thesis.thesis_id).sell_cooldown_until
+        replay = record_order_fill(
+            order_intent_id=intent_id,
+            fill_payload=fill,
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertFalse(first["already_recorded"])
+        self.assertTrue(replay["already_recorded"])
+        self.assertEqual(tracker.get(thesis.thesis_id).sell_cooldown_until, cooldown_before)
+
+    def test_late_broker_fill_upgrades_external_close_without_double_booking(self):
+        from artha.fill_finalizer import finalize_broker_sell_fill
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        thesis = self._active_thesis(journal, ticker="LATE", position_type="STARTER", entry=100)
+        tracker.mark_waiting_for_sell(thesis.thesis_id, reason="Council EXIT")
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="LATE",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-08-01T14:00:00Z",
+                    market_value=100,
+                    thesis_id=thesis.thesis_id,
+                )
+            ]
+        ).save(portfolio_path)
+        row = {
+            "ticker": "LATE",
+            "side": "sell",
+            "thesis_id": thesis.thesis_id,
+            "order_intent_id": "late-intent",
+            "evidence_json": {"sell_council": {"confirmed": True, "action": "EXIT"}},
+        }
+        synthetic = finalize_broker_sell_fill(
+            journal=journal,
+            execution_row=row,
+            ticker="LATE",
+            cumulative_quantity=1,
+            average_price=95,
+            broker_order_id="external-snapshot:LATE:2026-08-10T15:00:00Z",
+            source="external_snapshot_reconciliation",
+            filled_at="2026-08-10T15:00:00Z",
+            portfolio_path=portfolio_path,
+            data_quality="estimated_price_from_last_artha_mark",
+        )
+        actual = finalize_broker_sell_fill(
+            journal=journal,
+            execution_row=row,
+            ticker="LATE",
+            cumulative_quantity=1,
+            average_price=97,
+            broker_order_id="rh-late-exact",
+            source="broker_fill_callback",
+            filled_at="2026-08-08T15:00:00Z",
+            portfolio_path=portfolio_path,
+            data_quality="broker_fill",
+        )
+        replay = finalize_broker_sell_fill(
+            journal=journal,
+            execution_row=row,
+            ticker="LATE",
+            cumulative_quantity=1,
+            average_price=97,
+            broker_order_id="rh-late-exact",
+            source="broker_fill_callback",
+            filled_at="2026-08-08T15:00:00Z",
+            portfolio_path=portfolio_path,
+            data_quality="broker_fill",
+        )
+
+        self.assertEqual(actual["event_id"], synthetic["event_id"])
+        self.assertTrue(actual["external_reconciliation_upgraded"])
+        self.assertTrue(replay["already_recorded"])
+        self.assertEqual(len(journal.get_sell_trade_events(ticker="LATE")), 1)
+        self.assertEqual(len(journal.get_broker_fill_effects()), 1)
+        self.assertEqual(len(journal.get_all_post_sell_reviews()), 1)
+        event = journal.get_sell_trade_events(ticker="LATE")[0]
+        self.assertEqual(event["broker_order_id"], "rh-late-exact")
+        self.assertEqual(event["average_price"], 97)
+        self.assertEqual(event["realized_pnl"], -3)
+        transactions = Portfolio.load(portfolio_path).transactions
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["broker_order_id"], "rh-late-exact")
+        self.assertEqual(transactions[0]["price"], 97)
+
+    def test_cumulative_partial_sell_fill_uses_incremental_price_and_one_event(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import record_order_fill
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="CUM", position_type="STARTER", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="CUM",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=100,
+                )
+            ],
+            cash_deployed=100,
+        ).save(portfolio_path)
+        intent_id = "sell-intent-cumulative"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "CUM",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 0.5,
+                "notional": 48,
+                "estimated_price": 96,
+                "status": "submitted",
+                "thesis_id": thesis.thesis_id,
+                "evidence_json": {"sell_council": {"confirmed": True, "action": "TRIM"}},
+                "request_json": {"symbol": "CUM", "side": "sell", "quantity": "0.5"},
+            }
+        )
+
+        first = record_order_fill(
+            order_intent_id=intent_id,
+            fill_payload={
+                "id": "rh-cumulative",
+                "symbol": "CUM",
+                "side": "sell",
+                "state": "partially_filled",
+                "cumulative_quantity": "0.2",
+                "average_price": "90",
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+        second = record_order_fill(
+            order_intent_id=intent_id,
+            fill_payload={
+                "id": "rh-cumulative",
+                "symbol": "CUM",
+                "side": "sell",
+                "state": "filled",
+                "cumulative_quantity": "0.5",
+                "average_price": "96",
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertEqual(first["status"], "PASS")
+        self.assertEqual(second["status"], "PASS")
+        portfolio = Portfolio.load(portfolio_path)
+        self.assertAlmostEqual(portfolio.get_position("CUM").shares, 0.5)
+        sells = [row for row in portfolio.transactions if row.get("type") == "SELL"]
+        self.assertEqual(len(sells), 2)
+        self.assertAlmostEqual(sells[0]["price"], 90.0)
+        self.assertAlmostEqual(sells[1]["price"], 100.0)
+        self.assertAlmostEqual(sum(row["realized_pnl"] for row in sells), -2.0)
+        events = journal.get_sell_trade_events(thesis_id=thesis.thesis_id)
+        self.assertEqual(len(events), 1)
+        self.assertAlmostEqual(events[0]["shares"], 0.5)
+        self.assertAlmostEqual(events[0]["proceeds"], 48.0)
+        self.assertAlmostEqual(events[0]["realized_pnl"], -2.0)
+        self.assertEqual(events[0]["event_type"], "TRIM")
+        self.assertEqual(journal.get_pending_post_sell_reviews(), [])
+
+    def test_replayed_old_trim_cannot_reactivate_archived_thesis(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import record_order_fill
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        thesis = self._active_thesis(journal, ticker="REPLAY", position_type="STARTER", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="REPLAY",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=100,
+                )
+            ],
+            cash_deployed=100,
+        ).save(portfolio_path)
+
+        def seed_order(intent_id, action, quantity):
+            journal.save_execution_order(
+                {
+                    "order_intent_id": intent_id,
+                    "ticker": "REPLAY",
+                    "side": "sell",
+                    "order_type": "market",
+                    "quantity": quantity,
+                    "notional": quantity * 95,
+                    "estimated_price": 95,
+                    "status": "submitted",
+                    "thesis_id": thesis.thesis_id,
+                    "evidence_json": {"sell_council": {"confirmed": True, "action": action}},
+                    "request_json": {"symbol": "REPLAY", "side": "sell", "quantity": str(quantity)},
+                }
+            )
+
+        seed_order("trim-old", "TRIM", 0.25)
+        trim_payload = {
+            "id": "rh-trim-old",
+            "symbol": "REPLAY",
+            "side": "sell",
+            "state": "filled",
+            "cumulative_quantity": "0.25",
+            "average_price": "95",
+        }
+        record_order_fill(
+            order_intent_id="trim-old",
+            fill_payload=trim_payload,
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+        seed_order("exit-new", "EXIT", 0.75)
+        record_order_fill(
+            order_intent_id="exit-new",
+            fill_payload={
+                "id": "rh-exit-new",
+                "symbol": "REPLAY",
+                "side": "sell",
+                "state": "filled",
+                "cumulative_quantity": "0.75",
+                "average_price": "96",
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        replayed = record_order_fill(
+            order_intent_id="trim-old",
+            fill_payload=trim_payload,
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertTrue(replayed["already_recorded"])
+        self.assertIsNone(Portfolio.load(portfolio_path).get_position("REPLAY"))
+        self.assertEqual(tracker.get(thesis.thesis_id).status, "archived")
+        events = journal.get_sell_trade_events(thesis_id=thesis.thesis_id)
+        self.assertEqual([event["event_type"] for event in events], ["TRIM", "EXIT"])
+        self.assertEqual(len(journal.get_pending_post_sell_reviews()), 1)
+        self.assertEqual(len(journal.get_broker_fill_effects()), 2)
+
+    def test_supervisor_fails_filled_sell_that_bypassed_shared_finalizer(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.supervisor import _check_broker_fill_accounting
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio().save(portfolio_path)
+        journal.save_execution_order(
+            {
+                "order_intent_id": "bypassed-sell",
+                "ticker": "MISS",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 1,
+                "notional": 10,
+                "estimated_price": 10,
+                "status": "filled",
+                "broker_order_id": "rh-bypassed-sell",
+                "filled_at": "2026-06-06T14:00:00Z",
+            }
+        )
+
+        result = _check_broker_fill_accounting(journal, portfolio_path=portfolio_path)
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["missing_effects"], ["rh-bypassed-sell"])
+        self.assertEqual(result["missing_events"], ["rh-bypassed-sell"])
+
+    def test_sector_backfill_reaches_portfolio_state_and_intended_risk_gate(self):
+        from types import SimpleNamespace
+
+        from artha.council import hard_risk_gate
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.portfolio_risk import build_portfolio_factor_risk
+        from artha.portfolio_state import PortfolioStateEngine
+        from artha.position_classification import backfill_portfolio_classifications
+        from artha.supervisor import _check_position_classification
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        journal.save_decision_features(
+            {
+                "dossier_path": str(self.tmp_dir / "TECH_dossier.json"),
+                "generated_at": "2026-06-04T14:20:00+00:00",
+                "ticker": "TECH",
+                "final_verdict": "STARTER",
+                "sector": "Technology",
+                "industry": "Software",
+                "feature_json": "{}",
+            }
+        )
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="TECH",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=40,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    current_price=40,
+                    market_value=40,
+                )
+            ],
+            cash_available=60,
+        ).save(portfolio_path)
+
+        backfill = backfill_portfolio_classifications(
+            journal,
+            portfolio_path=portfolio_path,
+        )
+        state = PortfolioStateEngine(portfolio_path).compute_state()
+
+        self.assertEqual(backfill["updated"], ["TECH"])
+        self.assertEqual(backfill["unresolved"], [])
+        self.assertEqual(state["positions"][0]["sector"], "Technology")
+        check = _check_position_classification(portfolio_path=portfolio_path)
+        self.assertEqual(check["status"], "PASS", check)
+        self.assertAlmostEqual(check["sector_exposures"][0]["pct_nav"], 40.0)
+        self.assertAlmostEqual(check["sector_exposures"][0]["pct_invested"], 100.0)
+
+        config = SimpleNamespace(
+            MAX_CONCURRENT_POSITIONS=20,
+            MAX_INVESTED_PCT=0.90,
+            MAX_SECTOR_PCT=0.30,
+            MAX_POSITION_PCT=0.20,
+            EXPLORATION_MAX_PER_POSITION_PCT=0.05,
+        )
+        candidate = {"profile": {"sector": "Technology", "industry": "Software"}}
+        passed, reason = hard_risk_gate("NEW", candidate, state, [], config)
+        self.assertFalse(passed)
+        self.assertIn("SECTOR LIMIT", reason)
+        risk = build_portfolio_factor_risk("NEW", candidate, state, config, 5.0)
+        self.assertAlmostEqual(risk["current_sector_pct"], 40.0)
+        self.assertAlmostEqual(risk["current_sector_invested_pct"], 100.0)
+
+    def test_historical_backfill_groups_trims_into_one_closed_episode_idempotently(self):
+        from artha.fill_finalizer import backfill_sell_fill_accounting
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        thesis = self._active_thesis(journal, ticker="HIST", position_type="STARTER", entry=100)
+        tracker.archive_thesis(thesis.thesis_id, exit_price=105, exit_reason="Historical exit")
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio().save(portfolio_path)
+
+        for index, (action, quantity, price) in enumerate(
+            [("TRIM", 0.25, 102), ("EXIT", 0.75, 106)],
+            start=1,
+        ):
+            intent_id = f"historical-{index}"
+            broker_id = f"rh-historical-{index}"
+            filled_at = f"2026-06-0{index + 5}T14:00:00Z"
+            journal.save_execution_order(
+                {
+                    "order_intent_id": intent_id,
+                    "ticker": "HIST",
+                    "side": "sell",
+                    "order_type": "market",
+                    "quantity": quantity,
+                    "notional": quantity * price,
+                    "estimated_price": price,
+                    "status": "filled",
+                    "broker_order_id": broker_id,
+                    "thesis_id": thesis.thesis_id,
+                    "filled_at": filled_at,
+                    "evidence_json": {"sell_council": {"confirmed": True, "action": action}},
+                    "response_json": {
+                        "order": {
+                            "id": broker_id,
+                            "symbol": "HIST",
+                            "side": "sell",
+                            "state": "filled",
+                            "cumulative_quantity": quantity,
+                            "average_price": price,
+                            "last_transaction_at": filled_at,
+                        }
+                    },
+                }
+            )
+
+        first = backfill_sell_fill_accounting(journal, portfolio_path=portfolio_path)
+        second = backfill_sell_fill_accounting(journal, portfolio_path=portfolio_path)
+
+        self.assertEqual(first["sell_orders_seen"], 2)
+        self.assertEqual(first["events_created"], 2)
+        self.assertEqual(second["events_created"], 0)
+        events = journal.get_sell_trade_events(thesis_id=thesis.thesis_id)
+        self.assertEqual([event["event_type"] for event in events], ["TRIM", "EXIT"])
+        self.assertEqual(len(journal.get_broker_fill_effects()), 2)
+        self.assertEqual(len(journal.get_all_post_sell_reviews()), 1)
+        episodes = journal.get_position_trade_episodes(status="closed")
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(episodes[0]["sell_fill_count"], 2)
+        self.assertEqual(episodes[0]["trim_count"], 1)
+        self.assertAlmostEqual(episodes[0]["shares_sold"], 1.0)
+
+    def test_historical_backfill_reconstructs_fifo_cost_from_broker_fills(self):
+        from artha.execution_learning import build_execution_learning_summary
+        from artha.fill_finalizer import backfill_sell_fill_accounting
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="FIFO", entry=100)
+        ThesisTracker(journal).update_thesis_fields(
+            thesis.thesis_id,
+            entry_date="2026-08-01T14:00:30Z",
+        )
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            transactions=[
+                {
+                    "type": "SELL",
+                    "ticker": "FIFO",
+                    "shares": 0.25,
+                    "price": 130,
+                    "total": 32.5,
+                    "realized_pnl": 7.5,
+                    "cost_basis_per_share": 100,
+                    "broker_order_id": "rh-fifo-sell",
+                    "timestamp": "2026-08-01T14:10:00Z",
+                }
+            ]
+        ).save(portfolio_path)
+
+        for index, (quantity, price, filled_at) in enumerate(
+            (
+                (0.6, 100.0, "2026-08-01T14:00:00Z"),
+                (0.4, 120.0, "2026-08-01T14:05:00Z"),
+            ),
+            start=1,
+        ):
+            broker_id = f"rh-fifo-buy-{index}"
+            journal.save_execution_order(
+                {
+                    "order_intent_id": f"fifo-buy-{index}",
+                    "ticker": "FIFO",
+                    "side": "buy",
+                    "order_type": "market",
+                    "quantity": quantity,
+                    "notional": quantity * price,
+                    "estimated_price": price,
+                    "status": "filled",
+                    "broker_order_id": broker_id,
+                    "thesis_id": thesis.thesis_id if index == 2 else None,
+                    "filled_at": filled_at,
+                    "response_json": {
+                        "order": {
+                            "id": broker_id,
+                            "symbol": "FIFO",
+                            "side": "buy",
+                            "state": "filled",
+                            "cumulative_quantity": quantity,
+                            "average_price": price,
+                            "last_transaction_at": filled_at,
+                            "fees": "0.000000",
+                        }
+                    },
+                }
+            )
+        journal.save_execution_order(
+            {
+                "order_intent_id": "fifo-sell",
+                "ticker": "FIFO",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 0.7,
+                "notional": 91,
+                "estimated_price": 130,
+                "status": "filled",
+                "broker_order_id": "rh-fifo-sell",
+                "thesis_id": thesis.thesis_id,
+                "filled_at": "2026-08-01T14:10:00Z",
+                "evidence_json": {"sell_council": {"confirmed": True, "action": "TRIM"}},
+                "response_json": {
+                    "order": {
+                        "id": "rh-fifo-sell",
+                        "symbol": "FIFO",
+                        "side": "sell",
+                        "state": "filled",
+                        "cumulative_quantity": 0.7,
+                        "average_price": 130,
+                        "last_transaction_at": "2026-08-01T14:10:00Z",
+                        "fees": "0.000000",
+                    }
+                },
+            }
+        )
+
+        result = backfill_sell_fill_accounting(journal, portfolio_path=portfolio_path)
+        event = journal.get_sell_trade_events(ticker="FIFO")[0]
+        episode = journal.get_position_trade_episodes(status="open")[0]
+        summary = build_execution_learning_summary(journal, portfolio_path=portfolio_path)
+
+        self.assertEqual(result["broker_fifo_reconstructed_events"], 1)
+        self.assertEqual(event["data_quality"], "broker_fill_fifo_reconstruction")
+        self.assertAlmostEqual(event["cost_basis_per_share"], 72 / 0.7)
+        self.assertAlmostEqual(event["realized_pnl"], 19.0)
+        self.assertAlmostEqual(event["position_shares_before"], 1.0)
+        self.assertAlmostEqual(event["position_shares_after"], 0.3)
+        self.assertEqual(episode["buy_fill_count"], 2)
+        self.assertAlmostEqual(episode["shares_bought"], 1.0)
+        self.assertEqual(summary["data_quality"]["uncertain_events"], 0)
+
+    def test_post_sell_accounting_refresh_preserves_completed_outcome(self):
+        from artha.journal import DecisionJournal
+        from artha.opportunity_cost import PostSellTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = PostSellTracker(journal)
+        tracker.record_sell(
+            ticker="KEEP",
+            thesis_id="keep-thesis",
+            sell_price=100,
+            sell_reason="test",
+            shares=1,
+            position_type="STARTER",
+            tracking_id="keep-tracking",
+            sell_date="2026-06-01",
+        )
+        journal.save_post_sell_tracking(
+            {
+                "tracking_id": "keep-tracking",
+                "price_5d": 101,
+                "price_20d": 102,
+                "price_60d": 103,
+                "grade": "EARLY",
+                "status": "completed",
+            }
+        )
+
+        tracker.record_sell(
+            ticker="KEEP",
+            thesis_id="keep-thesis",
+            sell_price=100,
+            sell_reason="test",
+            shares=1,
+            position_type="STARTER",
+            tracking_id="keep-tracking",
+            sell_date="2026-06-01",
+            cost_basis=90,
+            realized_pnl=10,
+            data_quality="broker_fill_fifo_reconstruction",
+        )
+        row = journal.get_post_sell_review("keep-tracking")
+
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["grade"], "EARLY")
+        self.assertEqual(row["price_60d"], 103)
+        self.assertEqual(row["cost_basis"], 90)
+        self.assertEqual(row["data_quality"], "broker_fill_fifo_reconstruction")
+
+    def test_execution_learning_reports_checkpoint_maturity_without_relaxing_gate(self):
+        from datetime import date
+
+        from artha.execution_learning import build_execution_learning_summary
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        for tracking_id, sell_date in (("overdue", "2026-05-01"), ("future", "2026-07-15")):
+            journal.save_post_sell_tracking(
+                {
+                    "tracking_id": tracking_id,
+                    "ticker": tracking_id.upper(),
+                    "sell_date": sell_date,
+                    "sell_price": 100,
+                    "status": "tracking",
+                }
+            )
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio().save(portfolio_path)
+
+        summary = build_execution_learning_summary(
+            journal,
+            portfolio_path=portfolio_path,
+            as_of=date(2026, 8, 11),
+        )
+
+        self.assertEqual(summary["post_sell"]["overdue_60d_reviews"], 1)
+        self.assertEqual(summary["post_sell"]["next_60d_due_date"], "2026-09-13")
+        self.assertFalse(summary["post_sell"]["council_learning_ready"])
+
+    def test_historical_backfill_flags_legacy_quantity_conflict(self):
+        from artha.execution_learning import build_execution_learning_summary
+        from artha.fill_finalizer import backfill_sell_fill_accounting
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        thesis = self._active_thesis(journal, ticker="LEGACY", position_type="STARTER", entry=100)
+        tracker.archive_thesis(thesis.thesis_id, exit_price=95, exit_reason="Historical exit")
+        broker_order_id = "rh-legacy-quantity-conflict"
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            transactions=[
+                {
+                    "type": "SELL",
+                    "ticker": "LEGACY",
+                    "shares": 0.25,
+                    "price": 95,
+                    "total": 23.75,
+                    "realized_pnl": -1.25,
+                    "cost_basis_per_share": 100,
+                    "broker_order_id": broker_order_id,
+                    "timestamp": "2026-08-05T14:00:00Z",
+                }
+            ]
+        ).save(portfolio_path)
+        journal.save_execution_order(
+            {
+                "order_intent_id": "legacy-conflict-intent",
+                "ticker": "LEGACY",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 1,
+                "notional": 95,
+                "estimated_price": 95,
+                "status": "filled",
+                "broker_order_id": broker_order_id,
+                "thesis_id": thesis.thesis_id,
+                "filled_at": "2026-08-05T14:00:00Z",
+                "evidence_json": {"sell_council": {"confirmed": True, "action": "EXIT"}},
+                "response_json": {
+                    "order": {
+                        "id": broker_order_id,
+                        "symbol": "LEGACY",
+                        "side": "sell",
+                        "state": "filled",
+                        "cumulative_quantity": 1,
+                        "average_price": 95,
+                        "last_transaction_at": "2026-08-05T14:00:00Z",
+                    }
+                },
+            }
+        )
+
+        backfill_sell_fill_accounting(journal, portfolio_path=portfolio_path)
+        event = journal.get_sell_trade_events(ticker="LEGACY")[0]
+        summary = build_execution_learning_summary(journal, portfolio_path=portfolio_path)
+
+        self.assertEqual(event["data_quality"], "legacy_portfolio_quantity_conflict")
+        self.assertEqual(summary["data_quality"]["quantity_conflict_events"], 1)
+        self.assertEqual(summary["data_quality"]["uncertain_events"], 1)
+        self.assertTrue(summary["data_quality"]["expectancy_is_provisional"])
+
+    def test_execution_learning_counts_episodes_not_individual_trims(self):
+        from artha.execution_learning import build_execution_learning_summary
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.supervisor import _check_execution_learning
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        for event_id, thesis_id, event_type, pnl, proceeds, quality in (
+            ("win-trim", "win-thesis", "TRIM", 1.0, 11.0, "broker_fill"),
+            ("win-exit", "win-thesis", "EXIT", 2.0, 12.0, "broker_fill"),
+            ("loss-exit", "loss-thesis", "EXIT", -2.0, 8.0, "broker_fill_with_inferred_cost"),
+        ):
+            journal.save_sell_trade_event(
+                {
+                    "event_id": event_id,
+                    "ticker": thesis_id.split("-")[0].upper(),
+                    "thesis_id": thesis_id,
+                    "event_type": event_type,
+                    "shares": 1,
+                    "average_price": proceeds,
+                    "cost_basis_per_share": 10,
+                    "proceeds": proceeds,
+                    "realized_pnl": pnl,
+                    "sell_reason": "test",
+                    "source": "unit_test",
+                    "data_quality": quality,
+                    "filled_at": "2026-06-06T14:00:00Z",
+                }
+            )
+        for episode_id, thesis_id, pnl, return_pct in (
+            ("episode-win", "win-thesis", 3.0, 15.0),
+            ("episode-loss", "loss-thesis", -2.0, -10.0),
+        ):
+            journal.save_position_trade_episode(
+                {
+                    "episode_id": episode_id,
+                    "thesis_id": thesis_id,
+                    "ticker": thesis_id.split("-")[0].upper(),
+                    "status": "closed",
+                    "realized_pnl": pnl,
+                    "return_pct": return_pct,
+                    "source": "unit_test",
+                }
+            )
+        journal.save_post_sell_tracking(
+            {
+                "tracking_id": "post-win",
+                "ticker": "WIN",
+                "sell_date": "2026-06-06T14:00:00Z",
+                "sell_price": 12,
+                "grade": "EARLY",
+                "status": "completed",
+            }
+        )
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="OPEN",
+                    asset_type="stock",
+                    shares=2,
+                    avg_cost=10,
+                    opened_at="2026-06-05T14:00:00Z",
+                    market_value=24,
+                    position_type="STARTER",
+                )
+            ]
+        ).save(portfolio_path)
+
+        summary = build_execution_learning_summary(journal, portfolio_path=portfolio_path)
+
+        self.assertEqual(summary["scope"], "observational_only")
+        self.assertFalse(summary["strategy_effects_enabled"])
+        self.assertEqual(summary["episodes"]["closed"], 2)
+        self.assertEqual(summary["episodes"]["wins"], 1)
+        self.assertEqual(summary["episodes"]["losses"], 1)
+        self.assertEqual(summary["episodes"]["win_rate_pct"], 50.0)
+        self.assertEqual(summary["episodes"]["expectancy_dollars"], 0.5)
+        self.assertEqual(summary["sell_events"]["total"], 3)
+        self.assertEqual(summary["sell_events"]["trims"], 1)
+        self.assertEqual(summary["post_sell"]["grade_counts"], {"EARLY": 1})
+        self.assertEqual(summary["current_sizing"]["median_position_dollars"], 24.0)
+        self.assertEqual(summary["data_quality"]["status"], "provisional")
+        self.assertTrue(summary["data_quality"]["expectancy_is_provisional"])
+        self.assertEqual(summary["data_quality"]["inferred_cost_events"], 1)
+        check = _check_execution_learning(journal, portfolio_path=portfolio_path)
+        self.assertEqual(check["status"], "WARN")
+        self.assertIn("provisional", check["message"])
+        self.assertTrue(check["observational_only"])
+
+    def test_pending_exit_watchdog_never_archives_from_zero_shares_alone(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        from artha.scheduler import ArthaScheduler
+
+        thesis = SimpleNamespace(
+            thesis_id="pending-zero-thesis",
+            ticker="ZERO",
+            status="pending_exit",
+        )
+        tracker = Mock()
+        tracker.get_all_monitored.return_value = [thesis]
+        tracker.get.return_value = thesis
+        scheduler = ArthaScheduler.__new__(ArthaScheduler)
+        scheduler.sell_engine = SimpleNamespace(
+            journal=Mock(),
+            tracker=tracker,
+        )
+        scheduler.telegram = SimpleNamespace(enabled=False)
+        scheduler._load_robinhood_position_snapshot = Mock(
+            return_value={
+                "fresh": True,
+                "positions": [],
+                "orders": [],
+            }
+        )
+
+        with patch(
+            "artha.robinhood_bridge.sync_orders_to_artha",
+            return_value={"status": "PASS", "filled": []},
+        ) as sync_orders:
+            asyncio.run(scheduler._run_pending_exit_watchdog())
+
+        sync_orders.assert_called_once()
+        tracker.archive_thesis.assert_not_called()
+        tracker.reactivate_for_retry.assert_not_called()
+
+    def test_scheduler_snapshot_loader_preserves_orders_for_exit_watchdog(self):
+        from artha.config import Config
+        from artha.scheduler import ArthaScheduler
+
+        snapshot_path = self.tmp_dir / "latest_snapshot.json"
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "robinhood_mcp",
+            "account": {"account_number": "222233334"},
+            "portfolio": {"buying_power": "50", "cash": "50", "total_value": "60"},
+            "positions": [
+                {"symbol": "KEEP", "quantity": "1", "average_buy_price": "10"}
+            ],
+            "orders": [
+                {
+                    "id": "rh-watchdog-fill",
+                    "symbol": "GONE",
+                    "side": "sell",
+                    "state": "filled",
+                    "cumulative_quantity": "1",
+                    "average_price": "11",
+                }
+            ],
+        }
+        snapshot_path.write_text(json.dumps(payload), encoding="utf-8")
+        scheduler = ArthaScheduler.__new__(ArthaScheduler)
+
+        with patch.object(Config, "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "222233334"), patch.object(
+            Config,
+            "ROBINHOOD_RECONCILIATION_SNAPSHOT_FILE",
+            str(snapshot_path),
+        ):
+            loaded = scheduler._load_robinhood_position_snapshot()
+
+        self.assertTrue(loaded["fresh"])
+        self.assertEqual([row["id"] for row in loaded["orders"]], ["rh-watchdog-fill"])
+
+    def test_manual_sell_cli_uses_shared_fill_finalizer_for_trim_and_exit(self):
+        from argparse import Namespace
+
+        from artha.cli import portfolio_update
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(
+            journal,
+            ticker="MANUAL",
+            position_type="STARTER",
+            entry=100,
+        )
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="MANUAL",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00Z",
+                    market_value=100,
+                    thesis_id=thesis.thesis_id,
+                    position_type="STARTER",
+                )
+            ],
+            cash_deployed=100,
+            cash_available=0,
+        ).save(portfolio_path)
+
+        with patch.object(portfolio_update, "PORTFOLIO_FILE", portfolio_path), \
+                patch.object(portfolio_update, "DecisionJournal", return_value=journal), \
+                patch.object(portfolio_update, "_out") as output:
+            portfolio_update.cmd_sell(
+                Namespace(ticker="MANUAL", shares=0.5, price=110, reason="Manual trim")
+            )
+            portfolio_update.cmd_sell(
+                Namespace(ticker="MANUAL", shares=0.5, price=95, reason="Manual exit")
+            )
+
+        self.assertEqual(output.call_count, 2)
+        portfolio = Portfolio.load(portfolio_path)
+        self.assertIsNone(portfolio.get_position("MANUAL"))
+        self.assertAlmostEqual(portfolio.cash_available, 102.5)
+        self.assertAlmostEqual(portfolio.cash_deployed, 0.0)
+        events = journal.get_sell_trade_events(thesis_id=thesis.thesis_id)
+        self.assertEqual([row["event_type"] for row in events], ["TRIM", "EXIT"])
+        self.assertEqual([row["source"] for row in events], [
+            "manual_cli_confirmation",
+            "manual_cli_confirmation",
+        ])
+        self.assertEqual(len(journal.get_all_post_sell_reviews()), 1)
+        self.assertEqual(
+            ThesisTracker(journal).get(thesis.thesis_id).status,
+            "archived",
+        )
 
     def test_snapshot_order_sync_does_not_double_apply_already_reflected_sell(self):
         from artha.journal import DecisionJournal
@@ -9246,6 +10270,85 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertAlmostEqual(position.shares, 0.75)
         self.assertEqual(journal.get_execution_order_by_intent_id(intent_id)["status"], "filled")
         self.assertEqual(journal.get_thesis(thesis.thesis_id)["status"], "active")
+        sells = [row for row in Portfolio.load(portfolio_path).transactions if row.get("type") == "SELL"]
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["broker_order_id"], "rh-snapshot-sell")
+        self.assertEqual(len(journal.get_sell_trade_events(thesis_id=thesis.thesis_id)), 1)
+
+    def test_in_memory_snapshot_sync_preserves_filled_order_history(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import sync_snapshot_to_artha
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="LIVEFILL", position_type="STARTER", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="LIVEFILL",
+                    asset_type="stock",
+                    shares=0.75,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=75,
+                    thesis_id=thesis.thesis_id,
+                )
+            ]
+        ).save(portfolio_path)
+        intent_id = "sell-intent-live-snapshot"
+        broker_order_id = "rh-live-snapshot-sell"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "LIVEFILL",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 0.25,
+                "notional": 23.75,
+                "estimated_price": 95,
+                "status": "submitted",
+                "broker_order_id": broker_order_id,
+                "thesis_id": thesis.thesis_id,
+                "evidence_json": {"sell_council": {"confirmed": True, "action": "TRIM"}},
+                "request_json": {"symbol": "LIVEFILL", "side": "sell", "quantity": "0.25"},
+            }
+        )
+
+        result = sync_snapshot_to_artha(
+            {
+                "source": "robinhood_mcp",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "positions": [
+                    {
+                        "symbol": "LIVEFILL",
+                        "quantity": "0.75",
+                        "average_buy_price": "100.00",
+                        "market_price": "95.00",
+                    }
+                ],
+                "orders": [
+                    {
+                        "id": broker_order_id,
+                        "symbol": "LIVEFILL",
+                        "side": "sell",
+                        "state": "filled",
+                        "cumulative_quantity": "0.25",
+                        "average_price": "95",
+                        "last_transaction_at": "2026-06-06T14:00:00Z",
+                    }
+                ],
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertEqual(result["order_sync"]["status"], "PASS")
+        self.assertEqual(len(result["order_sync"]["filled"]), 1)
+        execution = journal.get_execution_order_by_intent_id(intent_id)
+        self.assertEqual(execution["status"], "filled")
+        self.assertEqual(execution["filled_at"], "2026-06-06T14:00:00Z")
+        self.assertEqual(len(journal.get_sell_trade_events(thesis_id=thesis.thesis_id)), 1)
 
     def test_snapshot_order_sync_repairs_filled_sell_missing_from_portfolio(self):
         from artha.journal import DecisionJournal
@@ -9331,6 +10434,107 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertEqual(len(sells), 1)
         self.assertIn(broker_order_id, sells[0]["notes"])
         self.assertEqual(journal.get_thesis(thesis.thesis_id)["status"], "archived")
+        self.assertEqual(len(journal.get_pending_post_sell_reviews()), 1)
+        self.assertEqual(len(journal.get_sell_trade_events(thesis_id=thesis.thesis_id)), 1)
+
+    def test_snapshot_order_sync_does_not_repair_fully_accounted_history(self):
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.robinhood_bridge import sync_orders_to_artha
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="HISTORY", position_type="STARTER", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="HISTORY",
+                    asset_type="stock",
+                    shares=0.75,
+                    avg_cost=100,
+                    opened_at="2026-06-05T14:00:00+00:00",
+                    market_value=75,
+                    thesis_id=thesis.thesis_id,
+                )
+            ]
+        ).save(portfolio_path)
+        intent_id = "sell-intent-accounted-history"
+        broker_order_id = "rh-accounted-history"
+        journal.save_execution_order(
+            {
+                "order_intent_id": intent_id,
+                "ticker": "HISTORY",
+                "side": "sell",
+                "order_type": "market",
+                "quantity": 0.25,
+                "notional": 23.75,
+                "estimated_price": 95,
+                "status": "filled",
+                "broker_order_id": broker_order_id,
+                "thesis_id": thesis.thesis_id,
+                "notes": "Original execution note",
+                "response_json": {
+                    "artha_fill_applied": True,
+                    "artha_fill_broker_order_id": broker_order_id,
+                    "artha_fill_quantity": 0.25,
+                    "artha_fill_average_price": 95,
+                },
+            }
+        )
+        journal.save_broker_fill_effect(
+            {
+                "event_key": "fill-accounted-history",
+                "broker_order_id": broker_order_id,
+                "order_intent_id": intent_id,
+                "ticker": "HISTORY",
+                "side": "sell",
+                "state": "filled",
+                "cumulative_quantity": 0.25,
+                "average_price": 95,
+                "applied_quantity": 0.25,
+                "source": "historical_execution_backfill",
+                "portfolio_effect_status": "historical_unreconciled",
+                "thesis_effect_status": "historical",
+                "tracking_effect_status": "historical",
+            }
+        )
+        cooldown_before = journal.get_thesis(thesis.thesis_id)["sell_cooldown_until"]
+
+        result = sync_orders_to_artha(
+            {
+                "positions": [{"symbol": "HISTORY", "quantity": "0.75"}],
+                "orders": [
+                    {
+                        "id": broker_order_id,
+                        "symbol": "HISTORY",
+                        "side": "sell",
+                        "state": "filled",
+                        "cumulative_quantity": "0.25",
+                        "average_price": "95",
+                        "last_transaction_at": "2026-06-06T14:00:00Z",
+                    }
+                ],
+            },
+            journal=journal,
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["filled"], [])
+        self.assertEqual(result["updated"][0]["filled_at"], "2026-06-06T14:00:00Z")
+        self.assertEqual(Portfolio.load(portfolio_path).transactions, [])
+        self.assertEqual(
+            journal.get_execution_order_by_intent_id(intent_id)["filled_at"],
+            "2026-06-06T14:00:00Z",
+        )
+        self.assertEqual(
+            journal.get_execution_order_by_intent_id(intent_id)["notes"],
+            "Original execution note",
+        )
+        self.assertEqual(
+            journal.get_thesis(thesis.thesis_id)["sell_cooldown_until"],
+            cooldown_before,
+        )
 
     def test_auto_sell_authorization_requires_sell_council_provenance(self):
         from datetime import datetime, timedelta, timezone
@@ -9875,6 +11079,391 @@ class TestSellSideHardening(unittest.TestCase):
         self.assertEqual(decision.action, "EXIT")
         self.assertEqual(decision.scoring_audit["cio_requested_action"], "HOLD")
         self.assertEqual(decision.scoring_audit["score_mapped_action"], "EXIT")
+
+    def test_time_checkpoint_requests_review_without_declaring_thesis_break(self):
+        from datetime import datetime, timedelta, timezone
+        from types import SimpleNamespace
+
+        from artha.journal import DecisionJournal
+        from artha.sell_engine import SellEngine
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        entry = datetime.now(timezone.utc) - timedelta(days=8)
+        thesis = tracker.create_thesis(
+            ticker="REVIEW",
+            position_type="STARTER",
+            thesis_summary="Review the business after one week.",
+            invalidation_conditions=[
+                {
+                    "metric": "days_held",
+                    "op": "gte",
+                    "value": 7,
+                    "description": "Mandatory one-week re-underwrite.",
+                }
+            ],
+        )
+        thesis = tracker.activate_thesis(
+            thesis.thesis_id,
+            100,
+            entry_date=entry.isoformat(),
+            shares=1,
+        )
+        tracker.update_thesis_fields(thesis.thesis_id, last_review_date=entry.isoformat())
+        thesis = tracker.get(thesis.thesis_id)
+        engine = SellEngine(journal=journal, collector=SimpleNamespace())
+
+        signals = engine._check_thesis_break(thesis, 101)
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0].signal_type, "thesis_review")
+        self.assertEqual(signals[0].action_recommended, "HOLD")
+        self.assertIn("not evidence that the thesis failed", signals[0].message)
+
+        tracker.update_review_date(thesis.thesis_id)
+        self.assertEqual(engine._check_thesis_break(tracker.get(thesis.thesis_id), 101), [])
+
+    def test_price_condition_remains_machine_checked_thesis_break(self):
+        from types import SimpleNamespace
+
+        from artha.journal import DecisionJournal
+        from artha.sell_engine import SellEngine
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        thesis = tracker.create_thesis(
+            ticker="BREAK",
+            position_type="STARTER",
+            thesis_summary="Price structure must hold.",
+            invalidation_conditions=[
+                {
+                    "metric": "price",
+                    "op": "lte",
+                    "value": 90,
+                    "description": "Support failure invalidates the entry.",
+                }
+            ],
+        )
+        thesis = tracker.activate_thesis(thesis.thesis_id, 100, shares=1)
+        signal = SellEngine(
+            journal=journal,
+            collector=SimpleNamespace(),
+        )._check_thesis_break(thesis, 89)[0]
+
+        self.assertEqual(signal.signal_type, "thesis_break")
+        self.assertEqual(signal.action_recommended, "EXIT")
+
+    def test_review_word_triggered_does_not_add_false_thesis_break_bonus(self):
+        from types import SimpleNamespace
+
+        from artha.sell_council import SellCouncil
+
+        thesis = SimpleNamespace(
+            ticker="TEST",
+            position_type="STARTER",
+            entry_price=100,
+            hard_stop_price=80,
+            entry_regime="neutral",
+            thesis_health_score=100,
+            days_held=7,
+        )
+        report = (
+            "**SELL VERDICT:** HOLD\n**FUNDAMENTAL SELL SCORE:** 30\n"
+            "**THESIS STATUS:** INTACT\n[REVIEW] days_held gte 7: TRIGGERED"
+        )
+        council = SellCouncil()
+        review_adjustments = council._build_rule_adjustments(
+            thesis,
+            _sample_stock(price=100),
+            "neutral",
+            [report],
+            trigger_type="thesis_review",
+        )
+        break_adjustments = council._build_rule_adjustments(
+            thesis,
+            _sample_stock(price=89),
+            "neutral",
+            [report],
+            trigger_type="thesis_break",
+        )
+
+        self.assertNotIn(
+            "invalidation_condition_triggered",
+            {row["name"] for row in review_adjustments},
+        )
+        self.assertIn(
+            "invalidation_condition_triggered",
+            {row["name"] for row in break_adjustments},
+        )
+
+    def test_thesis_metadata_extracts_narrative_and_preserves_business_conditions(self):
+        from artha.council import (
+            _extract_thesis_summary,
+            _merge_invalidation_conditions,
+            _normalize_decision_json,
+        )
+
+        synthesis = """PRIMARY DRIVER: RISK_ADJUSTED
+**COUNCIL CONSENSUS:** 2-1
+**RECOMMENDED ACTION:** STARTER
+
+**SYNTHESIS:**
+The company has improving free cash flow and a defensible balance sheet, but the entry should remain small while demand is verified.
+
+**KEY RISK TO WATCH:** demand deterioration
+```json
+{"opportunity_score": 72}
+```"""
+        decision = _normalize_decision_json(
+            {
+                "verdict": "STARTER",
+                "conviction_0_10": 7,
+                "entry_zone": None,
+                "stop_price": 90,
+                "target_price": 120,
+                "invalidation_conditions": [
+                    {"metric": "price", "op": "lte", "value": 90, "description": "support"},
+                    {"metric": "days_held", "op": "gte", "value": 7, "description": "review"},
+                ],
+                "half_size": False,
+            }
+        )
+        merged = _merge_invalidation_conditions(
+            ["Free cash flow deteriorates while leverage rises"],
+            decision["invalidation_conditions"],
+        )
+
+        self.assertTrue(_extract_thesis_summary(synthesis).startswith("The company has improving"))
+        self.assertEqual(merged[0], "Free cash flow deteriorates while leverage rises")
+        self.assertEqual(merged[1]["effect"], "invalidate")
+        self.assertEqual(merged[2]["effect"], "review")
+
+    def test_scale_out_marker_is_recorded_only_after_confirmed_trim_fill(self):
+        from types import SimpleNamespace
+
+        from artha.config import Config
+        from artha.fill_finalizer import finalize_broker_sell_fill
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.sell_engine import SellEngine
+        from artha.thesis_tracker import ThesisTracker
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        tracker = ThesisTracker(journal)
+        thesis = tracker.create_thesis(
+            ticker="SCALE",
+            position_type="STARTER",
+            thesis_summary="Unit thesis",
+            invalidation_conditions=["Fundamentals deteriorate"],
+        )
+        thesis = tracker.activate_thesis(thesis.thesis_id, 100, shares=1)
+        engine = SellEngine(journal=journal, collector=SimpleNamespace())
+        old_schedule = Config.SELL_SCALE_OUT_STARTER
+        Config.SELL_SCALE_OUT_STARTER = {"+10%": 0.25}
+        try:
+            signals = engine._check_scale_out(thesis, 111)
+        finally:
+            Config.SELL_SCALE_OUT_STARTER = old_schedule
+
+        self.assertEqual(signals[0].trim_pct, 0.25)
+        self.assertEqual(signals[0].completion_markers, ["+10%"])
+        self.assertNotIn("+10%", tracker.get(thesis.thesis_id).scale_out_completed)
+
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="SCALE",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-08-01T14:00:00Z",
+                    market_value=111,
+                    thesis_id=thesis.thesis_id,
+                    position_type="STARTER",
+                )
+            ]
+        ).save(portfolio_path)
+        row = {
+            "ticker": "SCALE",
+            "side": "sell",
+            "thesis_id": thesis.thesis_id,
+            "order_intent_id": "scale-intent",
+            "evidence_json": {
+                "action": "TRIM",
+                "completion_markers": ["+10%"],
+                "sell_council": {"confirmed": True, "action": "TRIM"},
+            },
+        }
+        first = finalize_broker_sell_fill(
+            journal=journal,
+            execution_row=row,
+            ticker="SCALE",
+            cumulative_quantity=0.25,
+            average_price=111,
+            broker_order_id="rh-scale",
+            order_intent_id="scale-intent",
+            filled_at="2026-08-11T15:30:00Z",
+            portfolio_path=portfolio_path,
+        )
+        replay = finalize_broker_sell_fill(
+            journal=journal,
+            execution_row=row,
+            ticker="SCALE",
+            cumulative_quantity=0.25,
+            average_price=111,
+            broker_order_id="rh-scale",
+            order_intent_id="scale-intent",
+            filled_at="2026-08-11T15:30:00Z",
+            portfolio_path=portfolio_path,
+        )
+
+        self.assertEqual(first["completion_markers"], ["+10%"])
+        self.assertTrue(replay["already_recorded"])
+        self.assertEqual(tracker.get(thesis.thesis_id).scale_out_completed.count("+10%"), 1)
+
+    def test_sell_queue_fails_closed_when_duplicate_state_cannot_be_read(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from artha.journal import DecisionJournal
+        from artha.portfolio import Portfolio, Position
+        from artha.scheduler import ArthaScheduler
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="DEDUPE", entry=100)
+        portfolio_path = self.tmp_dir / "portfolio.json"
+        Portfolio(
+            positions=[
+                Position(
+                    ticker="DEDUPE",
+                    asset_type="stock",
+                    shares=1,
+                    avg_cost=100,
+                    opened_at="2026-08-01T14:00:00Z",
+                    market_value=100,
+                    thesis_id=thesis.thesis_id,
+                )
+            ]
+        ).save(portfolio_path)
+        scheduler = ArthaScheduler()
+        decision = SimpleNamespace(
+            action="EXIT",
+            session_id="sell-dedupe-unit",
+            dossier_path=str(self.tmp_dir / "sell-dedupe.json"),
+            sell_score=90,
+            confidence=8,
+            trigger_type="hard_stop",
+        )
+
+        with patch("artha.scheduler.PORTFOLIO_FILE", portfolio_path), \
+                patch.object(journal, "get_trade_actions", side_effect=RuntimeError("db unavailable")):
+            result = scheduler._prepare_robinhood_sell_review(
+                thesis=thesis,
+                action="EXIT",
+                current_price=90,
+                journal=journal,
+                trigger_type="hard_stop",
+                reason="unit",
+                sell_decision=decision,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(journal.get_execution_orders(), [])
+
+    def test_sell_council_retries_instead_of_fabricating_hold_on_analyst_outage(self):
+        from artha.journal import DecisionJournal
+        from artha.sell_council import SellCouncil
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="OUTAGE", entry=100)
+        report = (
+            "**SELL VERDICT:** HOLD\n**FUNDAMENTAL SELL SCORE:** 25\n"
+            "**CONFIDENCE:** 7\n**THESIS STATUS:** INTACT\nBusiness remains sound."
+        )
+        with patch("artha.sell_council._run_sell_fundamental", return_value=report), \
+                patch("artha.sell_council._run_sell_technical", return_value=None), \
+                patch("artha.sell_council._run_sell_contrarian", return_value=None), \
+                patch("artha.sell_council.ChatGPTBackendClient.chat") as synthesis:
+            decision = SellCouncil(journal).run_sell_review(thesis, _sample_stock(price=100))
+
+        self.assertIsNone(decision)
+        synthesis.assert_not_called()
+
+    def test_sell_council_retries_when_cio_synthesis_is_unavailable(self):
+        from artha.journal import DecisionJournal
+        from artha.sell_council import SellCouncil
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        thesis = self._active_thesis(journal, ticker="NOCIO", entry=100)
+        report = (
+            "**SELL VERDICT:** HOLD\n**FUNDAMENTAL SELL SCORE:** 25\n"
+            "**CONFIDENCE:** 7\n**THESIS STATUS:** INTACT\nBusiness remains sound."
+        )
+        with patch("artha.sell_council._run_sell_fundamental", return_value=report), \
+                patch("artha.sell_council._run_sell_technical", return_value=report), \
+                patch("artha.sell_council._run_sell_contrarian", return_value=report), \
+                patch("artha.sell_council.ChatGPTBackendClient.chat", side_effect=RuntimeError("model outage")):
+            decision = SellCouncil(journal).run_sell_review(thesis, _sample_stock(price=100))
+
+        self.assertIsNone(decision)
+
+    def test_sell_council_retries_on_malformed_cio_numeric_fields(self):
+        from artha.sell_council import _validate_sell_synthesis_payload
+
+        valid = {
+            "sell_score": 55,
+            "action": "TRIM",
+            "thesis_status": "WEAKENED",
+            "next_review_days": 14,
+            "confidence": 7,
+            "health_score": 65,
+            "trim_pct": 20,
+        }
+        self.assertEqual(_validate_sell_synthesis_payload(valid), (True, ""))
+        for field, bad_value in (
+            ("sell_score", "not-a-number"),
+            ("action", "BUY"),
+            ("thesis_status", "UNKNOWN"),
+            ("next_review_days", 0),
+            ("confidence", 11),
+            ("trim_pct", 150),
+        ):
+            malformed = dict(valid)
+            malformed[field] = bad_value
+            ok, reason = _validate_sell_synthesis_payload(malformed)
+            self.assertFalse(ok, field)
+            self.assertTrue(reason, field)
+
+    def test_sell_learning_context_is_sample_gated_and_reason_specific(self):
+        from artha.execution_learning import build_sell_learning_context
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_dir / "artha.db")
+        for index in range(20):
+            journal.save_post_sell_tracking(
+                {
+                    "tracking_id": f"learning-{index}",
+                    "ticker": f"T{index}",
+                    "sell_date": "2026-06-01",
+                    "sell_price": 100,
+                    "sell_reason": "earnings risk trim" if index < 10 else "trailing stop",
+                    "grade": "EARLY" if index < 6 else "CORRECT",
+                    "status": "completed",
+                }
+            )
+
+        immature = build_sell_learning_context(journal, minimum_completed=21)
+        mature = build_sell_learning_context(journal, minimum_completed=20)
+
+        self.assertFalse(immature["ready"])
+        self.assertIn("20/21", immature["context"])
+        self.assertTrue(mature["ready"])
+        self.assertIn("earnings_risk", mature["context"])
+        self.assertIn("trailing_stop", mature["context"])
+        self.assertIn("weak calibration", mature["context"])
 
 
 class TestBrokerCapacityAndScanLifecycle(unittest.TestCase):

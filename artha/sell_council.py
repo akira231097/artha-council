@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
@@ -19,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .config import Config
+from .execution_learning import build_sell_learning_context
 from .journal import DecisionJournal
 from .chatgpt_backend import ChatGPTBackendClient
 from .gemini_client import gemini_generate
@@ -31,6 +33,7 @@ from .sell_prompts import (
     build_sell_context,
     build_blind_sell_context,
     build_sell_synthesis_prompt,
+    format_sell_condition,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,7 +132,7 @@ def _run_sell_fundamental(
     # Build invalidation condition review format hint
     conditions = getattr(thesis, "invalidation_conditions", []) or []
     cond_format = "\n".join(
-        f"- {c}: [INTACT|THREATENED|TRIGGERED] — [Evidence]"
+        f"- {format_sell_condition(c)}: [STATUS] — [Evidence]"
         for c in conditions[:8]
     ) or SELL_CONDITION_REVIEW_FORMAT
 
@@ -229,6 +232,20 @@ def _parse_sell_score(report: str, score_key: str) -> int:
     return 50  # default when parsing fails
 
 
+def _is_valid_sell_analyst_report(report: Any) -> bool:
+    """Require the two machine-consumed fields before counting an analyst."""
+    text = str(report or "").strip()
+    if len(text) < 40:
+        return False
+    has_verdict = bool(re.search(
+        r"SELL VERDICT[^\n]*(?:HOLD|TRIM|EXIT|URGENT_EXIT)",
+        text,
+        re.IGNORECASE,
+    ))
+    has_score = bool(re.search(r"SELL SCORE[^\n]*\d{1,3}", text, re.IGNORECASE))
+    return has_verdict and has_score
+
+
 def _parse_sell_verdict(report: str) -> str:
     """Extract HOLD/TRIM/EXIT verdict from analyst report."""
     match = re.search(
@@ -325,6 +342,50 @@ def _clamp_score(value: float) -> float:
 def _normalize_action(action: Any) -> str:
     value = str(action or "HOLD").upper().strip()
     return value if value in {"HOLD", "TRIM", "EXIT", "URGENT_EXIT"} else "HOLD"
+
+
+def _validate_sell_synthesis_payload(payload: Any) -> tuple[bool, str]:
+    """Reject malformed CIO JSON instead of coercing it into a live decision."""
+    if not isinstance(payload, dict):
+        return False, "payload is not an object"
+    required = {
+        "sell_score", "action", "thesis_status", "next_review_days", "confidence",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        return False, f"missing required fields: {', '.join(missing)}"
+
+    action = str(payload.get("action") or "").upper().strip()
+    if action not in {"HOLD", "TRIM", "EXIT", "URGENT_EXIT"}:
+        return False, f"invalid action: {action or '<empty>'}"
+    thesis_status = str(payload.get("thesis_status") or "").upper().strip()
+    if thesis_status not in {"INTACT", "WEAKENED", "DAMAGED", "BROKEN"}:
+        return False, f"invalid thesis_status: {thesis_status or '<empty>'}"
+
+    numeric_bounds = {
+        "sell_score": (0.0, 100.0),
+        "confidence": (1.0, 10.0),
+        "next_review_days": (1.0, 90.0),
+    }
+    for field, (lower, upper) in numeric_bounds.items():
+        if isinstance(payload.get(field), bool):
+            return False, f"{field} must be numeric"
+        value = _as_float(payload.get(field))
+        if value is None or not math.isfinite(value) or not lower <= value <= upper:
+            return False, f"{field} must be between {lower:g} and {upper:g}"
+        if field in {"confidence", "next_review_days"} and not value.is_integer():
+            return False, f"{field} must be an integer"
+
+    for field in ("health_score", "trim_pct"):
+        raw = payload.get(field)
+        if raw is None or raw == "":
+            continue
+        if isinstance(raw, bool):
+            return False, f"{field} must be numeric or null"
+        value = _as_float(raw)
+        if value is None or not math.isfinite(value) or not 0.0 <= value <= 100.0:
+            return False, f"{field} must be between 0 and 100"
+    return True, ""
 
 
 _SELL_ACTION_RANK = {"HOLD": 0, "TRIM": 1, "EXIT": 2, "URGENT_EXIT": 3}
@@ -473,34 +534,35 @@ class SellCouncil:
                 for future in futures:
                     future.cancel()
 
-        # FIX 7: Count available (non-None) analysts; never substitute score-50 for missing ones
+        analyst_reports = {
+            "fundamental": fundamental_report,
+            "technical": technical_report,
+            "contrarian": contrarian_report,
+        }
+        for name, report in list(analyst_reports.items()):
+            if report and not _is_valid_sell_analyst_report(report):
+                logger.error(
+                    "[sell_council] %s analyst returned an invalid report for %s; "
+                    "excluding it from the decision",
+                    name,
+                    ticker,
+                )
+                analyst_reports[name] = None
+        fundamental_report = analyst_reports["fundamental"]
+        technical_report = analyst_reports["technical"]
+        contrarian_report = analyst_reports["contrarian"]
+
+        # Count only complete analyst reports; never fabricate a neutral vote.
         available_count = sum(
             1 for r in [fundamental_report, technical_report, contrarian_report] if r
         )
-        if available_count == 0:
-            logger.error("[sell_council] All analysts failed for %s", ticker)
-            return None
-
         if available_count < 2:
-            logger.warning(
-                "[sell_council] Only %d analyst available for %s — defaulting to HOLD",
+            logger.error(
+                "[sell_council] Only %d valid analyst(s) available for %s — "
+                "aborting so the scheduler can retry",
                 available_count, ticker,
             )
-            return SellDecision(
-                ticker=ticker,
-                position_type=position_type,
-                action="HOLD",
-                sell_score=50.0,
-                thesis_status="INTACT",
-                health_score=None,
-                fundamental=None,
-                technical=None,
-                contrarian=None,
-                synthesis_report="Insufficient analyst availability — defaulting to HOLD.",
-                key_reasons=["Fewer than 2 analysts available; cannot make reliable sell determination."],
-                next_review_date=_add_days(self._default_review_days(position_type)),
-                trigger_type=trigger_type,
-            )
+            return None
 
         # Parse scores only for available analysts (None stays None — not 50)
         f_score = _parse_sell_score(fundamental_report, "FUNDAMENTAL SELL SCORE") if fundamental_report else None
@@ -529,6 +591,22 @@ class SellCouncil:
         )
         adjustments = self._build_adjustments_text(base_sell_score, rule_adjustments)
 
+        try:
+            sell_learning = build_sell_learning_context(self.journal)
+        except Exception as learning_e:
+            logger.warning(
+                "[sell_council] Sell-outcome learning unavailable for %s: %s",
+                ticker,
+                learning_e,
+            )
+            sell_learning = {
+                "status": "unavailable",
+                "ready": False,
+                "completed": 0,
+                "minimum_completed": Config.SELL_LEARNING_MIN_COMPLETED,
+                "context": "SELL-OUTCOME CALIBRATION: unavailable; do not adjust.",
+            }
+
         # CIO synthesis — pass empty string for unavailable reports
         synthesis_prompt = build_sell_synthesis_prompt(
             ticker=ticker,
@@ -538,16 +616,26 @@ class SellCouncil:
             technical_report=technical_report or "Analyst unavailable.",
             contrarian_report=contrarian_report or "Analyst unavailable.",
             sell_score_adjustments=adjustments,
+            sell_learning_context=str(sell_learning.get("context") or ""),
         )
 
         try:
             synthesis_raw = ChatGPTBackendClient(timeout=150).chat(synthesis_prompt)
         except Exception as synth_e:
             logger.error("[sell_council] CIO synthesis failed: %s", synth_e)
-            synthesis_raw = "Synthesis unavailable."
+            return None
 
         # Parse synthesis JSON
         synth_data = _parse_synthesis_json(synthesis_raw)
+        payload_valid, payload_error = _validate_sell_synthesis_payload(synth_data)
+        if not payload_valid:
+            logger.error(
+                "[sell_council] CIO synthesis for %s is invalid (%s); aborting so "
+                "the scheduler can retry",
+                ticker,
+                payload_error,
+            )
+            return None
         rule_score, rule_total, forced_score = self._apply_rule_adjustments(
             base_sell_score,
             rule_adjustments,
@@ -582,22 +670,28 @@ class SellCouncil:
 
         # CIO model score is logged for audit only; the final score is the
         # deterministic base + code rules + bounded evidence-gated CIO adjustment.
-        model_sell_score = synth_data.get("sell_score")
+        model_sell_score = _as_float(synth_data.get("sell_score"))
         if model_sell_score is not None:
-            _deviation = abs(float(model_sell_score) - sell_score)
+            _deviation = abs(model_sell_score - sell_score)
             if _deviation > 15:
                 logger.warning(
                     "[sell_council] %s: CIO sell_score deviation %.1f pts "
                     "(model=%.1f, final=%.1f) — using audited final score",
-                    ticker, _deviation, float(model_sell_score), sell_score,
+                    ticker, _deviation, model_sell_score, sell_score,
                 )
         cio_action = _normalize_action(synth_data.get("action", "HOLD"))
-        thesis_status = synth_data.get("thesis_status", "INTACT").upper()
-        health_score = synth_data.get("health_score")
-        next_review_days = int(synth_data.get("next_review_days", self._default_review_days(position_type)))
+        thesis_status = str(synth_data.get("thesis_status", "INTACT")).upper()
+        health_score = _as_float(synth_data.get("health_score"))
+        next_review_days = int(
+            _as_float(
+                synth_data.get("next_review_days"),
+                float(self._default_review_days(position_type)),
+            )
+        )
         trim_pct_raw = synth_data.get("trim_pct")
-        trim_pct = float(trim_pct_raw) / 100 if trim_pct_raw else None
-        confidence = int(synth_data.get("confidence", 5))
+        trim_pct_value = _as_float(trim_pct_raw)
+        trim_pct = trim_pct_value / 100 if trim_pct_value else None
+        confidence = int(_as_float(synth_data.get("confidence"), 5.0))
 
         score_action = self._action_from_score(sell_score, position_type)
         action = self._reconcile_cio_action(cio_action, score_action)
@@ -635,6 +729,12 @@ class SellCouncil:
             "cio_requested_action": cio_action,
             "score_mapped_action": score_action,
             "final_action": action,
+            "sell_learning": {
+                "status": sell_learning.get("status"),
+                "ready": bool(sell_learning.get("ready")),
+                "completed": int(sell_learning.get("completed") or 0),
+                "minimum_completed": int(sell_learning.get("minimum_completed") or 0),
+            },
         }
 
         # Compute next review date
@@ -855,11 +955,18 @@ class SellCouncil:
             })
 
         combined_reports = "\n\n".join(r for r in analyst_reports if r)
-        if self._analyst_reports_show_triggered_invalidation(combined_reports):
+        trigger_norm = str(trigger_type or "").lower().strip()
+        machine_break = trigger_norm == "thesis_break"
+        analyst_break = self._analyst_reports_show_triggered_invalidation(combined_reports)
+        if machine_break or analyst_break:
             adjustments.append({
                 "name": "invalidation_condition_triggered",
                 "value": Config.SELL_SCORE_THESIS_TRIGGERED_BONUS,
-                "reason": "At least one analyst marked an invalidation condition as TRIGGERED.",
+                "reason": (
+                    "A machine-checked invalidation condition triggered."
+                    if machine_break
+                    else "At least one analyst classified the thesis as DAMAGED or BROKEN."
+                ),
             })
 
         return adjustments
@@ -867,11 +974,7 @@ class SellCouncil:
     def _analyst_reports_show_triggered_invalidation(self, combined_reports: str) -> bool:
         if not combined_reports:
             return False
-        patterns = [
-            r"\bTRIGGERED\b\s*(?:-|—|:)",
-            r"[:\-—]\s*\bTRIGGERED\b",
-            r"\bTHESIS STATUS:\s*(?:DAMAGED|BROKEN)\b",
-        ]
+        patterns = [r"\bTHESIS STATUS:\s*(?:DAMAGED|BROKEN)\b"]
         return any(re.search(pattern, combined_reports, re.IGNORECASE) for pattern in patterns)
 
     def _apply_rule_adjustments(

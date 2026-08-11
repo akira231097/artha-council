@@ -60,7 +60,6 @@ class Config:
     # is rejected with invalid_value. Fallback is gpt-5.6-terra (verified live;
     # gpt-5.6-luna 404s on this backend).
     # xhigh is the default hard-problems setting; deployments can override it.
-    # sweet spot; max burned ~1.8x reasoning tokens per call for marginal gain.
     GPT_MODEL: str = os.getenv("ARTHA_GPT_MODEL", "gpt-5.6-sol")
     GPT_FALLBACK_MODEL: str = os.getenv("ARTHA_GPT_FALLBACK_MODEL", "gpt-5.6-terra")
     GPT_REASONING_EFFORT: str = os.getenv("ARTHA_GPT_REASONING_EFFORT", "xhigh")
@@ -152,8 +151,19 @@ class Config:
     YFINANCE_BATCH_SIZE: int = int(os.getenv("ARTHA_YFINANCE_BATCH_SIZE", "100"))
     YFINANCE_DOWNLOAD_TIMEOUT_SECONDS: int = int(os.getenv("ARTHA_YFINANCE_DOWNLOAD_TIMEOUT_SECONDS", "20"))
     YFINANCE_RANK_TOTAL_TIMEOUT_SECONDS: int = int(
-        os.getenv("ARTHA_YFINANCE_RANK_TOTAL_TIMEOUT_SECONDS", "120")
+        os.getenv("ARTHA_YFINANCE_RANK_TOTAL_TIMEOUT_SECONDS", "420")
     )
+    RANK_MIN_HISTORY_COVERAGE_PCT: float = _env_float(
+        "ARTHA_RANK_MIN_HISTORY_COVERAGE_PCT", 0.90
+    )
+    RANK_COVERAGE_AUDIT_ENABLED: bool = os.getenv(
+        "ARTHA_RANK_COVERAGE_AUDIT_ENABLED",
+        "true",
+    ).lower() in ("1", "true", "yes")
+    SCAN_REQUIRE_MIN_RANK_COVERAGE: bool = os.getenv(
+        "ARTHA_SCAN_REQUIRE_MIN_RANK_COVERAGE",
+        "true",
+    ).lower() in ("1", "true", "yes")
     YFINANCE_THREADS: bool = os.getenv(
         "ARTHA_YFINANCE_THREADS",
         "false",
@@ -662,6 +672,10 @@ class Config:
     AFTERNOON_SCAN_MINUTE_CT: int = int(os.getenv("ARTHA_AFTERNOON_SCAN_MINUTE_CT", "15"))
     AFTERNOON_SCAN_CATCHUP_MINUTES: int = int(os.getenv("ARTHA_AFTERNOON_SCAN_CATCHUP_MINUTES", "30"))
     AFTERNOON_SCAN_MAX_CANDIDATES: int = int(os.getenv("ARTHA_AFTERNOON_SCAN_MAX_CANDIDATES", "3"))
+    ALPHA_SHADOW_SIGNALS_ENABLED: bool = os.getenv(
+        "ARTHA_ALPHA_SHADOW_SIGNALS_ENABLED",
+        "true",
+    ).lower() in ("1", "true", "yes")
     # Regex-scraped limit prices must land within this fraction of the live
     # quote or the idea is rejected to an entry watch instead of an order.
     SCAN_LIMIT_PRICE_MAX_DEVIATION_PCT: float = _env_float(
@@ -915,6 +929,9 @@ class Config:
     # Post-sell shadow tracking
     SELL_SHADOW_TRACKING_DAYS: list = [5, 20, 60]   # Track price at these intervals
     SELL_SHADOW_TRACKING_WINDOW: int = 60            # Stop tracking after 60 days
+    SELL_LEARNING_MIN_COMPLETED: int = _env_int(
+        "ARTHA_SELL_LEARNING_MIN_COMPLETED", 20
+    )  # Mature 60-day outcomes required before Council sees sell calibration
 
     @classmethod
     def validate(cls) -> list[str]:

@@ -623,7 +623,8 @@ schema. Automation executes from this block, not from your prose:
     {{"metric": "<price|pnl_pct|days_held|trading_days_held>",
       "op": "<lt|lte|gt|gte|eq>",
       "value": <number>,
-      "description": "<plain-english condition>"}}
+      "description": "<plain-english condition>",
+      "effect": "<invalidate|review>"}}
   ],
   "half_size": <true|false>
 }}
@@ -639,7 +640,11 @@ Decision block rules:
 3. target_price: ATR/structure-derived (e.g. measured move or prior high plus
    ATR extension), not a fixed +15%.
 4. invalidation_conditions: measurable, machine-checkable conditions — every
-   entry needs at least one price-based and one time-based condition. Only the
+   entry needs at least one price-based invalidation and one time-based review.
+   Set effect="invalidate" for a fact that breaks the thesis. Set
+   effect="review" for a checkpoint that requires fresh Council analysis but
+   is NOT itself evidence that the thesis failed. Time conditions MUST use
+   effect="review"; price/P&L conditions normally use effect="invalidate". Only the
    listed metrics are machine-checked: price (last trade price in dollars),
    pnl_pct (unrealized P&L in PERCENT, e.g. -15 for -15%), days_held
    (calendar days), trading_days_held. Put the thesis rationale in

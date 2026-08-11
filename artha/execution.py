@@ -17,6 +17,8 @@ from uuid import uuid4
 from .config import Config
 from .journal import DecisionJournal
 from .portfolio import Portfolio
+from .portfolio_risk import evaluate_projected_sector_limit
+from .portfolio_state import PortfolioStateEngine
 from .scheduler import MarketHours
 from .stand_down import buying_paused, maybe_pause_buying_for_limit
 from .telegram import TelegramSender
@@ -1032,6 +1034,36 @@ class RobinhoodExecutionGuardrails:
             checks["decision_evidence"] = decision
             if not decision.get("allowed"):
                 reasons.append(str(decision.get("reason") or "Buy order lacks a valid council decision trail."))
+            else:
+                sector = str(
+                    decision.get("sector")
+                    or (intent.evidence or {}).get("sector")
+                    or ""
+                ).strip()
+                if sector:
+                    intent.evidence = {**(intent.evidence or {}), "sector": sector}
+                portfolio_state = (
+                    market_data.get("portfolio_state")
+                    if isinstance(market_data.get("portfolio_state"), dict)
+                    else PortfolioStateEngine().compute_state()
+                )
+                sector_gate = evaluate_projected_sector_limit(
+                    ticker=intent.ticker,
+                    sector=sector,
+                    portfolio_state=portfolio_state,
+                    proposed_notional=float(notional or 0.0),
+                    max_sector_pct=float(Config.MAX_SECTOR_PCT),
+                )
+                checks["sector_concentration"] = sector_gate
+                if intent.dry_run and not sector and not sector_gate.get("passed"):
+                    checks["sector_concentration"] = {
+                        **sector_gate,
+                        "status": "WARN",
+                        "preview_only": True,
+                        "enforcement": "Required again and fail-closed before any live placement.",
+                    }
+                elif not sector_gate.get("passed"):
+                    reasons.extend(str(reason) for reason in sector_gate.get("reasons") or [])
 
         if intent.side == "sell":
             active = journal.get_active_thesis_for_ticker(intent.ticker)
@@ -1083,6 +1115,10 @@ class RobinhoodExecutionGuardrails:
         final_verdict = str(feature.get("final_verdict") or "").upper().strip()
         evidence_count = int(feature.get("evidence_count") or 0)
         dossier_path = str(feature.get("dossier_path") or "")
+        feature_context = {
+            "sector": str(feature.get("sector") or "").strip(),
+            "industry": str(feature.get("industry") or "").strip(),
+        }
         if not intent.decision_dossier_path and dossier_path:
             intent.decision_dossier_path = dossier_path
 
@@ -1093,6 +1129,7 @@ class RobinhoodExecutionGuardrails:
                 "final_verdict": final_verdict,
                 "evidence_count": evidence_count,
                 "dossier_path": dossier_path,
+                **feature_context,
             }
         if final_verdict in BUY_ACTIONS:
             return {
@@ -1101,6 +1138,7 @@ class RobinhoodExecutionGuardrails:
                 "final_verdict": final_verdict,
                 "evidence_count": evidence_count,
                 "dossier_path": dossier_path,
+                **feature_context,
             }
 
         watch = journal.get_active_defer_watch_for_ticker(intent.ticker)
@@ -1123,6 +1161,7 @@ class RobinhoodExecutionGuardrails:
                 "watch_id": watch.get("watch_id"),
                 "zone_low": zone_low,
                 "zone_high": zone_high,
+                **feature_context,
             }
 
         return {
@@ -1131,6 +1170,7 @@ class RobinhoodExecutionGuardrails:
             "final_verdict": final_verdict,
             "evidence_count": evidence_count,
             "dossier_path": dossier_path,
+            **feature_context,
         }
 
 
