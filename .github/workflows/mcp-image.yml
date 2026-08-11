@@ -63,8 +63,8 @@ jobs:
         run: |
           image="ghcr.io/akira231097/artha-council-mcp:${GITHUB_SHA}"
           version="$(python -c 'from artha import __version__; print(__version__)')"
-          test "$(docker inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "${image}")" = "${GITHUB_SHA}"
-          test "$(docker inspect --format '{{ index .Config.Labels \"org.opencontainers.image.version\" }}' "${image}")" = "${version}"
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${image}")" = "${GITHUB_SHA}"
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "${image}")" = "${version}"
           docker run --rm \
             --env ARTHA_MCP_ACCESS_MODE=read_only \
             --env ARTHA_MCP_OPERATIONS_ENABLED=false \
