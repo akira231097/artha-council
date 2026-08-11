@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -271,6 +273,7 @@ class TestAlphaPipelineHardening(unittest.TestCase):
 
         self.assertEqual(result, [])
         self.assertFalse(fallback.called)
+        self.assertIn("Ranking covered 1/2 stocks", funnel.last_block_reason)
 
     def test_scanner_does_not_use_legacy_tickers_when_strict_funnel_is_empty(self):
         from artha.config import Config
@@ -331,6 +334,100 @@ class TestAlphaPipelineHardening(unittest.TestCase):
         self.assertFalse(new["passed"])
         self.assertFalse(new["is_add"])
         self.assertAlmostEqual(add["projected_sector_pct"], 0.31)
+
+    def test_broker_router_preserves_sector_blocked_and_unclassified_names_for_research(self):
+        from artha.broker_router import LANE_EXECUTION_READY, LANE_RESEARCH_WATCH, route_scan_candidates
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_path / "router-sector.db")
+        candidates = [
+            {
+                "symbol": "BANK",
+                "sector": "Financial",
+                "price": 100,
+                "avg_volume": 500_000,
+                "funnel_score": 90,
+            },
+            {
+                "symbol": "TECH",
+                "sector": "Technology",
+                "price": 100,
+                "avg_volume": 500_000,
+                "funnel_score": 80,
+            },
+            {
+                "symbol": "UNK",
+                "price": 100,
+                "avg_volume": 500_000,
+                "funnel_score": 70,
+            },
+        ]
+
+        def quote_provider(ticker):
+            return {"price": 100, "bid": 99.99, "ask": 100.01, "averageVolume": 500_000}
+
+        result = route_scan_candidates(
+            candidates,
+            session_id="router-sector",
+            journal=journal,
+            quote_provider=quote_provider,
+            market_open=True,
+            council_limit=3,
+            portfolio_state={
+                "total_value": 100,
+                "positions": [
+                    {"ticker": "USB", "sector": "Financials", "market_value": 29},
+                ],
+            },
+            minimum_viable_notional=10,
+        )
+
+        decisions = {row.ticker: row for row in result.decisions}
+        self.assertEqual(decisions["BANK"].lane, LANE_RESEARCH_WATCH)
+        self.assertEqual(
+            decisions["BANK"].reason_code,
+            "sector_headroom_below_realistic_buy_minimum",
+        )
+        self.assertEqual(decisions["BANK"].candidate["sector"], "Financial Services")
+        self.assertEqual(decisions["UNK"].lane, LANE_RESEARCH_WATCH)
+        self.assertEqual(decisions["UNK"].reason_code, "sector_classification_missing")
+        self.assertEqual(decisions["TECH"].lane, LANE_EXECUTION_READY)
+        self.assertEqual([row.ticker for row in result.selected_for_council], ["TECH"])
+
+    def test_broker_router_uses_staged_sector_profile_fallback(self):
+        from artha.broker_router import LANE_EXECUTION_READY, route_scan_candidates
+        from artha.journal import DecisionJournal
+
+        journal = DecisionJournal(db_path=self.tmp_path / "router-sector-fallback.db")
+        result = route_scan_candidates(
+            [
+                {
+                    "symbol": "NIQ",
+                    "sector": "unknown",
+                    "price": 16,
+                    "avg_volume": 2_000_000,
+                    "funnel_score": 80,
+                }
+            ],
+            session_id="router-sector-fallback",
+            journal=journal,
+            quote_provider=lambda ticker: {
+                "price": 16,
+                "bid": 15.99,
+                "ask": 16.01,
+                "averageVolume": 2_000_000,
+            },
+            sector_provider=lambda ticker: {"sector": "Industrials"},
+            market_open=True,
+            council_limit=1,
+            portfolio_state={"total_value": 100, "positions": []},
+            minimum_viable_notional=10,
+        )
+
+        decision = result.decisions[0]
+        self.assertEqual(decision.lane, LANE_EXECUTION_READY)
+        self.assertEqual(decision.candidate["sector"], "Industrials")
+        self.assertEqual(decision.evidence["sector_source"], "sector_provider")
 
     def test_live_execution_guardrail_blocks_exact_projected_sector_exposure(self):
         from artha.execution import OrderIntent, RobinhoodExecutionGuardrails
@@ -435,6 +532,141 @@ class TestAlphaPipelineHardening(unittest.TestCase):
         self.assertFalse(officer.called)
         self.assertIn("31.0%", result["message"])
 
+    def test_final_clearance_never_applies_buy_sector_gate_to_sell(self):
+        from artha.robinhood_bridge import run_final_clearance_for_action
+
+        action = {
+            "action_id": "ta-sector-sell",
+            "ticker": "USB",
+            "action_type": "auto_sell",
+            "side": "sell",
+            "payload_json": json.dumps(
+                {
+                    "intent": {
+                        "ticker": "USB",
+                        "side": "sell",
+                        "order_type": "market",
+                        "quantity": 0.5,
+                        "estimated_price": 80,
+                        "decision_dossier_path": "usb-sell.json",
+                        "evidence": {"sector": "Financial Services"},
+                    }
+                }
+            ),
+            "result_json": json.dumps(
+                {
+                    "review_response": {"data": {"symbol": "USB"}},
+                    "tradability_response": {"data": {"results": [{"symbol": "USB"}]}},
+                    "review_gate": {"passed": True, "status": "PASS", "reasons": []},
+                }
+            ),
+        }
+
+        class FakeJournal:
+            def __init__(self):
+                self.updates = []
+
+            def get_trade_action(self, action_id):
+                return dict(action)
+
+            def update_trade_action(self, action_id, fields):
+                self.updates.append(fields)
+
+        journal = FakeJournal()
+        clearance = {
+            "allow_place": True,
+            "status": "PASS",
+            "reason": "Sell review and final clearance are clean.",
+        }
+        with patch("artha.robinhood_bridge.PortfolioStateEngine.compute_state") as portfolio_state, patch(
+            "artha.execution_officer.robinhood_review_final_clearance",
+            return_value=clearance,
+        ) as officer:
+            result = run_final_clearance_for_action("ta-sector-sell", journal=journal)
+
+        self.assertTrue(result["allow_place"])
+        self.assertTrue(officer.called)
+        self.assertFalse(portfolio_state.called)
+        merged = journal.updates[-1]["result_json"]
+        self.assertEqual(merged["final_sector_concentration_gate"]["status"], "NOT_APPLICABLE")
+
+    def test_daily_warm_scan_keeps_event_loop_responsive(self):
+        from artha.scheduler import ArthaScheduler
+
+        scheduler = ArthaScheduler.__new__(ArthaScheduler)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_warm_scan():
+            started.set()
+            release.wait(timeout=1.0)
+
+        scheduler._run_daily_warm_scan_sync = blocking_warm_scan
+
+        async def scenario():
+            scheduler._council_scan_lock = asyncio.Lock()
+            safety_release = threading.Timer(1.0, release.set)
+            safety_release.start()
+            try:
+                task = asyncio.create_task(scheduler._run_daily_warm_scan())
+                await asyncio.sleep(0.03)
+                self.assertTrue(started.is_set())
+                self.assertFalse(task.done())
+                release.set()
+                await asyncio.wait_for(task, timeout=1.0)
+            finally:
+                release.set()
+                safety_release.cancel()
+
+        asyncio.run(scenario())
+
+    def test_tick_detaches_daily_warm_scan_from_monitor_cycle(self):
+        from artha.scheduler import ArthaScheduler
+
+        scheduler = ArthaScheduler.__new__(ArthaScheduler)
+        scheduler.market_hours = SimpleNamespace(is_market_open=lambda now: False)
+        for name in (
+            "_should_run_every_30min_market_task",
+            "_should_run_weekly_scan",
+            "_should_run_buy_capacity_catchup",
+            "_should_run_daily_health",
+            "_should_run_nightly_review",
+            "_should_run_broker_reconciliation_check",
+            "_should_run_pending_exit_watchdog",
+            "_should_run_sentinel_held",
+            "_should_run_periodic_review_check",
+            "_should_run_afternoon_scan",
+        ):
+            setattr(scheduler, name, lambda now: False)
+        scheduler._should_run_daily_warm_scan = lambda now: True
+        captured = []
+
+        def capture(name, coro):
+            captured.append(name)
+            coro.close()
+
+        scheduler._spawn_background_task = capture
+        asyncio.run(scheduler._tick())
+
+        self.assertEqual(captured, ["daily_warm_scan"])
+
+    def test_buy_discovery_block_alert_is_immediate_and_explicit(self):
+        from artha.scheduler import ArthaScheduler
+
+        messages = []
+        scheduler = ArthaScheduler.__new__(ArthaScheduler)
+        scheduler.telegram = SimpleNamespace(
+            enabled=True,
+            send_health_check=lambda message: messages.append(message) or True,
+        )
+
+        sent = scheduler._send_buy_discovery_blocked("Ranking coverage proof is missing.")
+
+        self.assertTrue(sent)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("BUY DISCOVERY BLOCKED", messages[0])
+        self.assertIn("sell protection continue normally", messages[0])
+
     def test_scan_signal_metadata_cannot_be_downgraded_by_mini_run(self):
         import artha.rank_candidates as rank
 
@@ -496,6 +728,30 @@ class TestAlphaPipelineHardening(unittest.TestCase):
             latest = rank.load_latest_rank_coverage_summary(max_age_hours=1)
         self.assertEqual(latest["universe_size"], 2)
         self.assertEqual(latest["history_count"], 1)
+
+    def test_supervisor_marks_missing_strict_rank_audit_as_failure(self):
+        import artha.supervisor as supervisor
+        from artha.config import Config
+
+        with patch.object(supervisor, "RANK_COVERAGE_DIR", self.tmp_path), patch.object(
+            Config, "SCAN_REQUIRE_MIN_RANK_COVERAGE", True
+        ):
+            result = supervisor._check_rank_coverage()
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("No immutable ranking-coverage audit", result["message"])
+
+    def test_supervisor_rejects_disabled_audit_under_strict_coverage(self):
+        import artha.supervisor as supervisor
+        from artha.config import Config
+
+        with patch.object(Config, "SCAN_REQUIRE_MIN_RANK_COVERAGE", True), patch.object(
+            Config, "RANK_COVERAGE_AUDIT_ENABLED", False
+        ):
+            result = supervisor._check_rank_coverage()
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("coverage audit is disabled", result["message"])
 
 
 if __name__ == "__main__":

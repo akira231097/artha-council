@@ -1567,6 +1567,15 @@ def _projected_sector_gate_for_action(
     """Repeat exact post-order sector exposure using current portfolio state."""
     try:
         resolved_intent = intent or _order_intent_for_action(row)
+        side = str(getattr(resolved_intent, "side", "") or "").lower().strip()
+        if side != "buy":
+            return {
+                "passed": True,
+                "status": "NOT_APPLICABLE",
+                "side": side or "unknown",
+                "reasons": [],
+                "reason": "Projected sector concentration applies only to buy orders.",
+            }
         notional = _resolved_notional_for_intent(resolved_intent)
         evidence = (
             resolved_intent.evidence

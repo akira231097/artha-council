@@ -3134,6 +3134,21 @@ class ArthaScheduler:
             logger.error("[scan] Failed to send scheduled scan candidate update to Telegram")
         return ok
 
+    def _send_buy_discovery_blocked(self, reason: str) -> bool:
+        """Immediately distinguish a data-pipeline block from a no-opportunity day."""
+        reason = str(reason or "").strip()
+        if not reason or not self.telegram.enabled:
+            return False
+        message = (
+            "ARTHA BUY DISCOVERY BLOCKED\n"
+            "---------------------------\n"
+            f"{reason}\n"
+            "No buy-side Council or auto-buy action will use this incomplete scan. "
+            "Portfolio monitoring and sell protection continue normally."
+        )
+        logger.error("[scan] %s", message.replace("\n", " | "))
+        return bool(self.telegram.send_health_check(message))
+
     def _send_scan_router_update(self, router_result: Any) -> bool:
         """Tell Telegram how the broker/data router split the funnel slate."""
         if not self.telegram.enabled or not router_result:
@@ -4086,11 +4101,25 @@ class ArthaScheduler:
                         regime_packet=regime_packet,
                         max_candidates=scan_candidate_pool,
                     )
+                    if not stock_candidates:
+                        self._send_buy_discovery_blocked(
+                            str(getattr(self.scanner, "last_funnel_block_reason", "") or "")
+                        )
                 logger.info(f"[scan] Funnel returned {len(stock_candidates)} dynamic candidates")
             except Exception as funnel_e:
-                logger.warning(f"[scan] Funnel failed, falling back to legacy scan: {funnel_e}")
-                scan = self.scanner.scan(max_stock_candidates=Config.SCAN_FALLBACK_MAX, max_crypto_candidates=0)
-                stock_candidates = scan.get("stock_candidates", [])
+                if Config.SCAN_REQUIRE_MIN_RANK_COVERAGE:
+                    logger.exception("[scan] Funnel failed under strict coverage; buy discovery remains closed")
+                    stock_candidates = []
+                    self._send_buy_discovery_blocked(
+                        f"Promotion funnel failed with {type(funnel_e).__name__}; strict buy discovery stayed closed."
+                    )
+                else:
+                    logger.warning(f"[scan] Funnel failed, falling back to legacy scan: {funnel_e}")
+                    scan = self.scanner.scan(
+                        max_stock_candidates=Config.SCAN_FALLBACK_MAX,
+                        max_crypto_candidates=0,
+                    )
+                    stock_candidates = scan.get("stock_candidates", [])
             self._send_scan_candidate_update(len(stock_candidates))
 
             reports: list[str] = []
@@ -4116,6 +4145,9 @@ class ArthaScheduler:
                         market_open=self.market_hours.is_market_open(_utcnow()),
                         council_limit=Config.SCAN_COUNCIL_MAX,
                         persist=True,
+                        portfolio_state=portfolio_state,
+                        minimum_viable_notional=Config.SCAN_MIN_DEPLOYABLE_FOR_BUY_COUNCIL,
+                        sector_provider=self.collector.fmp.company_profile,
                     )
                     self._send_scan_router_update(router_result)
                     if Config.OPPORTUNITY_SCOUT_ENABLED:
@@ -5099,6 +5131,11 @@ class ArthaScheduler:
         return True
 
     async def _run_daily_warm_scan(self) -> None:
+        """Run the synchronous warm scan without blocking monitor ticks."""
+        async with self._council_scan_lock:
+            await self._run_in_daemon_thread("daily_warm_scan", self._run_daily_warm_scan_sync)
+
+    def _run_daily_warm_scan_sync(self) -> None:
         """Daily warm cache: run funnel stages 1-3 without full council analysis.
 
         Runs every trading day before the full council scan.
@@ -5529,7 +5566,7 @@ class ArthaScheduler:
             tasks.append(self._safe_task("periodic_review", self._run_periodic_review_check()))
         # Daily warm cache: pre-warm funnel + track momentum before the full council scan.
         if self._should_run_daily_warm_scan(now_utc):
-            tasks.append(self._safe_task("daily_warm_scan", self._run_daily_warm_scan()))
+            self._spawn_background_task("daily_warm_scan", self._run_daily_warm_scan())
         # Wave 2: 14:15 CT movers-only opportunity pass (RISK_ON + deployable gated).
         if self._should_run_afternoon_scan(now_utc):
             self._spawn_background_task("afternoon_scan", self._run_afternoon_opportunity_pass())

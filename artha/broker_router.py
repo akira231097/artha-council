@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from .config import Config
 from .liquidity import resolve_average_volume
+from .portfolio_risk import evaluate_projected_sector_limit, normalize_sector
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,19 @@ def _quote_bid_ask(candidate: dict[str, Any], quote: dict[str, Any] | None) -> t
     return bid, ask
 
 
+def _candidate_sector(candidate: dict[str, Any], quote: dict[str, Any] | None) -> str:
+    """Resolve a canonical sector from the enriched candidate or quote fallback."""
+    quote = quote if isinstance(quote, dict) else {}
+    profile = candidate.get("profile") if isinstance(candidate.get("profile"), dict) else {}
+    yf_quote = candidate.get("yf_quote") if isinstance(candidate.get("yf_quote"), dict) else {}
+    candidate_quote = candidate.get("quote") if isinstance(candidate.get("quote"), dict) else {}
+    for payload in (candidate, profile, yf_quote, candidate_quote, quote):
+        sector = normalize_sector(payload.get("sector"))
+        if sector:
+            return sector
+    return ""
+
+
 @dataclass
 class BrokerRouteDecision:
     candidate: dict[str, Any]
@@ -178,6 +192,9 @@ class BrokerAwareCandidateRouter:
         now: datetime | None = None,
         market_open: bool = True,
         max_quote_checks: int | None = None,
+        portfolio_state: dict[str, Any] | None = None,
+        minimum_viable_notional: float | None = None,
+        sector_provider: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> None:
         self.journal = journal
         self.active_watches = active_watches or {}
@@ -185,7 +202,18 @@ class BrokerAwareCandidateRouter:
         self.now = (now or _utcnow()).astimezone(timezone.utc)
         self.market_open = bool(market_open)
         self.max_quote_checks = max(0, int(max_quote_checks if max_quote_checks is not None else Config.SCAN_BROKER_ROUTER_MAX_QUOTE_CHECKS))
+        self.portfolio_state = portfolio_state if isinstance(portfolio_state, dict) else None
+        self.sector_provider = sector_provider
+        self.minimum_viable_notional = max(
+            0.0,
+            float(
+                minimum_viable_notional
+                if minimum_viable_notional is not None
+                else Config.SCAN_MIN_DEPLOYABLE_FOR_BUY_COUNCIL
+            ),
+        )
         self._quote_checks = 0
+        self._sector_checks = 0
 
     def route(
         self,
@@ -278,6 +306,46 @@ class BrokerAwareCandidateRouter:
                         f"{source_drift:.2%}; route to research/watch until price data is reconciled."
                     ),
                     route_score - 8,
+                    funnel_score,
+                    evidence,
+                    price=candidate_price,
+                    live_price=live_price,
+                    quote_source=quote_source,
+                )
+
+        if self.portfolio_state is not None:
+            sector, sector_source = self._resolve_sector(ticker, candidate, quote)
+            evidence["sector"] = sector
+            evidence["sector_source"] = sector_source
+            if not sector:
+                return self._research_watch(
+                    candidate, ticker, rank, "sector_classification_missing",
+                    "Sector classification is missing, so projected concentration cannot be proven before Council.",
+                    route_score - 8,
+                    funnel_score,
+                    evidence,
+                    price=candidate_price,
+                    live_price=live_price,
+                    quote_source=quote_source,
+                )
+            candidate = {**candidate, "sector": sector}
+            sector_gate = evaluate_projected_sector_limit(
+                ticker=ticker,
+                sector=sector,
+                portfolio_state=self.portfolio_state,
+                proposed_notional=self.minimum_viable_notional,
+                max_sector_pct=float(Config.MAX_SECTOR_PCT),
+            )
+            evidence["projected_sector_gate"] = sector_gate
+            if not sector_gate.get("passed"):
+                return self._research_watch(
+                    candidate, ticker, rank, "sector_headroom_below_realistic_buy_minimum",
+                    (
+                        f"Only ${float(sector_gate.get('headroom_dollars') or 0.0):.2f} of {sector} "
+                        f"sector room remains, below the ${self.minimum_viable_notional:.2f} realistic "
+                        "buy minimum; preserve the idea in research/watch."
+                    ),
+                    route_score - 12,
                     funnel_score,
                     evidence,
                     price=candidate_price,
@@ -440,6 +508,26 @@ class BrokerAwareCandidateRouter:
             liquidity_source=str(liquidity.get("source") or ""),
             quote_source=quote_source,
         )
+
+    def _resolve_sector(
+        self,
+        ticker: str,
+        candidate: dict[str, Any],
+        quote: dict[str, Any] | None,
+    ) -> tuple[str, str]:
+        sector = _candidate_sector(candidate, quote)
+        if sector:
+            return sector, "candidate_or_quote"
+        if self.sector_provider is None or self._sector_checks >= self.max_quote_checks:
+            return "", "missing"
+        self._sector_checks += 1
+        try:
+            profile = self.sector_provider(ticker)
+            sector = normalize_sector(profile.get("sector")) if isinstance(profile, dict) else ""
+            return (sector, "sector_provider") if sector else ("", "sector_provider_missing")
+        except Exception as exc:
+            logger.warning("[broker_router] sector provider failed for %s: %s", ticker, exc)
+            return "", "sector_provider_failed"
 
     def _fetch_quote(self, ticker: str) -> dict[str, Any] | None:
         if self.quote_provider is None or self._quote_checks >= self.max_quote_checks:
@@ -647,6 +735,9 @@ def route_scan_candidates(
     council_limit: int | None = None,
     persist: bool = True,
     fill_research_slots: bool | None = None,
+    portfolio_state: dict[str, Any] | None = None,
+    minimum_viable_notional: float | None = None,
+    sector_provider: Callable[[str], dict[str, Any] | None] | None = None,
 ) -> BrokerRouterResult:
     """Convenience wrapper for scheduled scans and CLI previews."""
     router = BrokerAwareCandidateRouter(
@@ -655,6 +746,9 @@ def route_scan_candidates(
         quote_provider=quote_provider,
         market_open=market_open,
         now=now,
+        portfolio_state=portfolio_state,
+        minimum_viable_notional=minimum_viable_notional,
+        sector_provider=sector_provider,
     )
     return router.route(
         candidates,

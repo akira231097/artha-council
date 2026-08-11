@@ -222,6 +222,13 @@ def _check_latest_decision_artifacts(journal: DecisionJournal) -> dict[str, Any]
 
 def _check_rank_coverage() -> dict[str, Any]:
     """Verify that a recent full-universe rank run examined enough symbols."""
+    strict = bool(getattr(Config, "SCAN_REQUIRE_MIN_RANK_COVERAGE", True))
+    if strict and not bool(getattr(Config, "RANK_COVERAGE_AUDIT_ENABLED", True)):
+        return {
+            "name": "rank_coverage",
+            "status": "FAIL",
+            "message": "Strict rank coverage is enabled, but its immutable coverage audit is disabled.",
+        }
     paths = sorted(RANK_COVERAGE_DIR.glob("*/*.json"), reverse=True)[:100]
     candidates: list[tuple[datetime, int, Path, dict[str, Any]]] = []
     for path in paths:
@@ -239,7 +246,7 @@ def _check_rank_coverage() -> dict[str, Any]:
     if not candidates:
         return {
             "name": "rank_coverage",
-            "status": "WARN",
+            "status": "FAIL" if strict else "WARN",
             "message": "No immutable ranking-coverage audit exists yet.",
         }
 
@@ -257,7 +264,7 @@ def _check_rank_coverage() -> dict[str, Any]:
     coverage = float(summary.get("history_coverage_pct") or 0.0)
     minimum = float(getattr(Config, "RANK_MIN_HISTORY_COVERAGE_PCT", 0.90) or 0.90)
     age_hours = max(0.0, (now - generated).total_seconds() / 3600.0)
-    status = "PASS" if coverage >= minimum and age_hours <= max_age_hours else "WARN"
+    status = "PASS" if coverage >= minimum and age_hours <= max_age_hours else ("FAIL" if strict else "WARN")
     return {
         "name": "rank_coverage",
         "status": status,

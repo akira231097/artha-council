@@ -682,6 +682,7 @@ class MarketScanner:
     def __init__(self):
         self.collector = DataCollector()
         self._funnel = None  # Lazy-initialized to avoid slow imports at startup
+        self.last_funnel_block_reason = ""
 
     def _get_funnel(self):
         """Lazy-initialize PromotionFunnel to avoid import overhead."""
@@ -711,6 +712,7 @@ class MarketScanner:
             List of enriched candidate dicts for council analysis.
         """
         funnel = self._get_funnel()
+        self.last_funnel_block_reason = ""
         strict_coverage = bool(getattr(Config, "SCAN_REQUIRE_MIN_RANK_COVERAGE", True))
         if funnel is None:
             logger.warning("[scanner] Funnel unavailable")
@@ -721,6 +723,7 @@ class MarketScanner:
             max_council_candidates=max_candidates,
             fallback_on_failure=not strict_coverage,
         )
+        self.last_funnel_block_reason = str(getattr(funnel, "last_block_reason", "") or "")
 
         if not candidates:
             if strict_coverage:
