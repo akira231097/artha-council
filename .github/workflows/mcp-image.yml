@@ -48,7 +48,14 @@ jobs:
           artha-mcp --check
           python -m unittest discover -s tests -t . -v
 
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
       - name: Build MCP image
+        if: github.event_name != 'push' || github.ref_type != 'tag'
         run: |
           version="$(python -c 'from artha import __version__; print(__version__)')"
           docker build \
@@ -58,6 +65,10 @@ jobs:
             --build-arg "ARTHA_BUILD_VERSION=${version}" \
             --tag "ghcr.io/akira231097/artha-council-mcp:${GITHUB_SHA}" \
             .
+
+      - name: Load the tested commit image for release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        run: docker pull "ghcr.io/akira231097/artha-council-mcp:${GITHUB_SHA}"
 
       - name: Verify image provenance and startup
         run: |
@@ -92,17 +103,10 @@ jobs:
           assert image.endswith(f":{tag}"), (image, tag)
           PY
 
-      - name: Log in to GHCR
-        if: github.event_name == 'push'
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
-
-      - name: Publish immutable and channel tags
+      - name: Publish release and rolling tags
         if: github.event_name == 'push'
         run: |
           image="ghcr.io/akira231097/artha-council-mcp"
-          docker push "${image}:${GITHUB_SHA}"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
             docker tag "${image}:${GITHUB_SHA}" "${image}:${version}"
@@ -110,6 +114,7 @@ jobs:
             docker push "${image}:${version}"
             docker push "${image}:latest"
           else
+            docker push "${image}:${GITHUB_SHA}"
             docker tag "${image}:${GITHUB_SHA}" "${image}:main"
             docker push "${image}:main"
           fi
