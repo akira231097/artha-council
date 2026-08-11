@@ -1684,7 +1684,12 @@ class TestShadowRulesAndSupervisor(unittest.TestCase):
                 return [{"volume": 37_000_000} for _ in range(45)]
 
             def company_profile(self, symbol):
-                return {"isEtf": False, "isFund": False}
+                return {
+                    "isEtf": False,
+                    "isFund": False,
+                    "isActivelyTrading": True,
+                    "exchangeShortName": "NASDAQ",
+                }
 
             def stock_news(self, symbol, limit=3):
                 return [
@@ -1754,6 +1759,15 @@ class TestShadowRulesAndSupervisor(unittest.TestCase):
                     "price": 2.46,
                     "changePercentage": 26.8,
                     "marketCap": 1_500_000_000,
+                }
+
+            def company_profile(self, symbol):
+                return {
+                    "symbol": symbol,
+                    "isEtf": False,
+                    "isFund": False,
+                    "isActivelyTrading": True,
+                    "exchangeShortName": "NYSE",
                 }
 
         class FakeCursor:

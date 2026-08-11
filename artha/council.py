@@ -1006,6 +1006,46 @@ def _parse_synthesis(synthesis: str) -> dict:
 # v2: Hard Risk Gate
 # ---------------------------------------------------------------------------
 
+def load_verified_sentinel_risk_alerts(
+    ticker: str,
+    *,
+    prebrief: Any | None = None,
+    lookback_hours: float | None = None,
+) -> list[dict[str, Any]]:
+    """Load only second-stage, thesis-verified negative Sentinel events."""
+    if prebrief is None:
+        from .pre_brief import PreBrief
+
+        prebrief = PreBrief()
+    hours = (
+        Config.SENTINEL_VERIFIED_NEGATIVE_LOOKBACK_HOURS
+        if lookback_hours is None
+        else max(0.0, float(lookback_hours))
+    )
+    verified_events = prebrief.get_events(
+        ticker,
+        hours=hours,
+        source="sentinel_thesis_impact",
+        event_type="thesis_impact",
+        verified_negative=True,
+    )
+    return [
+        {
+            "ticker": str(ticker or "").upper(),
+            "severity": "CRITICAL",
+            "headline": str(
+                ((event.get("metadata") or {}).get("headline"))
+                or event.get("summary")
+                or "Verified negative thesis-impact event"
+            ),
+            "timestamp": event.get("timestamp"),
+            "source": event.get("source"),
+            "verified_negative": True,
+        }
+        for event in verified_events
+        if isinstance(event, dict)
+    ]
+
 def hard_risk_gate(
     ticker: str,
     stock_data: dict,
@@ -1033,7 +1073,11 @@ def hard_risk_gate(
                 continue
             alert_ticker = str(alert.get("ticker", "")).upper()
             severity = str(alert.get("severity", "")).upper()
-            if alert_ticker == ticker_upper and severity == "CRITICAL":
+            if (
+                alert_ticker == ticker_upper
+                and severity == "CRITICAL"
+                and alert.get("verified_negative") is True
+            ):
                 headline = str(alert.get("headline", alert.get("title", ""))[:100])
                 return False, f"SENTINEL BLOCK: CRITICAL alert — {headline}"
 
@@ -1591,6 +1635,26 @@ class ArthaCouncil:
         portfolio_context = self.portfolio_state.render_prompt_summary(portfolio_data)
         recent_decisions_context = self._render_recent_decisions_context(ticker, limit=5)
 
+        # Only a second-stage, thesis-verified negative Sentinel assessment may
+        # enter the hard risk gate automatically. Raw keyword severity is not
+        # enough: the fast feed also labels positive events such as earnings
+        # beats and upgrades as CRITICAL.
+        if sentinel_alerts is None:
+            sentinel_alerts = []
+            try:
+                sentinel_alerts = load_verified_sentinel_risk_alerts(ticker)
+            except Exception as sentinel_err:
+                logger.warning(
+                    "  [council] Verified Sentinel risk-context load failed for %s: %s",
+                    ticker,
+                    sentinel_err,
+                )
+        stock_data["sentinel_risk_context"] = {
+            "verified_negative_count": len(sentinel_alerts or []),
+            "lookback_hours": Config.SENTINEL_VERIFIED_NEGATIVE_LOOKBACK_HOURS,
+            "raw_keyword_alerts_used_as_hard_blocks": False,
+        }
+
         # --- Mechanical funnel signals (Wave 2): inject the scan_signals row so
         # analysts, buy scoring, and the CIO all see the same computed evidence.
         scan_signal_row: dict = {}
@@ -1716,11 +1780,22 @@ class ArthaCouncil:
         # --- Lessons from graded history (Wave 2): every analyst and the CIO
         # sees the digest of its own graded mistakes before opining again.
         lessons_digest = ""
+        learning_context: dict[str, Any] = {}
         try:
-            from .self_review import get_council_lessons
-            lessons_digest = get_council_lessons() or ""
+            from .self_review import build_council_learning_context
+
+            learning_context = build_council_learning_context()
+            lessons_digest = str(learning_context.get("digest") or "")
         except Exception as lessons_err:
             logger.warning("  [council] Council lessons digest failed (non-fatal): %s", lessons_err)
+            learning_context = {
+                "schema_version": 1,
+                "status": "unavailable",
+                "digest": "",
+                "error": f"{type(lessons_err).__name__}: {lessons_err}",
+                "policy": {"automatic_rule_changes": False},
+            }
+        stock_data["council_learning_context"] = learning_context
         if lessons_digest:
             context_header = (
                 f"{context_header}\n\n--- LESSONS FROM YOUR OWN GRADED HISTORY ---\n"

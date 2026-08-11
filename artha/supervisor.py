@@ -21,6 +21,7 @@ from .config import Config
 from .diagnostics import run_calibration_diagnosis
 from .execution import build_execution_readiness_report, normalize_robinhood_position_snapshot
 from .execution_learning import build_execution_learning_summary
+from .feedback_loop import build_feedback_loop_report
 from .fill_finalizer import (
     backfill_position_trade_episodes,
     reconcile_closed_position_control_state,
@@ -28,6 +29,7 @@ from .fill_finalizer import (
 from .journal import DecisionJournal
 from .paths import DATA_DIR
 from .portfolio import PORTFOLIO_FILE, Portfolio
+from .self_review import reconcile_lesson_routes
 from .shadow_rules import (
     backfill_trim_hold_shadows,
     backfill_shadow_rules_from_features,
@@ -1383,6 +1385,40 @@ def _check_execution_learning(
     }
 
 
+def _check_feedback_loop(journal: DecisionJournal) -> dict[str, Any]:
+    """Prove that each feedback producer has a guarded downstream consumer."""
+    report = build_feedback_loop_report(journal)
+    status = str(report.get("status") or "FAIL").upper()
+    if status == "FAIL":
+        message = "Feedback-loop integrity failed: " + "; ".join(
+            str(item) for item in (report.get("failures") or [])
+        )
+    elif status == "WARN":
+        message = "Feedback loops are connected with measurement gaps: " + "; ".join(
+            str(item) for item in (report.get("warnings") or [])
+        )
+    else:
+        buy = report.get("buy_outcome_feedback") or {}
+        sell = report.get("sell_outcome_feedback") or {}
+        sentinel = report.get("sentinel_feedback") or {}
+        shadow = report.get("shadow_feedback") or {}
+        provenance = report.get("decision_provenance") or {}
+        message = (
+            "Guarded feedback loops are connected: "
+            f"{buy.get('current_era_graded', 0)} current-era buy grades, "
+            f"{sell.get('completed', 0)}/{sell.get('minimum_completed', 0)} mature sell reviews, "
+            f"{shadow.get('completed', 0)} completed shadow evaluations, "
+            f"Sentinel escalation={'on' if sentinel.get('sell_council_escalation_enabled') else 'off'}, "
+            f"dossier provenance={provenance.get('status', 'unknown')}."
+        )
+    return {
+        "name": "feedback_loop",
+        "status": status,
+        "message": message,
+        "report": report,
+    }
+
+
 def _check_telegram(sender: TelegramSender) -> dict[str, Any]:
     if sender.enabled:
         return {"name": "telegram", "status": "PASS", "message": "Telegram is configured."}
@@ -1533,6 +1569,9 @@ def run_supervisor_check(
     operations.append(op)
     decision_backfilled = op.get("result") if op.get("status") == "PASS" else 0
 
+    op = _timed_operation("lesson_route_reconciliation", reconcile_lesson_routes)
+    operations.append(op)
+
     op = _timed_operation(
         "position_episode_backfill",
         lambda: backfill_position_trade_episodes(
@@ -1610,6 +1649,7 @@ def run_supervisor_check(
         _timed_check("broker_fill_accounting", lambda: _check_broker_fill_accounting(journal)),
         _timed_check("position_classification", lambda: _check_position_classification()),
         _timed_check("execution_learning", lambda: _check_execution_learning(journal)),
+        _timed_check("feedback_loop", lambda: _check_feedback_loop(journal)),
         _timed_check("broker_reconciliation", lambda: _check_broker_reconciliation_snapshot()),
         _timed_check("calibration_diagnosis", lambda: _check_calibration_and_diagnosis(journal)),
         _timed_check("shadow_rules", lambda: _check_shadow_rules(journal)),

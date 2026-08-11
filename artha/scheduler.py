@@ -210,6 +210,7 @@ class ArthaScheduler:
         # loop keeps servicing stop checks; the lock stops overlapping scans
         # (11:30 full scan vs 14:15 afternoon pass).
         self._council_scan_lock = asyncio.Lock()
+        self._sell_review_lock = asyncio.Lock()
         # Long scans are detached from the tick gather so run_forever keeps
         # ticking every 20s while a scan is in flight (strong refs held here).
         self._background_tasks: set[asyncio.Task] = set()
@@ -223,7 +224,15 @@ class ArthaScheduler:
         except Exception as e:
             logger.exception(f"Task {task_name} failed: {e}")
 
-    def _record_pre_brief_event(self, ticker: str, event_type: str, severity: str, summary: str, source: str) -> None:
+    def _record_pre_brief_event(
+        self,
+        ticker: str,
+        event_type: str,
+        severity: str,
+        summary: str,
+        source: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         try:
             from .pre_brief import PreBrief
             with self._shared_state_lock:
@@ -233,6 +242,7 @@ class ArthaScheduler:
                     severity=severity,
                     summary=summary[:200],
                     source=source,
+                    metadata=metadata,
                 )
         except Exception as pb_e:
             logger.debug("[pre_brief] Record failed for %s/%s: %s", ticker, event_type, pb_e)
@@ -3355,130 +3365,199 @@ class ArthaScheduler:
                 self._run_news_sentiment_review_check, portfolio
             )
 
-            if not quotes and not news_signals:
-                return
-
             price_signals = await asyncio.to_thread(
                 self.sell_engine.run_price_check_sell_tasks,
                 portfolio,
                 quotes,
             ) if quotes else []
-            signals = list(price_signals) + news_signals
-            if signals:
-                from .sell_council import SellCouncil
-
-                severity_rank = {"URGENT": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-                grouped: dict[str, list[Any]] = {}
-                for signal in signals:
-                    grouped.setdefault(str(signal.ticker or "").upper(), []).append(signal)
-                sell_council = SellCouncil(journal=self.sell_engine.journal)
-                for ticker, ticker_signals in grouped.items():
-                    ticker_signals.sort(key=lambda s: severity_rank.get(str(s.severity), 9))
-                    primary = ticker_signals[0]
-                    cooldown_hours = {
-                        "URGENT": 0.45,
-                        "HIGH": 4,
-                        "MEDIUM": 12,
-                        "LOW": 24,
-                    }.get(str(primary.severity or "").upper(), 12)
-                    alert = Alert(
-                        ticker=ticker,
-                        alert_type=f"sell_council_trigger_{primary.signal_type}",
-                        severity="CRITICAL" if primary.severity == "URGENT" else primary.severity,
-                        message=primary.message[:4000],
-                        metadata={
-                            "signal_id": primary.signal_id,
-                            "thesis_id": primary.thesis_id or "",
-                            "source": primary.source,
-                            "action_recommended": primary.action_recommended or "",
-                        },
-                    )
-                    fresh = self.monitor.alert_manager.claim_new_alerts([alert], within_hours=cooldown_hours)
-                    if not fresh:
-                        for signal in ticker_signals:
-                            self.sell_engine.aggregator.suppress(
-                                signal.signal_id,
-                                reason=f"Sell Council trigger cooldown active ({cooldown_hours}h)",
-                            )
-                        continue
-
-                    thesis = self.sell_engine.tracker.get(primary.thesis_id) if primary.thesis_id else None
-                    if not thesis:
-                        self.monitor.alert_manager.release_alerts([alert])
-                        logger.error("[sell_monitor] No thesis found for %s trigger; review not actioned", ticker)
-                        continue
-                    try:
-                        stock_data = await asyncio.to_thread(self.collector.collect_stock, ticker)
-                        quote_price = self._as_float((quotes.get(ticker) or {}).get("price"))
-                        if quote_price:
-                            quote = dict(stock_data.get("quote") or {})
-                            quote["price"] = quote_price
-                            stock_data["quote"] = quote
-                        stock_data["_sell_trigger"] = {
-                            "primary_type": primary.signal_type,
-                            "severity": primary.severity,
-                            "current_price": quote_price,
-                            "signals": [
-                                {
-                                    "signal_id": signal.signal_id,
-                                    "type": signal.signal_type,
-                                    "severity": signal.severity,
-                                    "recommended_action": signal.action_recommended,
-                                    "trim_pct": signal.trim_pct,
-                                    "completion_markers": list(signal.completion_markers or []),
-                                    "message": signal.message,
-                                }
-                                for signal in ticker_signals
-                            ],
-                        }
-                        macro_data = await asyncio.to_thread(self.collector.collect_macro)
-                        decision = await asyncio.to_thread(
-                            sell_council.run_sell_review,
-                            thesis,
-                            stock_data,
-                            macro_data,
-                            primary.signal_type,
-                            self._current_regime_state(),
-                        )
-                    except Exception as council_exc:
-                        decision = None
-                        logger.exception("[sell_monitor] Sell Council failed for %s: %s", ticker, council_exc)
-                    if not decision:
-                        self.monitor.alert_manager.release_alerts([alert])
-                        continue
-
-                    try:
-                        applied = self._apply_sell_council_decision(
-                            sell_council=sell_council,
-                            decision=decision,
-                            thesis=thesis,
-                            stock_data=stock_data,
-                            trigger_type=primary.signal_type,
-                            signal_id=primary.signal_id,
-                            completion_markers=sorted({
-                                marker
-                                for signal in ticker_signals
-                                for marker in (signal.completion_markers or [])
-                                if marker
-                            }),
-                            trigger_reason=" | ".join(s.message for s in ticker_signals)[:1600],
-                            fallback_trim_pct=primary.trim_pct,
-                        )
-                    except Exception as apply_exc:
-                        self.monitor.alert_manager.release_alerts([alert])
-                        logger.exception(
-                            "[sell_monitor] Failed to apply Sell Council decision for %s: %s",
-                            ticker,
-                            apply_exc,
-                        )
-                        continue
-                    if not applied["telegram_delivered"] and not applied["queued"]:
-                        self.monitor.alert_manager.release_alerts([alert])
-                        continue
-                    for signal in ticker_signals:
-                        self.sell_engine.aggregator.mark_actioned(signal.signal_id)
+            # Include durable signals created outside this 30-minute task, such
+            # as verified after-hours Sentinel events. Prefer the fresh in-memory
+            # object so one-shot completion markers are not lost on DB reload.
+            signal_by_id: dict[str, Any] = {}
+            for signal in [*price_signals, *news_signals, *self.sell_engine.aggregator.get_active()]:
+                signal_id = str(getattr(signal, "signal_id", "") or "")
+                if signal_id and signal_id not in signal_by_id:
+                    signal_by_id[signal_id] = signal
+            await self._run_sell_council_for_signals(
+                list(signal_by_id.values()),
+                quotes=quotes,
+                trigger_origin="market_price_check",
+            )
         except Exception as e:
             logger.error("[sell_engine_check] Failed: %s", e)
+
+    async def _run_sell_council_for_signals(
+        self,
+        signals: list[Any],
+        *,
+        quotes: dict[str, dict] | None = None,
+        trigger_origin: str = "sell_monitor",
+    ) -> dict[str, int]:
+        """Route durable sell signals through one serialized Sell Council path."""
+        if not signals:
+            return {"signals": 0, "tickers": 0, "reviewed": 0, "actioned": 0, "retried": 0}
+        lock = getattr(self, "_sell_review_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._sell_review_lock = lock
+        async with lock:
+            return await self._run_sell_council_for_signals_unlocked(
+                signals,
+                quotes=quotes or {},
+                trigger_origin=trigger_origin,
+            )
+
+    async def _run_sell_council_for_signals_unlocked(
+        self,
+        signals: list[Any],
+        *,
+        quotes: dict[str, dict],
+        trigger_origin: str,
+    ) -> dict[str, int]:
+        from .sell_council import SellCouncil
+
+        severity_rank = {"URGENT": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        grouped: dict[str, list[Any]] = {}
+        for signal in signals:
+            ticker = str(getattr(signal, "ticker", "") or "").upper().strip()
+            if ticker:
+                grouped.setdefault(ticker, []).append(signal)
+        result = {
+            "signals": len(signals),
+            "tickers": len(grouped),
+            "reviewed": 0,
+            "actioned": 0,
+            "retried": 0,
+        }
+        sell_council = SellCouncil(journal=self.sell_engine.journal)
+        for ticker, ticker_signals in grouped.items():
+            ticker_signals.sort(
+                key=lambda signal: severity_rank.get(str(getattr(signal, "severity", "")), 9)
+            )
+            primary = ticker_signals[0]
+            cooldown_hours = {
+                "URGENT": 0.45,
+                "HIGH": 4,
+                "MEDIUM": 12,
+                "LOW": 24,
+            }.get(str(primary.severity or "").upper(), 12)
+            alert = Alert(
+                ticker=ticker,
+                alert_type=f"sell_council_trigger_{primary.signal_type}",
+                severity="CRITICAL" if primary.severity == "URGENT" else primary.severity,
+                message=primary.message[:4000],
+                metadata={
+                    "signal_id": primary.signal_id,
+                    "thesis_id": primary.thesis_id or "",
+                    "source": primary.source,
+                    "action_recommended": primary.action_recommended or "",
+                    "trigger_origin": trigger_origin,
+                },
+            )
+            fresh = self.monitor.alert_manager.claim_new_alerts(
+                [alert], within_hours=cooldown_hours
+            )
+            if not fresh:
+                for signal in ticker_signals:
+                    self.sell_engine.aggregator.suppress(
+                        signal.signal_id,
+                        reason=f"Sell Council trigger cooldown active ({cooldown_hours}h)",
+                    )
+                continue
+
+            thesis = self.sell_engine.tracker.get(primary.thesis_id) if primary.thesis_id else None
+            if not thesis:
+                thesis = self.sell_engine.get_active_thesis(ticker)
+            if not thesis:
+                self.monitor.alert_manager.release_alerts([alert])
+                for signal in ticker_signals:
+                    self.sell_engine.aggregator.suppress(
+                        signal.signal_id,
+                        reason="No active position thesis exists for this sell signal.",
+                    )
+                logger.error(
+                    "[sell_monitor] No active thesis for %s trigger; stale signal suppressed",
+                    ticker,
+                )
+                continue
+            try:
+                stock_data = await asyncio.to_thread(self.collector.collect_stock, ticker)
+                quote_price = self._as_float((quotes.get(ticker) or {}).get("price"))
+                if quote_price:
+                    quote = dict(stock_data.get("quote") or {})
+                    quote["price"] = quote_price
+                    stock_data["quote"] = quote
+                stock_data["_sell_trigger"] = {
+                    "primary_type": primary.signal_type,
+                    "severity": primary.severity,
+                    "current_price": quote_price,
+                    "origin": trigger_origin,
+                    "signals": [
+                        {
+                            "signal_id": signal.signal_id,
+                            "type": signal.signal_type,
+                            "severity": signal.severity,
+                            "source": signal.source,
+                            "recommended_action": signal.action_recommended,
+                            "trim_pct": signal.trim_pct,
+                            "completion_markers": list(signal.completion_markers or []),
+                            "message": signal.message,
+                        }
+                        for signal in ticker_signals
+                    ],
+                }
+                macro_data = await asyncio.to_thread(self.collector.collect_macro)
+                decision = await asyncio.to_thread(
+                    sell_council.run_sell_review,
+                    thesis,
+                    stock_data,
+                    macro_data,
+                    primary.signal_type,
+                    self._current_regime_state(),
+                )
+            except Exception as council_exc:
+                decision = None
+                logger.exception("[sell_monitor] Sell Council failed for %s: %s", ticker, council_exc)
+            if not decision:
+                result["retried"] += 1
+                self.monitor.alert_manager.release_alerts([alert])
+                continue
+
+            result["reviewed"] += 1
+            try:
+                applied = self._apply_sell_council_decision(
+                    sell_council=sell_council,
+                    decision=decision,
+                    thesis=thesis,
+                    stock_data=stock_data,
+                    trigger_type=primary.signal_type,
+                    signal_id=primary.signal_id,
+                    completion_markers=sorted({
+                        marker
+                        for signal in ticker_signals
+                        for marker in (signal.completion_markers or [])
+                        if marker
+                    }),
+                    trigger_reason=" | ".join(signal.message for signal in ticker_signals)[:1600],
+                    fallback_trim_pct=primary.trim_pct,
+                )
+            except Exception as apply_exc:
+                result["retried"] += 1
+                self.monitor.alert_manager.release_alerts([alert])
+                logger.exception(
+                    "[sell_monitor] Failed to apply Sell Council decision for %s: %s",
+                    ticker,
+                    apply_exc,
+                )
+                continue
+            if not applied["telegram_delivered"] and not applied["queued"]:
+                result["retried"] += 1
+                self.monitor.alert_manager.release_alerts([alert])
+                continue
+            for signal in ticker_signals:
+                self.sell_engine.aggregator.mark_actioned(signal.signal_id)
+                result["actioned"] += 1
+        return result
 
     def _run_news_sentiment_review_check(self, portfolio) -> list:
         """Rule 4.7 news hook: flag strongly negative material-news days.
@@ -4518,11 +4597,14 @@ class ArthaScheduler:
     async def _run_nightly_review(self):
         try:
             logger.info("[review] Starting nightly self-review")
-            findings = self.reviewer.run_review()
+            findings = await asyncio.to_thread(self.reviewer.run_review)
 
             # Send accuracy report if there are graded picks
             report = self.accuracy.format_monthly_report()
-            if report and findings.get("accuracy_grades", 0) > 0:
+            repaired_grades = int(
+                ((findings.get("benchmark_backfill") or {}).get("regraded") or 0)
+            )
+            if report and (int(findings.get("accuracy_grades") or 0) + repaired_grades) > 0:
                 if self.telegram.enabled:
                     self.telegram.send_message(report, parse_mode=None)
                     logger.info("[review] Sent accuracy report to Telegram")
@@ -4753,26 +4835,34 @@ class ArthaScheduler:
             if not fresh:
                 return
 
-            # Record fresh alerts in pre_brief system
-            try:
-                from .pre_brief import PreBrief
-                brief = PreBrief()
-                for alert in fresh:
-                    brief.record_event(
-                        ticker=alert.ticker,
-                        event_type="news_alert",
-                        severity=alert.severity,
-                        summary=alert.message[:200],
-                        source="sentinel",
-                    )
-            except Exception as pb_e:
-                logger.debug("[sentinel_held] Pre-brief recording failed (non-fatal): %s", pb_e)
+            # Record raw alerts for context. Raw keyword severity is never used
+            # as proof of negative thesis impact.
+            for alert in fresh:
+                self._record_pre_brief_event(
+                    ticker=alert.ticker,
+                    event_type="news_alert",
+                    severity=alert.severity,
+                    summary=alert.message[:200],
+                    source="sentinel",
+                    metadata={
+                        "headline": str((alert.metadata or {}).get("headline") or "")[:500],
+                        "url": str((alert.metadata or {}).get("url") or "")[:1000],
+                        "raw_keyword_severity": str((alert.metadata or {}).get("severity") or alert.severity),
+                        "verified_negative": False,
+                    },
+                )
 
             # For CRITICAL alerts on held positions, run thesis impact assessment
+            sentinel_review_signals: dict[str, Any] = {}
             critical = [a for a in fresh if a.severity == "CRITICAL"]
             for alert in critical:
                 try:
-                    await self._assess_thesis_impact_and_alert(alert, priority_label="CRITICAL NEWS")
+                    impact = await self._assess_thesis_impact_and_alert(
+                        alert, priority_label="CRITICAL NEWS"
+                    )
+                    signal = self._record_verified_sentinel_impact(alert, impact)
+                    if signal:
+                        sentinel_review_signals[signal.signal_id] = signal
                 except Exception as impact_e:
                     logger.warning("[sentinel_held] Thesis impact assessment failed: %s", impact_e)
 
@@ -4791,9 +4881,26 @@ class ArthaScheduler:
                                     **(getattr(alert, "metadata", None) or {}),
                                     "thesis_semantic_assessment": semantic,
                                 }
-                            await self._assess_thesis_impact_and_alert(alert, priority_label="HIGH NEWS")
+                            impact = await self._assess_thesis_impact_and_alert(
+                                alert, priority_label="HIGH NEWS"
+                            )
+                            signal = self._record_verified_sentinel_impact(alert, impact)
+                            if signal:
+                                sentinel_review_signals[signal.signal_id] = signal
                     except Exception as impact_e:
                         logger.warning("[sentinel_held] HIGH thesis impact assessment failed: %s", impact_e)
+
+            if sentinel_review_signals and self.market_hours.is_market_open(_utcnow()):
+                await self._run_sell_council_for_signals(
+                    list(sentinel_review_signals.values()),
+                    quotes={},
+                    trigger_origin="held_sentinel",
+                )
+            elif sentinel_review_signals:
+                logger.info(
+                    "[sentinel_held] Persisted %d verified news review signal(s) for next market cycle",
+                    len(sentinel_review_signals),
+                )
 
             # Non-critical sentinel alerts are recorded to pre_brief (above) for
             # council context but NOT sent to Telegram — reduces noise.
@@ -4937,8 +5044,62 @@ class ArthaScheduler:
                 "failed": True,
             }
 
-    async def _assess_thesis_impact_and_alert(self, alert: Any, priority_label: str = "CRITICAL NEWS") -> None:
-        """For CRITICAL news on a held position, assess thesis impact and send enriched alert."""
+    def _record_verified_sentinel_impact(self, alert: Any, impact: dict[str, Any]) -> Any:
+        """Persist verified Sentinel impact and create a durable review signal."""
+        ticker = str(getattr(alert, "ticker", "") or "").upper()
+        headline = str((getattr(alert, "metadata", None) or {}).get("headline") or getattr(alert, "message", ""))[:500]
+        affected = impact.get("affected_conditions") if isinstance(impact, dict) else []
+        if not isinstance(affected, list):
+            affected = []
+        verified_negative = bool(impact.get("verified_negative"))
+        review_required = bool(impact.get("review_required"))
+        self._record_pre_brief_event(
+            ticker=ticker,
+            event_type="thesis_impact",
+            severity="CRITICAL" if verified_negative else "WARNING" if review_required else "INFO",
+            summary=(
+                f"Verified negative thesis impact: {headline}"
+                if verified_negative
+                else f"Thesis-impact review required: {headline}"
+                if review_required
+                else f"No material thesis impact verified: {headline}"
+            ),
+            source="sentinel_thesis_impact",
+            metadata={
+                "headline": headline,
+                "verified_negative": verified_negative,
+                "review_required": review_required,
+                "assessment_failed": bool(impact.get("assessment_failed")),
+                "affected_conditions": affected[:5],
+                "priority_label": str(impact.get("priority_label") or ""),
+            },
+        )
+        if not review_required or not Config.SELL_SENTINEL_COUNCIL_ESCALATION_ENABLED:
+            return None
+        evidence = "; ".join(
+            f"{str(item.get('threat') or '').upper()}: {str(item.get('condition') or '')[:160]}"
+            for item in affected
+            if isinstance(item, dict)
+        )
+        if impact.get("assessment_failed"):
+            evidence = "Thesis-impact classifier failed; full Sell Council review required."
+        return self.sell_engine.flag_material_news_review(
+            ticker,
+            headline,
+            source=(
+                "news_sentinel_verified"
+                if verified_negative
+                else "news_sentinel_assessment_failure"
+            ),
+            evidence=evidence,
+        )
+
+    async def _assess_thesis_impact_and_alert(
+        self,
+        alert: Any,
+        priority_label: str = "CRITICAL NEWS",
+    ) -> dict[str, Any]:
+        """Assess held-position news and return a structured escalation result."""
         from .thesis_tracker import ThesisTracker
         from .chatgpt_backend import ChatGPTBackendClient
         import json as _json
@@ -4959,9 +5120,19 @@ class ArthaScheduler:
             )
             if self.telegram.enabled:
                 self.telegram.send_alert(msg)
-            return
+            return {
+                "ticker": ticker,
+                "headline": headline,
+                "priority_label": priority_label,
+                "affected_conditions": [],
+                "verified_negative": False,
+                "review_required": False,
+                "assessment_failed": False,
+                "reason": "No active thesis or invalidation conditions.",
+            }
 
         # Use GPT to assess impact on thesis conditions
+        assessment_failed = False
         try:
             conditions_json = _json.dumps(thesis.invalidation_conditions, indent=2)
             prompt = (
@@ -4972,7 +5143,7 @@ class ArthaScheduler:
                 "For each affected condition, rate the threat level: POSSIBLE, LIKELY, or CONFIRMED.\n"
                 'Respond ONLY in JSON: {"affected_conditions": [{"condition": "...", "threat": "...", "explanation": "..."}]}'
             )
-            raw = ChatGPTBackendClient(timeout=30).chat(prompt)
+            raw = str(ChatGPTBackendClient(timeout=30).chat(prompt) or "")
             # Parse JSON
             try:
                 if "```" in raw:
@@ -4982,11 +5153,38 @@ class ArthaScheduler:
                 impact_data = _json.loads(raw)
             except Exception:
                 impact_data = {}
+                assessment_failed = True
 
             affected = impact_data.get("affected_conditions", [])
         except Exception as e:
             logger.warning("[thesis_impact] GPT call failed: %s", e)
             affected = []
+            assessment_failed = True
+
+        if not isinstance(affected, list):
+            affected = []
+        normalized_affected: list[dict[str, str]] = []
+        for item in affected[:5]:
+            if not isinstance(item, dict):
+                continue
+            threat = str(item.get("threat") or "POSSIBLE").upper().strip()
+            if threat not in {"POSSIBLE", "LIKELY", "CONFIRMED"}:
+                threat = "POSSIBLE"
+            normalized_affected.append(
+                {
+                    "condition": str(item.get("condition") or "")[:300],
+                    "threat": threat,
+                    "explanation": str(item.get("explanation") or "")[:500],
+                }
+            )
+        affected = normalized_affected
+        verified_negative = any(
+            item.get("threat") in {"LIKELY", "CONFIRMED"} for item in affected
+        )
+        # A failed second-stage assessment on an already CRITICAL (or
+        # semantically matched HIGH) item is uncertainty, not evidence to sell.
+        # It still warrants a full Sell Council review rather than being lost.
+        review_required = verified_negative or assessment_failed
 
         # Build enriched alert message
         health = thesis.thesis_health_score
@@ -5028,10 +5226,34 @@ class ArthaScheduler:
         msg = "\n".join(l for l in lines if l is not None)
         if self.telegram.enabled:
             self.telegram.send_alert(msg[:4000])
-        logger.info("[thesis_impact] Sent critical impact alert for %s", ticker)
+        logger.info(
+            "[thesis_impact] Sent impact alert for %s verified_negative=%s review_required=%s failed=%s",
+            ticker,
+            verified_negative,
+            review_required,
+            assessment_failed,
+        )
+        return {
+            "ticker": ticker,
+            "headline": headline,
+            "priority_label": priority_label,
+            "affected_conditions": affected,
+            "verified_negative": verified_negative,
+            "review_required": review_required,
+            "assessment_failed": assessment_failed,
+        }
 
     async def _run_periodic_review_check(self) -> None:
-        """Check active theses for due reviews and fire sell council if needed."""
+        """Serialize scheduled lifecycle reviews with event-triggered reviews."""
+        lock = getattr(self, "_sell_review_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._sell_review_lock = lock
+        async with lock:
+            await self._run_periodic_review_check_unlocked()
+
+    async def _run_periodic_review_check_unlocked(self) -> None:
+        """Check active theses for due reviews and fire Sell Council if needed."""
         try:
             tracker = self.sell_engine.tracker
             due = tracker.get_due_reviews()

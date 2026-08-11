@@ -1,7 +1,9 @@
-"""Nightly self-review engine — Artha's 1% daily improvement system.
+"""Nightly evidence review for Artha's guarded improvement process.
 
-Inspired by Felix/Nat Eliason: every night, review the day's activity,
-identify ONE improvement, and apply it. Compounds over time.
+Every night, review the day's activity and record one candidate lesson. The
+module does not alter live scores, thresholds, position sizes, or broker rules;
+evidence must pass its declared sample gate and an explicit human-reviewed
+promotion before it can change strategy.
 
 This module:
 1. Reviews all alerts that fired (or should have)
@@ -9,7 +11,7 @@ This module:
 3. Checks accuracy tracker for newly gradeable recommendations
 4. Identifies one actionable improvement
 5. Logs the improvement to data/learnings/
-6. Optionally adjusts thresholds/config for next run
+6. Routes the lesson to an explicit advisory, shadow, or manual-review consumer
 
 Runs as a scheduler task after market close or as a standalone script.
 """
@@ -19,11 +21,11 @@ import json
 import logging
 import os
 import tempfile
+import hashlib
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
-
-import yfinance as yf
+from typing import Any, Iterator, Optional
 
 from .accuracy import AccuracyTracker
 from .config import Config
@@ -31,6 +33,11 @@ from .monitor import ALERT_HISTORY_FILE
 from .paths import DATA_DIR
 
 logger = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 LEARNINGS_DIR = DATA_DIR / "learnings"
 LESSONS_FILE = LEARNINGS_DIR / "lessons.json"
@@ -50,7 +57,55 @@ def _env_float(name: str, default: float) -> float:
 MISSED_WINNER_MIN_MARKET_CAP = _env_float("ARTHA_MISSED_WINNER_MIN_MARKET_CAP", 1_000_000_000)
 MISSED_WINNER_TOP_N = int(_env_float("ARTHA_MISSED_WINNER_TOP_N", 10))
 MISSED_WINNER_AUDIT_ENABLED = os.getenv("ARTHA_MISSED_WINNER_AUDIT_ENABLED", "1").strip() not in {"0", "false", "no"}
-LESSON_STATUSES = ("new", "applied", "dismissed")
+LESSON_STATUSES = ("new", "applied", "dismissed", "expired")
+
+# Every lesson type has an explicit downstream owner. A lesson may remain
+# observational or require manual promotion, but it must never disappear into
+# an unlabelled JSON backlog or silently alter live trading rules.
+LESSON_CONSUMER_ROUTES: dict[str, dict[str, str]] = {
+    "verdict_postmortem": {"consumer": "nightly_postmortem_audit", "effect": "observational"},
+    "analyst_prompt_tune": {"consumer": "manual_prompt_review", "effect": "manual_review"},
+    "missed_winner": {"consumer": "scanner_coverage_diagnostic", "effect": "observational"},
+    "missed_winner_audit": {"consumer": "scanner_coverage_diagnostic", "effect": "observational"},
+    "captured_winner": {"consumer": "scanner_coverage_diagnostic", "effect": "observational"},
+    "policy_excluded_winner": {"consumer": "policy_exclusion_audit", "effect": "observational"},
+    "shadow_rule_promotion": {"consumer": "manual_shadow_promotion_review", "effect": "manual_review"},
+    "alert_threshold_tune": {"consumer": "manual_operations_review", "effect": "manual_review"},
+    "observation": {"consumer": "nightly_operations_log", "effect": "observational"},
+}
+
+
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _eligible_missed_winner_instrument(profile: dict, quote: dict) -> bool:
+    """Keep missed-winner lessons inside Artha's permitted stock universe."""
+    # This is a learning audit, not a trading opportunity. If identity cannot
+    # be verified, skip it rather than teaching from an ETF/fund mislabeled as
+    # a stock by a top-movers endpoint.
+    if not isinstance(profile, dict) or not profile:
+        return False
+    if any(
+        _truthy_flag(value)
+        for value in (
+            profile.get("isEtf"),
+            profile.get("isETF"),
+            profile.get("isFund"),
+            quote.get("isEtf"),
+            quote.get("isETF"),
+            quote.get("isFund"),
+        )
+    ):
+        return False
+    if profile.get("isActivelyTrading") is not None and not _truthy_flag(
+        profile.get("isActivelyTrading")
+    ):
+        return False
+    exchange = str(profile.get("exchangeShortName") or "").upper().strip()
+    return exchange in {"NASDAQ", "NYSE", "AMEX"}
 
 
 def _utcnow() -> datetime:
@@ -74,6 +129,20 @@ def _atomic_write_json(path: Path, payload: object) -> None:
         raise
 
 
+@contextmanager
+def _lesson_lock(*, exclusive: bool) -> Iterator[None]:
+    lock_path = LESSONS_FILE.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _lesson_dedupe_key(lesson_type: str, description: str) -> str:
     """Stable dedupe id: type + description with volatile numbers stripped.
 
@@ -87,8 +156,17 @@ def _lesson_dedupe_key(lesson_type: str, description: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def load_lessons() -> dict:
-    """Load the deduped lessons ledger (data/learnings/lessons.json)."""
+def get_lesson_consumer_route(lesson_type: str) -> dict[str, str]:
+    """Return the declared consumer/effect for one lesson type."""
+    return dict(
+        LESSON_CONSUMER_ROUTES.get(
+            str(lesson_type or "").strip(),
+            {"consumer": "unmapped", "effect": "none"},
+        )
+    )
+
+
+def _load_lessons_unlocked() -> dict:
     if not LESSONS_FILE.exists():
         return {"lessons": [], "updated_at": ""}
     try:
@@ -101,6 +179,12 @@ def load_lessons() -> dict:
     return {"lessons": [], "updated_at": ""}
 
 
+def load_lessons() -> dict:
+    """Load the deduped lessons ledger under a shared file lock."""
+    with _lesson_lock(exclusive=False):
+        return _load_lessons_unlocked()
+
+
 def record_lesson(lesson: dict) -> dict:
     """Upsert a lesson into the deduped ledger with lifecycle status.
 
@@ -108,53 +192,136 @@ def record_lesson(lesson: dict) -> dict:
     keep the existing status, so an 'applied' or 'dismissed' lesson never
     reappears as fresh noise.
     """
-    ledger = load_lessons()
-    lesson_id = lesson.get("id") or _lesson_dedupe_key(
-        lesson.get("type", ""), lesson.get("description", "")
-    )
-    now_iso = _utcnow().isoformat()
-    for existing in ledger["lessons"]:
-        if existing.get("id") == lesson_id:
-            existing["last_seen"] = now_iso
-            existing["occurrences"] = int(existing.get("occurrences") or 1) + 1
-            existing["description"] = lesson.get("description", existing.get("description", ""))
-            if lesson.get("context"):
-                existing["context"] = lesson["context"]
-            ledger["updated_at"] = now_iso
-            _atomic_write_json(LESSONS_FILE, ledger)
-            return existing
+    with _lesson_lock(exclusive=True):
+        ledger = _load_lessons_unlocked()
+        lesson_id = lesson.get("id") or _lesson_dedupe_key(
+            lesson.get("type", ""), lesson.get("description", "")
+        )
+        now_iso = _utcnow().isoformat()
+        for existing in ledger["lessons"]:
+            if existing.get("id") == lesson_id:
+                existing["last_seen"] = now_iso
+                existing["occurrences"] = int(existing.get("occurrences") or 1) + 1
+                existing["description"] = lesson.get("description", existing.get("description", ""))
+                if lesson.get("context"):
+                    existing["context"] = lesson["context"]
+                if (
+                    str(existing.get("status") or "") == "expired"
+                    and str(existing.get("type") or "") == "shadow_rule_promotion"
+                ):
+                    existing["status"] = "new"
+                    existing["status_changed_at"] = now_iso
+                    existing["status_reason"] = "Shadow rule qualified again."
+                route = get_lesson_consumer_route(existing.get("type", ""))
+                existing["consumer"] = route["consumer"]
+                existing["decision_effect"] = route["effect"]
+                ledger["updated_at"] = now_iso
+                _atomic_write_json(LESSONS_FILE, ledger)
+                return existing
 
-    entry = {
-        "id": lesson_id,
-        "type": lesson.get("type", "unknown"),
-        "description": lesson.get("description", ""),
-        "action": lesson.get("action", ""),
-        "priority": lesson.get("priority", "LOW"),
-        "status": "new",
-        "first_seen": now_iso,
-        "last_seen": now_iso,
-        "occurrences": 1,
-        "context": lesson.get("context") or {},
-    }
-    ledger["lessons"].append(entry)
-    ledger["updated_at"] = now_iso
-    _atomic_write_json(LESSONS_FILE, ledger)
-    return entry
+        route = get_lesson_consumer_route(lesson.get("type", "unknown"))
+        entry = {
+            "id": lesson_id,
+            "type": lesson.get("type", "unknown"),
+            "description": lesson.get("description", ""),
+            "action": lesson.get("action", ""),
+            "priority": lesson.get("priority", "LOW"),
+            "status": "new",
+            "first_seen": now_iso,
+            "last_seen": now_iso,
+            "occurrences": 1,
+            "context": lesson.get("context") or {},
+            "consumer": route["consumer"],
+            "decision_effect": route["effect"],
+        }
+        ledger["lessons"].append(entry)
+        ledger["updated_at"] = now_iso
+        _atomic_write_json(LESSONS_FILE, ledger)
+        return entry
 
 
 def set_lesson_status(lesson_id: str, status: str) -> bool:
     """Move a lesson through its lifecycle: new -> applied | dismissed."""
     if status not in LESSON_STATUSES:
         raise ValueError(f"status must be one of {LESSON_STATUSES}")
-    ledger = load_lessons()
-    for existing in ledger["lessons"]:
-        if existing.get("id") == lesson_id:
-            existing["status"] = status
-            existing["status_changed_at"] = _utcnow().isoformat()
+    with _lesson_lock(exclusive=True):
+        ledger = _load_lessons_unlocked()
+        for existing in ledger["lessons"]:
+            if existing.get("id") == lesson_id:
+                existing["status"] = status
+                existing["status_changed_at"] = _utcnow().isoformat()
+                ledger["updated_at"] = _utcnow().isoformat()
+                _atomic_write_json(LESSONS_FILE, ledger)
+                return True
+    return False
+
+
+def reconcile_lesson_routes(
+    *,
+    candidate_promotion_ids: set[str] | None = None,
+) -> dict[str, int]:
+    """Backfill routes and expire/reactivate stale shadow promotion notices."""
+    promotion_snapshot_available = candidate_promotion_ids is not None
+    if candidate_promotion_ids is None:
+        try:
+            from .shadow_rules import summarize_shadow_rules
+
+            candidate_promotion_ids = {
+                str(row.get("rule_id") or "")
+                for row in (summarize_shadow_rules().get("candidate_promotions") or [])
+                if isinstance(row, dict) and row.get("rule_id")
+            }
+            promotion_snapshot_available = True
+        except Exception as exc:
+            logger.warning("[review] Shadow-promotion lifecycle check unavailable: %s", exc)
+            candidate_promotion_ids = set()
+    with _lesson_lock(exclusive=True):
+        ledger = _load_lessons_unlocked()
+        updated = 0
+        unmapped = 0
+        expired = 0
+        reactivated = 0
+        now_iso = _utcnow().isoformat()
+        for lesson in ledger.get("lessons", []):
+            if not isinstance(lesson, dict):
+                continue
+            route = get_lesson_consumer_route(lesson.get("type", ""))
+            if route["consumer"] == "unmapped":
+                unmapped += 1
+            if (
+                lesson.get("consumer") != route["consumer"]
+                or lesson.get("decision_effect") != route["effect"]
+            ):
+                lesson["consumer"] = route["consumer"]
+                lesson["decision_effect"] = route["effect"]
+                updated += 1
+            if (
+                promotion_snapshot_available
+                and str(lesson.get("type") or "") == "shadow_rule_promotion"
+            ):
+                context = lesson.get("context") if isinstance(lesson.get("context"), dict) else {}
+                rule_id = str(context.get("rule_id") or "")
+                status = str(lesson.get("status") or "new")
+                if status == "new" and rule_id and rule_id not in candidate_promotion_ids:
+                    lesson["status"] = "expired"
+                    lesson["status_changed_at"] = now_iso
+                    lesson["status_reason"] = "Rule no longer meets current promotion criteria."
+                    expired += 1
+                elif status == "expired" and rule_id in candidate_promotion_ids:
+                    lesson["status"] = "new"
+                    lesson["status_changed_at"] = now_iso
+                    lesson["status_reason"] = "Rule meets current promotion criteria again."
+                    reactivated += 1
+        if updated or expired or reactivated:
             ledger["updated_at"] = _utcnow().isoformat()
             _atomic_write_json(LESSONS_FILE, ledger)
-            return True
-    return False
+        return {
+            "total": len(ledger.get("lessons", [])),
+            "updated": updated,
+            "unmapped": unmapped,
+            "expired": expired,
+            "reactivated": reactivated,
+        }
 
 
 class NightlyReview:
@@ -191,6 +358,21 @@ class NightlyReview:
         grade_results = self._grade_pending_recommendations()
         findings["accuracy_grades"] = len(grade_results)
         findings["grades"] = grade_results
+
+        # Repair historical fallback grades before deriving patterns or lessons.
+        # A provider outage must not teach the next Council from a weaker,
+        # absolute-return substitute.
+        if Config.ACCURACY_BENCHMARK_BACKFILL_ENABLED:
+            try:
+                findings["benchmark_backfill"] = self.accuracy.backfill_missing_benchmark_grades(
+                    max_tickers=Config.ACCURACY_BENCHMARK_BACKFILL_MAX_TICKERS,
+                )
+            except Exception as exc:
+                logger.warning("[review] Benchmark-grade backfill failed: %s", exc)
+                findings["benchmark_backfill"] = {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
 
         # --- Step 3: Check accuracy stats for patterns ---
         accuracy_insights = self._analyze_accuracy_patterns()
@@ -279,51 +461,24 @@ class NightlyReview:
         return summary
 
     def _grade_pending_recommendations(self) -> list[dict]:
-        """Grade any recommendations that have passed their 30-day review date."""
-        pending = self.accuracy.get_pending_reviews()
-        graded = []
-
-        for rec in pending:
-            ticker = rec.get("ticker", "")
-            timestamp = rec.get("timestamp", "")
-            if not ticker:
-                continue
-
-            try:
-                # FMP first (paid, reliable); yfinance as fallback. Buy-type
-                # verdicts grade through this exact same path as everything
-                # else — a dead quote no longer leaves them PENDING forever.
-                current_price = 0.0
-                try:
-                    from .collector import FMPCollector
-                    quote = FMPCollector().quote(ticker) or {}
-                    current_price = float(quote.get("price") or 0)
-                except Exception as fmp_e:
-                    logger.debug(f"[review] FMP quote failed for {ticker}: {fmp_e}")
-                if not current_price:
-                    stock = yf.Ticker(ticker)
-                    info = stock.info or {}
-                    current_price = info.get("regularMarketPrice") or info.get("currentPrice", 0)
-                    if not current_price:
-                        hist = stock.history(period="1d")
-                        if not hist.empty:
-                            current_price = float(hist["Close"].iloc[-1])
-
-                if current_price:
-                    result = self.accuracy.grade_recommendation(
-                        ticker, timestamp, current_price
-                    )
-                    if result:
-                        graded.append(result)
-            except Exception as e:
-                logger.warning(f"[review] Failed to grade {ticker}: {e}")
-
-        return graded
+        """Grade due recommendations at one fixed, benchmark-matched horizon."""
+        result = self.accuracy.grade_due_recommendations_from_history(
+            max_records=Config.ACCURACY_NIGHTLY_GRADE_MAX_RECORDS,
+        )
+        if result.get("skipped"):
+            logger.warning(
+                "[review] Historical grading left %d due row(s) pending for retry",
+                len(result["skipped"]),
+            )
+        return list(result.get("graded_records") or [])
 
     def _analyze_accuracy_patterns(self) -> dict:
         """Look for patterns in graded recommendations."""
         stats = self.accuracy.get_summary_stats()
-        current_stats = self.accuracy.get_summary_stats(since=Config.ACCURACY_CURRENT_ERA_START)
+        current_stats = self.accuracy.get_summary_stats(
+            since=Config.ACCURACY_CURRENT_ERA_START,
+            benchmark_only=True,
+        )
         min_samples = max(1, int(getattr(Config, "ACCURACY_MIN_PATTERN_SAMPLES", 3)))
         insights: dict[str, Any] = {
             "patterns": [],
@@ -411,6 +566,16 @@ class NightlyReview:
             market_cap = float(quote.get("marketCap") or 0)
             if market_cap < MISSED_WINNER_MIN_MARKET_CAP:
                 continue
+            try:
+                profile = collector.company_profile(symbol) or {}
+            except Exception:
+                profile = {}
+
+            # The lesson must come from the same single-company opportunity set
+            # Artha is allowed to buy. Leveraged/inverse ETFs in the top-gainers
+            # feed are not missed stocks and must not teach the Council to chase.
+            if not _eligible_missed_winner_instrument(profile, quote):
+                continue
             price = float(quote.get("price") or row.get("price") or 0)
             move_pct = quote.get("changePercentage")
             if move_pct is None:
@@ -420,6 +585,8 @@ class NightlyReview:
                 "move_pct": round(float(move_pct or 0), 2),
                 "market_cap": market_cap,
                 "price": price,
+                "exchange": str(profile.get("exchangeShortName") or "").upper(),
+                "instrument_identity_verified": True,
             })
 
         if not winners:
@@ -733,120 +900,175 @@ class NightlyReview:
             logger.warning(f"[review] Failed to upsert lesson into ledger: {e}")
 
 
-def get_council_lessons(max_items: int = 5, max_chars: int = 1200) -> str:
-    """Deterministic digest of graded postmortems for council prompt injection.
+def build_council_learning_context(
+    max_items: int = 5,
+    max_chars: int = 1200,
+    *,
+    records: list[dict[str, Any]] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build the bounded, current-era feedback packet used by Buy Council.
 
-    Pulls INCORRECT / PARTIALLY_CORRECT graded records from the accuracy
-    tracker, weights them by recency and excess-return magnitude, and renders
-    a compact plain-text digest (no LLM calls, file reads only). Wave 2
-    injects this into council prompts.
+    The packet is deliberately balanced between missed no-buy opportunities and
+    bad/early buy calls, admits only one observation per ticker, and never
+    injects unreviewed free-form lessons into a live decision.
     """
-    tracker = AccuracyTracker()
-    lf = tracker._lock(exclusive=False)
-    try:
-        records = tracker._load()
-    finally:
-        tracker._unlock(lf)
+    if records is None:
+        tracker = AccuracyTracker()
+        lf = tracker._lock(exclusive=False)
+        try:
+            records = tracker._load()
+        finally:
+            tracker._unlock(lf)
 
-    from .accuracy import EXPOSURE_VERDICTS, _normalize_verdict, _num_or_none
+    from .accuracy import (
+        EXPOSURE_VERDICTS,
+        _current_era_start,
+        _is_current_era,
+        _normalize_verdict,
+        _num_or_none,
+    )
 
-    now = _utcnow()
-    wrong_nobuy: list[dict] = []
-    wrong_buy: list[dict] = []
-    scored: list[tuple[float, str, str]] = []
-    for rec in records:
-        if rec.get("status") != "GRADED":
-            continue
-        grade = rec.get("grade")
-        if grade not in ("INCORRECT", "PARTIALLY_CORRECT"):
+    current_time = now or _utcnow()
+    current_graded = [
+        rec for rec in records
+        if rec.get("status") == "GRADED" and _is_current_era(rec)
+    ]
+    benchmark_graded = [
+        rec
+        for rec in current_graded
+        if str(rec.get("grade_basis") or "").startswith("excess_vs_")
+        and _num_or_none(rec.get("excess_return_pct")) is not None
+    ]
+    categories: dict[str, list[dict[str, Any]]] = {"missed_no_buy": [], "bad_buy": []}
+    for rec in benchmark_graded:
+        grade = str(rec.get("grade") or "").upper()
+        if grade not in {"INCORRECT", "PARTIALLY_CORRECT"}:
             continue
         excess = _num_or_none(rec.get("excess_return_pct"))
         if excess is None:
-            excess = _num_or_none(rec.get("price_change_pct")) or 0.0
+            continue
         ts = str(rec.get("timestamp") or "")
         try:
             rec_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             if rec_dt.tzinfo is None:
                 rec_dt = rec_dt.replace(tzinfo=timezone.utc)
-            age_days = max(0.0, (now - rec_dt).total_seconds() / 86400.0)
+            age_days = max(0.0, (current_time - rec_dt).total_seconds() / 86400.0)
         except ValueError:
             age_days = 365.0
-        weight = abs(excess) * (0.5 ** (age_days / 60.0))
-
-        ticker = str(rec.get("ticker") or "?").upper()
         verdict = str(rec.get("verdict") or "?").upper()
-        is_exposure = _normalize_verdict(verdict) in EXPOSURE_VERDICTS
-        date_str = ts[:10]
-        if is_exposure:
-            wrong_buy.append(rec)
-            line = (
-                f"- {verdict} {ticker} ({date_str}): lagged the benchmark by "
-                f"{excess:+.1f}pp over the review window — graded {grade}. "
-                f"Buy thesis failed; check entry timing and expectation risk."
+        category = (
+            "bad_buy"
+            if _normalize_verdict(verdict) in EXPOSURE_VERDICTS
+            else "missed_no_buy"
+        )
+        ticker = str(rec.get("ticker") or "?").upper()
+        item = {
+            "ticker": ticker,
+            "timestamp": ts,
+            "date": ts[:10],
+            "verdict": verdict,
+            "grade": grade,
+            "excess_return_pct": round(float(excess), 4),
+            "category": category,
+            "weight": abs(float(excess)) * (0.5 ** (age_days / 60.0)),
+        }
+        categories[category].append(item)
+
+    for items in categories.values():
+        items.sort(key=lambda item: (-float(item["weight"]), item["ticker"], item["timestamp"]))
+
+    selected: list[dict[str, Any]] = []
+    seen_tickers: set[str] = set()
+
+    def _take_first(category: str) -> None:
+        for item in categories[category]:
+            if item["ticker"] not in seen_tickers:
+                selected.append(item)
+                seen_tickers.add(item["ticker"])
+                return
+
+    remaining = sorted(
+        [*categories["missed_no_buy"], *categories["bad_buy"]],
+        key=lambda item: (-float(item["weight"]), item["ticker"], item["timestamp"]),
+    )
+    # Guarantee both error directions are represented when there is room. With
+    # a one-item budget, choose the strongest available observation instead of
+    # accidentally returning nothing when only one category exists.
+    if max_items >= 2 and categories["missed_no_buy"] and categories["bad_buy"]:
+        _take_first("missed_no_buy")
+        _take_first("bad_buy")
+    for item in remaining:
+        if len(selected) >= max(0, int(max_items)):
+            break
+        if item["ticker"] in seen_tickers:
+            continue
+        selected.append(item)
+        seen_tickers.add(item["ticker"])
+
+    missed_values = [float(item["excess_return_pct"]) for item in categories["missed_no_buy"]]
+    bad_buy_values = [float(item["excess_return_pct"]) for item in categories["bad_buy"]]
+    era_start = _current_era_start().date().isoformat()
+    lines = [
+        "CURRENT-ERA GRADED POSTMORTEMS "
+        f"(since {era_start}; benchmark-graded={len(benchmark_graded)}/{len(current_graded)}; "
+        f"missed no-buy={len(missed_values)}; weak buys={len(bad_buy_values)}):"
+    ]
+    for item in selected:
+        if item["category"] == "bad_buy":
+            interpretation = (
+                "Historical buy exposure underperformed; re-check entry timing, "
+                "expectation risk, and thesis quality."
             )
         else:
-            wrong_nobuy.append(rec)
-            line = (
-                f"- {verdict} {ticker} ({date_str}): it beat the benchmark by "
-                f"{excess:+.1f}pp after the no-buy call — graded {grade}. "
-                f"Excessive caution on a name with working momentum/catalysts."
+            interpretation = (
+                "Historical no-buy call missed relative strength; re-check whether "
+                "supported momentum or catalyst evidence was underweighted."
             )
-        scored.append((weight, f"{ticker}|{ts}", line))
-
-    lines: list[str] = []
-    if scored:
-        nobuy_excess = [
-            _num_or_none(r.get("excess_return_pct")) for r in wrong_nobuy
-        ]
-        nobuy_excess = [v for v in nobuy_excess if v is not None]
-        header = (
-            f"GRADED POSTMORTEMS ({len(wrong_nobuy)} wrong/partial no-buy calls"
+        lines.append(
+            f"- {item['verdict']} {item['ticker']} ({item['date']}): benchmark-relative "
+            f"return {item['excess_return_pct']:+.1f}pp; graded {item['grade']}. {interpretation}"
         )
-        if nobuy_excess:
-            header += f", avg missed excess {sum(nobuy_excess) / len(nobuy_excess):+.1f}pp"
-        header += f"; {len(wrong_buy)} wrong/partial buys):"
-        lines.append(header)
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        per_ticker: dict[str, int] = {}
-        picked = 0
-        for _, key, line in scored:
-            if picked >= max_items:
-                break
-            ticker = key.split("|", 1)[0]
-            if per_ticker.get(ticker, 0) >= 2:
-                continue  # Keep the digest diverse — max 2 lines per ticker.
-            per_ticker[ticker] = per_ticker.get(ticker, 0) + 1
-            lines.append(line)
-            picked += 1
-        if len(wrong_nobuy) > len(wrong_buy) and len(wrong_nobuy) >= 3:
-            lines.append(
-                "Pattern: most graded mistakes are missed winners from DEFER/WATCH/AVOID, "
-                "not bad buys. Anchoring on pullback entries that never fill has been the "
-                "repeated INCORRECT mode — weigh that asymmetry before deferring."
-            )
-    else:
-        lines.append("GRADED POSTMORTEMS: no graded misses on record yet.")
-
-    # Append the most persistent open lessons from the ledger.
-    ledger = load_lessons()
-    open_lessons = [
-        l for l in ledger.get("lessons", [])
-        if l.get("status") == "new" and l.get("type") in ("missed_winner", "shadow_rule_promotion")
-    ]
-    open_lessons.sort(
-        key=lambda l: (-int(l.get("occurrences") or 0), str(l.get("id") or ""))
+    if not selected:
+        lines.append("- No current-era incorrect or partial outcomes are eligible yet.")
+    footer = (
+        "Calibration only: these are correlated historical observations, not causal proof. "
+        "Do not override current filings, live data, valuation, risk gates, or execution evidence."
     )
-    for lesson in open_lessons[:2]:
-        lines.append(f"- Open lesson (seen {lesson.get('occurrences')}x): {lesson.get('description')}")
+    lines.append(footer)
 
+    # Preserve the header and safety footer; drop lower-ranked examples first.
+    while len("\n".join(lines)) > max_chars and len(lines) > 2:
+        lines.pop(-2)
+        if selected:
+            selected.pop()
     digest = "\n".join(lines)
     if len(digest) > max_chars:
-        clipped: list[str] = []
-        used = 0
-        for line in lines:
-            if used + len(line) + 1 > max_chars:
-                break
-            clipped.append(line)
-            used += len(line) + 1
-        digest = "\n".join(clipped)
-    return digest
+        digest = digest[: max(0, max_chars - 3)].rstrip() + "..."
+    return {
+        "schema_version": 1,
+        "current_era_start": era_start,
+        "current_era_graded": len(current_graded),
+        "benchmark_graded": len(benchmark_graded),
+        "excluded_absolute_fallback": len(current_graded) - len(benchmark_graded),
+        "eligible_missed_no_buy": len(categories["missed_no_buy"]),
+        "eligible_bad_buy": len(categories["bad_buy"]),
+        "selected": selected,
+        "digest": digest,
+        "digest_sha256": hashlib.sha256(digest.encode("utf-8")).hexdigest(),
+        "policy": {
+            "current_era_only": True,
+            "max_one_observation_per_ticker": True,
+            "balanced_when_available": True,
+            "unreviewed_ledger_lessons_in_live_prompt": False,
+            "automatic_rule_changes": False,
+        },
+    }
+
+
+def get_council_lessons(max_items: int = 5, max_chars: int = 1200) -> str:
+    """Return the bounded Buy Council feedback digest."""
+    return str(
+        build_council_learning_context(max_items=max_items, max_chars=max_chars).get("digest")
+        or ""
+    )

@@ -950,6 +950,7 @@ class SellEngine:
         ticker: str,
         headline: str,
         source: str = "news_sentinel",
+        evidence: str = "",
     ) -> Optional[SellSignal]:
         """Rule 4.7: strongly negative material news day → REVIEW_EXIT signal.
 
@@ -958,6 +959,16 @@ class SellEngine:
         thesis = self.tracker.get_active(ticker)
         if not thesis:
             return None
+        normalized_headline = " ".join(str(headline or "").lower().split())[:200]
+        for existing in self.aggregator.get_active(ticker):
+            if (
+                existing.signal_type == SIGNAL_REVIEW_EXIT
+                and str(existing.source or "") == str(source or "")
+                and normalized_headline
+                and normalized_headline in " ".join(str(existing.message or "").lower().split())
+            ):
+                return existing
+        evidence_text = f" Verified impact: {str(evidence).strip()[:500]}" if evidence else ""
         signal = SellSignal(
             ticker=ticker,
             thesis_id=thesis.thesis_id,
@@ -966,7 +977,7 @@ class SellEngine:
             source=source,
             message=(
                 f"📰 REVIEW_EXIT (rule 4.7): strongly negative material news for "
-                f"{ticker}: {headline[:200]}. Run immediate sell review."
+                f"{ticker}: {headline[:200]}. Run immediate sell review.{evidence_text}"
             ),
             action_recommended="REVIEW",
             sell_score=float(Config.SELL_SCORE_TRIM_THRESHOLD),
