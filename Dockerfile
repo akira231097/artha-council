@@ -3,7 +3,7 @@
 # This is pure-Python (requests, pandas, numpy, LLM SDKs). No system media
 # libraries are required. Provider keys are supplied at runtime via -e / --env-file;
 # never bake credentials into the image.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
